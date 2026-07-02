@@ -1,0 +1,505 @@
+"""
+API principal do VTE - Estilo PyTorch/Ollama
+"""
+
+from pathlib import Path
+from typing import Optional
+from ..bridge.hip_runtime import HIPRuntime
+from ..compiler.sanitizer import GGUFSanitizer
+from .lifecycle import ModelLifecycleManager
+from ..bridge.logger import get_logger
+from ..compiler.tokenizer import QwenTokenizer
+from ..core.sampler import Sampler
+from ..core.hip_graph_executor import HIPGraphExecutor
+from ..core.fallback_executor import FallbackExecutor
+from ..compiler.qwen_mapper import QwenTensorMapper, ActivationArena
+from ..bridge.memory import MemoryBlock, SlabAllocator, MemoryRegion
+from vte.core.vram_profiler import VRAMProfiler
+from ..compiler.gguf_parser import GGUFParser
+from ..compiler.weight_loader import GGUFWeightLoader
+from ..core.lm_head import LMHead
+import os
+import time
+import threading
+import ctypes
+import numpy as np
+
+logger = get_logger("VTE.Model")
+
+class VTEModel:
+    """
+    Interface de alto nível para carregar e usar modelos de linguagem.
+    
+    Exemplo:
+        >>> model = VTEModel.from_pretrained("qwen2.5:1.5b-q4_k_m")
+        >>> response = model.generate("Olá", max_tokens=100)
+    """
+    
+    MODEL_REGISTRY = {
+        "qwen2.5:1.5b-q4_k_m": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+    }
+    
+    DEFAULT_CONTEXT_LENGTH = 2048
+
+    def __init__(self, gguf_path: str, use_hip_graph: bool = True, enable_fusion: bool = True, context_length: int = None, idle_timeout: int = 5, auto_unload: bool = True, max_batch_size: int = 1):
+        self._path = gguf_path
+        self._use_hip_graph = use_hip_graph
+        self._enable_fusion = enable_fusion
+        self._hip = None
+        self._allocator = None
+        self._graph = None
+        self.compute_graph = None
+        self._is_loaded = False
+        self._context_length = context_length if context_length is not None else self.DEFAULT_CONTEXT_LENGTH
+        # Fase II (prep): reserva headroom de VRAM no pool para permitir
+        # generate_batch() alocar KV cache/arena de até `max_batch_size` sob
+        # demanda, sem re-hipMalloc do pool inteiro. Pesos não escalam com
+        # batch — só o KV cache/arena do maior batch pretendido precisa de
+        # espaço reservado de antemão.
+        self._max_batch_size = max(1, max_batch_size)
+        
+        self.idle_timeout = idle_timeout
+        self.auto_unload = auto_unload
+        self._last_access_time = 0
+        self._watchdog_thread = None
+        self._stop_watchdog = threading.Event()
+        self.profiler = None
+        
+        self._lifecycle = ModelLifecycleManager(
+            self,
+            idle_timeout_seconds=idle_timeout,
+            enable_auto_unload=auto_unload
+        )
+    
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_name: str,
+        use_hip_graph: bool = True,
+        enable_fusion: bool = True,
+        idle_timeout_seconds: int = 300,
+        enable_auto_unload: bool = True,
+        max_batch_size: int = 1
+    ) -> "VTEModel":
+        if model_name not in cls.MODEL_REGISTRY:
+            available = ", ".join(cls.MODEL_REGISTRY.keys())
+            raise ValueError(
+                f"Modelo '{model_name}' não encontrado.\n"
+                f"Modelos disponíveis: {available}"
+            )
+        
+        filename = cls.MODEL_REGISTRY[model_name]
+        model_path = Path("Model") / filename
+        
+        if not model_path.exists():
+            raise FileNotFoundError(
+                f"Arquivo do modelo não encontrado: {model_path}\n"
+                f"Baixe o modelo e coloque-o na pasta 'Model/'"
+            )
+        
+        instance = cls(
+            str(model_path),
+            use_hip_graph=use_hip_graph,
+            enable_fusion=enable_fusion,
+            idle_timeout=idle_timeout_seconds,
+            auto_unload=enable_auto_unload,
+            max_batch_size=max_batch_size
+        )
+        instance._load()
+        instance._lifecycle.start_monitoring()
+        return instance
+    
+    def _load(self):
+        sanitizer = GGUFSanitizer(Path(self._path))
+        sanitizer.validate()
+
+        # Lê os hiperparâmetros REAIS do GGUF em vez de depender de defaults
+        # espalhados pelo código. Vários defaults estavam ERRADOS para o
+        # Qwen2.5-1.5B (head_count=12 não 16, rope.freq_base=1e6 não 1e4,
+        # eps=1e-6 não 1e-5), quebrando GQA, RoPE e lançando blocos de cabeça
+        # fora dos limites. As chaves aqui são as (sem prefixo 'qwen2.') que
+        # kernel_arg_builder/qwen_compute/qwen_mapper consultam.
+        from ..compiler.gguf_metadata import read_gguf_metadata
+        raw = read_gguf_metadata(self._path, wanted_keys={
+            "qwen2.embedding_length", "qwen2.block_count", "qwen2.context_length",
+            "qwen2.attention.head_count", "qwen2.attention.head_count_kv",
+            "qwen2.attention.key_length", "qwen2.feed_forward_length",
+            "qwen2.rope.freq_base", "qwen2.attention.layer_norm_rms_epsilon",
+        })
+
+        embedding_length = raw.get("qwen2.embedding_length", sanitizer.header.embedding_length)
+        head_count = raw.get("qwen2.attention.head_count", 12)
+        # Qwen2.5 não armazena key_length separado no GGUF; head_dim = hidden / n_heads.
+        head_dim = raw.get("qwen2.attention.key_length", embedding_length // head_count)
+
+        metadata = {
+            "embedding_length": embedding_length,
+            "block_count": raw.get("qwen2.block_count", sanitizer.header.block_count),
+            "context_length": raw.get("qwen2.context_length", sanitizer.header.context_length),
+            "attention.head_count": head_count,
+            "attention.head_count_kv": raw.get("qwen2.attention.head_count_kv", 2),
+            "attention.key_length": head_dim,
+            "feed_forward_length": raw.get("qwen2.feed_forward_length", 8960),
+            "rope.freq_base": raw.get("qwen2.rope.freq_base", 1000000.0),
+            "attention.layer_norm_rms_epsilon": raw.get("qwen2.attention.layer_norm_rms_epsilon", 1e-6),
+        }
+        self.metadata = metadata
+        logger.info(
+            f"Hiperparâmetros GGUF: hidden={embedding_length}, heads={head_count}, "
+            f"kv_heads={metadata['attention.head_count_kv']}, head_dim={head_dim}, "
+            f"ffn={metadata['feed_forward_length']}, rope_theta={metadata['rope.freq_base']}, "
+            f"eps={metadata['attention.layer_norm_rms_epsilon']:.2e}"
+        )
+
+        if self._hip is None:
+            self._hip = HIPRuntime()
+            self._hip.initialize()
+        
+        if self._allocator is None:
+            vram_total = self._hip.get_device_properties()['total_global_mem']
+            
+            self.parser = GGUFParser(Path(self._path))
+            self.parser.parse_tensors(sanitizer.header)
+
+            # Etapa C: registra os pesos que ficam CRUS em Q4_K (gate/up) a
+            # partir da MESMA função usada pelo loader/mapper, para o executor
+            # rotear esses nós ao gemv_q4k. Fonte única de verdade.
+            from vte.compiler.qwen_mapper import is_raw_q4k_weight, is_raw_q6k_weight
+            from vte.core.fallback_executor import register_raw_q4k_weights, register_raw_q6k_weights
+            raw_q4k = {n for n, t in self.parser.tensors.items() if is_raw_q4k_weight(n, t)}
+            raw_q6k = {n for n, t in self.parser.tensors.items() if is_raw_q6k_weight(n, t)}
+            register_raw_q4k_weights(raw_q4k)
+            register_raw_q6k_weights(raw_q6k)
+            logger.info(f"Pesos crus in-kernel: Q4_K={len(raw_q4k)} (gemv_q4k), Q6_K={len(raw_q6k)} (gemv_q6k)")
+
+            mapper = QwenTensorMapper(self.parser, metadata)
+            self._mapper = mapper  # Fase II (prep): reaproveitado por generate_batch()
+
+            # Dimensiona o pool para o MAIOR batch_size pretendido (padrão 1 —
+            # sem custo extra para quem só usa generate() de sequência única).
+            # Pesos não escalam com batch; só o KV cache/arena do batch máximo
+            # entram no cálculo de margem.
+            reqs = mapper.calculate_memory_requirements(self._context_length, self._max_batch_size)
+            requested_pool_size = reqs['with_margin']
+
+            self._allocator = SlabAllocator(self._hip, vram_total, requested_pool_size=requested_pool_size)
+            self._allocator.initialize()
+            
+            self.profiler = VRAMProfiler(self._allocator)
+            
+            self.tensor_mapping = mapper.map_and_allocate_tensors(self._allocator, self._hip, profiler=self.profiler, context_length=self._context_length)
+
+            weight_loader = GGUFWeightLoader(self._path, self.parser, self.tensor_mapping)
+            loaded, total_bytes = weight_loader.load_all(self._hip)
+            logger.info(f"Pesos injetados na VRAM: {loaded} tensores ({total_bytes / (1024*1024):.1f} MB)")
+
+            logger.info("Construindo grafo de operações...")
+            from vte.compiler.qwen_compute import QwenComputeGraphBuilder
+            compute_builder = QwenComputeGraphBuilder(metadata)
+            self.compute_graph = compute_builder.build_compute_graph()
+            self._graph = self.compute_graph  # Alias para compatibilidade
+            
+            if self._enable_fusion:
+                logger.info("Aplicando fusão de kernels...")
+                from vte.compiler.fusion_analyzer import FusionAnalyzer
+                from vte.compiler.fusion_applier import FusionApplier
+                
+                analyzer = FusionAnalyzer()
+                candidates = analyzer.analyze(self.compute_graph)
+                
+                if candidates:
+                    applier = FusionApplier()
+                    self.compute_graph = applier.apply(self.compute_graph, candidates)
+                    self._graph = self.compute_graph
+                    logger.info(f"Fusão aplicada: {len(candidates)} mega-kernels criados")
+                else:
+                    logger.info("Nenhuma fusão possível encontrada")
+
+            # Epilogue Fusion do residual: detecta GEMV -> Add(residual) e funde
+            # o Add no epílogo do GEMV (mata ~56 launches/tok). Deve rodar após
+            # o grafo final estar montado.
+            from vte.core.fallback_executor import build_residual_fusion, RESIDUAL_FUSION
+            build_residual_fusion(list(self._graph.nodes.values()))
+            logger.info(f"Fusão de residual (epilogue): {len(RESIDUAL_FUSION)} GEMVs fundidos")
+
+        self.tokenizer = QwenTokenizer(gguf_path=self._path)
+        self.sampler = Sampler()
+
+        # Recupera o bloco de arena pré-alocado pelo mapper (Evita sobreposicao)
+        arena_block = next((b for b in self._allocator.blocks if b.tag == "ACTIVATION_ARENA"), None)
+        if not arena_block:
+            raise RuntimeError("Bloco ACTIVATION_ARENA não encontrado no SlabAllocator após mapeamento.")
+            
+        # 2MB reservado para input_embeddings e input_ids no início da arena
+        self.arena = ActivationArena(arena_block, start_offset=2097152)
+        
+        # Aloca buffers de ativação persistentes para o HIP Graph
+        self._allocate_activation_buffers()
+
+        if self._use_hip_graph:
+            try:
+                self.executor = HIPGraphExecutor(self._hip, self._allocator, self._graph, self.tensor_mapping, metadata=self.metadata)
+                self.executor.build_decode_graph()
+                logger.info(f"✅ HIP Graph executor inicializado com sucesso (Nós: {len(self._graph.nodes)})")
+            except Exception as e:
+                logger.warning(f"⚠️ HIP Graph falhou: {e}. Fazendo fallback para executor legado.")
+                self.executor = FallbackExecutor(self._hip, self._allocator, self.arena, self._graph, self.tensor_mapping, metadata=self.metadata)
+                self._use_hip_graph = False
+        else:
+            logger.info("ℹ️ HIP Graphs desabilitado via flag. Usando FallbackExecutor.")
+            self.executor = FallbackExecutor(self._hip, self._allocator, self.arena, self._graph, self.tensor_mapping, metadata=self.metadata)
+
+        self.lm_head = LMHead(self, self._hip, self._allocator, tokenizer=self.tokenizer)
+
+        from vte.core.gpu_keepalive import GPUKeepAlive
+        self._keepalive = GPUKeepAlive(self._hip, self._allocator)
+
+        self._is_loaded = True
+    
+    def _allocate_activation_buffers(self):
+        """
+        Aloca buffers persistentes na VRAM para as saídas intermediárias de cada nó.
+        Necessário para o HIP Graph (grafo estático = endereços fixos).
+        """
+        from vte.compiler.ir import NodeType
+        
+        if not hasattr(self, 'compute_graph') or self.compute_graph is None:
+            return
+        
+        allocated = 0
+        for node in self.compute_graph.topological_sort():
+            if node.op_type in [NodeType.INPUT, NodeType.OUTPUT]:
+                continue
+            
+            out_name = node.output_tensor
+            if not out_name or out_name in self.tensor_mapping:
+                continue
+
+            # Aloca PERSISTENTEMENTE a saída de todo nó de computação (não só as
+            # saídas finais de camada). O HIP Graph exige endereços fixos para
+            # TODOS os tensores intermediários referenciados durante a captura,
+            # já que não há alocação dinâmica possível dentro de um grafo estático.
+            #
+            # Dimensionamos a dimensão dinâmica (-1, seq_len) como 1: esses buffers
+            # persistentes são compartilhados por TODAS as capturas de grafo, e o
+            # caso dominante (decode autoregressivo, um token por passo) sempre usa
+            # seq_len=1. Dimensionar para context_length cheio custaria ~4.5GB só
+            # nesses buffers (28 camadas x tensores intermediários), inviável na
+            # VRAM disponível. Limitação conhecida: um prefill multi-token via
+            # HIPGraphExecutor pode gravar além do buffer se seq_len > 1 nesses
+            # tensores intermediários (não nas saídas finais persistentes, que já
+            # existiam antes e continuam corretas) — acompanhar em trabalho futuro
+            # de particionamento de buffers por "classe de shape" do grafo.
+            size = 1
+            for dim in node.shape:
+                if dim > 0:
+                    size *= dim
+                elif dim == -1:
+                    size *= 1
+            size = size * 2  # fp16
+            size = max(size, 512)
+            
+            block = self._allocator.allocate(size, f"act_{out_name}", MemoryRegion.ACTIVATIONS)
+            self.tensor_mapping[out_name] = block.ptr
+            allocated += 1
+        
+        logger.info(f"Buffers persistentes alocados: {allocated} tensores")
+
+    def generate(
+        self, 
+        prompt: str, 
+        max_tokens: int = 100,
+        temperature: float = 0.7,
+        top_p: float = 0.9
+    ):
+        """Gera texto como um Generator, permitindo interrupção caller-side."""
+        self._lifecycle.ensure_loaded()
+        self._lifecycle.touch()
+        
+        input_tokens = self.tokenizer.encode(prompt)
+        current_seq_len = len(input_tokens)
+
+        # Prefill processa o prompt (posições 0..N-1). Ao final, output_norm.output
+        # contém o hidden state da ÚLTIMA posição do prompt — é dele que sai a
+        # predição do PRIMEIRO token gerado. Não reprocessamos o último token.
+        #
+        # No modo HIP Graph, processamos o prompt token a token reutilizando o
+        # MESMO grafo de decode (seq_len=1, kv_offset variável) em vez do
+        # antigo execute_prefill em lote (grafo seq_len=N): os buffers de
+        # ativação persistentes são dimensionados para 1 posição, e um grafo
+        # de N posições sofreria o mesmo overflow/corrupção que foi corrigido
+        # no FallbackExecutor.prefill(). Como o grafo de decode já é
+        # capturado uma única vez e reaproveitado (replay puro), processar o
+        # prompt assim continua rápido — sem overhead de lançar 392 kernels
+        # em Python por token do prompt.
+        if self._use_hip_graph:
+            for pos, tok in enumerate(input_tokens):
+                self.executor.execute_decode(tok, kv_offset=pos)
+        else:
+            self.executor.prefill(input_tokens)
+
+        def _read_logits():
+            hidden_ptr = self.tensor_mapping.get('output_norm.output')
+            hidden_val = hidden_ptr.ptr if hasattr(hidden_ptr, 'ptr') else hidden_ptr
+            logits_ptr = self.lm_head.compute_logits(hidden_val, seq_len=1)
+            # O LM head grava logits em FP16 (mesmo tipo do matmul_kernel).
+            logits_buffer = bytearray(self.lm_head.vocab_size * 2)
+            self._hip.safe_memcpy_device_to_host(
+                logits_buffer, ctypes.c_void_p(logits_ptr), tag="logits_d2h"
+            )
+            return np.frombuffer(logits_buffer, dtype=np.float16).astype(np.float32)
+
+        logits = _read_logits()
+
+        for i in range(max_tokens):
+            next_token = self.sampler.sample(
+                logits=logits,
+                temperature=temperature,
+                top_p=top_p,
+                generated_tokens=input_tokens,
+            )
+            input_tokens.append(next_token)
+            word = self.tokenizer.decode([next_token])
+            yield word
+
+            current_seq_len += 1
+            if current_seq_len >= 4096:
+                break
+
+            # Processa o token recém-gerado na sua posição para prever o próximo.
+            if self._use_hip_graph:
+                self.executor.execute_decode(next_token, kv_offset=current_seq_len - 1)
+            else:
+                self.executor.decode_step(next_token, current_seq_len - 1)
+
+            # Antes 15ms fixos por token — virou um teto artificial de
+            # velocidade (~66 tok/s) depois que HIP Graph + fusão reduziram o
+            # tempo real de GPU por token bem abaixo disso. 2ms ainda dá um
+            # pulso de keep-alive (a função dispara o kernel minúsculo pelo
+            # menos uma vez), suficiente para suavizar a transição de clock
+            # sem virar o novo gargalo.
+            self._keepalive.pulse(0.002)
+            logits = _read_logits()
+
+    def generate_batch(
+        self,
+        prompts: list,
+        max_tokens: int = 100,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+    ):
+        """
+        Fase II (preparação para scheduler): gera para `len(prompts)`
+        sequências SIMULTANEAMENTE via BatchedHIPGraphExecutor — mesmos
+        pesos do modelo já carregado (compartilhados, sem duplicar VRAM),
+        KV cache/arena/RoPE cache alocados sob demanda para este batch_size.
+
+        Escopo desta etapa (deliberado, ver Fase I/plano): todos os prompts
+        precisam ter o MESMO número de tokens (lockstep puro). Suportar
+        prompts de tamanhos diferentes exige mascaramento de atenção para
+        ignorar posições de padding — isso é trabalho de scheduler real
+        (Fase II completa: fila de admissão, paginação de KV cache), não
+        uma mudança trivial de tokenização. Levantamos um erro claro em vez
+        de gerar silenciosamente resultados incorretos.
+
+        Yields:
+            list[str]: uma palavra por sequência do batch, a cada "tick".
+        """
+        self._lifecycle.ensure_loaded()
+        self._lifecycle.touch()
+
+        batch_size = len(prompts)
+        tokenized = [self.tokenizer.encode(p) for p in prompts]
+        lengths = {len(t) for t in tokenized}
+        if len(lengths) != 1:
+            raise ValueError(
+                f"generate_batch requer prompts do MESMO comprimento em tokens (lockstep) "
+                f"nesta etapa — recebido comprimentos {sorted(lengths)}. Padding com máscara de "
+                f"atenção fica para a Fase II completa (scheduler com admissão heterogênea)."
+            )
+        prompt_len = lengths.pop()
+
+        from vte.core.batched_hip_graph_executor import BatchedHIPGraphExecutor
+        batch_tensor_mapping = self._mapper.allocate_batch_runtime_state(
+            self.tensor_mapping, self._allocator, self._hip,
+            self._context_length, batch_size, profiler=self.profiler
+        )
+        batch_executor = BatchedHIPGraphExecutor(
+            self._hip, self._allocator, self._graph, batch_tensor_mapping, self.metadata, batch_size=batch_size
+        )
+
+        for pos in range(prompt_len):
+            tokens_at_pos = [tokenized[b][pos] for b in range(batch_size)]
+            batch_executor.execute_decode_batch(tokens_at_pos, [pos] * batch_size)
+
+        hidden_size = self.metadata.get('embedding_length', 1536)
+
+        def _read_logits_batch():
+            hidden_ptr = batch_tensor_mapping['output_norm.output']
+            hidden_val = hidden_ptr.ptr if hasattr(hidden_ptr, 'ptr') else hidden_ptr
+            logits_ptr = self.lm_head.compute_logits_batch(hidden_val, batch_size)
+            buf = bytearray(batch_size * self.lm_head.vocab_size * 2)
+            self._hip.safe_memcpy_device_to_host(buf, ctypes.c_void_p(logits_ptr), tag="logits_d2h")
+            return np.frombuffer(bytes(buf), dtype=np.float16).astype(np.float32).reshape(batch_size, self.lm_head.vocab_size)
+
+        logits_batch = _read_logits_batch()
+        current_seq_len = prompt_len
+
+        for i in range(max_tokens):
+            next_tokens = []
+            words = []
+            for b in range(batch_size):
+                tok = self.sampler.sample(
+                    logits=logits_batch[b], temperature=temperature, top_p=top_p,
+                    generated_tokens=tokenized[b],
+                )
+                tokenized[b].append(tok)
+                next_tokens.append(tok)
+                words.append(self.tokenizer.decode([tok]))
+            yield words
+
+            current_seq_len += 1
+            if current_seq_len >= 4096:
+                break
+
+            batch_executor.execute_decode_batch(next_tokens, [current_seq_len - 1] * batch_size)
+            self._keepalive.pulse(0.002)
+            logits_batch = _read_logits_batch()
+
+    def unload(self):
+        """Descarrega o modelo da VRAM (limpa slabs e libera HIP)."""
+        logger.info("Iniciando unload seguro do modelo...")
+        self._is_loaded = False
+        self._lifecycle.unload()
+        if self._allocator:
+            self._allocator.cleanup()
+            self._allocator = None
+        if self._hip:
+            self._hip.cleanup()
+            self._hip = None
+        logger.info("Modelo descarregado da VRAM com sucesso")
+
+    def get_vram_usage(self) -> dict:
+        """Retorna as estatísticas do VRAMProfiler"""
+        if self.profiler:
+            return self.profiler.get_summary_dict()
+        return {'total_mb': 0, 'weights_mb': 0, 'kv_cache_mb': 0, 'arena_mb': 0, 'scratch_mb': 0}
+
+    def get_model_status(self) -> dict:
+        """Retorna status do modelo"""
+        return self._lifecycle.get_status()
+    
+    def __del__(self):
+        try:
+            if hasattr(self, '_lifecycle') and self._lifecycle._is_loaded:
+                logger.info("Cleanup automático: descarregando modelo...")
+                self._lifecycle.unload()
+        except Exception as e:
+            logger.error(f"Erro no cleanup automático: {e}")
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.__del__()
+        return False

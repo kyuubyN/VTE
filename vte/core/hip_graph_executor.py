@@ -1,0 +1,477 @@
+"""
+Executor de alta performance usando HIP Graphs.
+
+Grava o fluxo de kernels uma vez e executa com overhead mínimo de Python (~5µs).
+O padrão de Staging Buffers separa a transferência de dados da execução do grafo,
+garantindo conformidade com a API de Stream Capture da AMD/HIP.
+
+Segurança de recursos da GPU: o grafo de decode é capturado UMA ÚNICA VEZ para
+toda a geração (o kv_cache_offset é lido de um ponteiro na VRAM, atualizado a
+cada passo, em vez de gravado como escalar fixo na captura). Grafos de prefill
+(um por tamanho de prompt distinto) são cacheados com um teto — o mais antigo é
+destruído (hipGraphExecDestroy) antes de capturar um novo além do limite, para
+não acumular recursos de GPU indefinidamente.
+"""
+
+import numpy as np
+import ctypes
+import shutil
+from collections import OrderedDict
+from typing import Dict, Optional, List
+from vte.bridge.hip_runtime import HIPRuntime
+from vte.bridge.memory import SlabAllocator, MemoryRegion
+from vte.compiler.ir import IRGraph, IRNode, NodeType
+from vte.compiler.codegen import CodegenEngine
+from vte.core.kernel_arg_builder import KernelArgBuilder
+from vte.bridge.logger import get_logger
+
+logger = get_logger(__name__)
+
+class GraphCaptureError(Exception):
+    pass
+
+class HIPGraphExecutor:
+    """
+    Executor de altíssima performance usando HIP Graphs.
+    Grava operações e as executa com < 5µs de overhead em Python.
+    """
+
+    DYNAMIC_INPUT_TENSORS = frozenset([
+        "input_ids", "input_embeddings", "hidden_states"
+    ])
+
+    MAX_CACHED_PREFILL_GRAPHS = 2
+
+    def __init__(self, hip: HIPRuntime, allocator: SlabAllocator, graph: IRGraph, tensor_mapping: dict, metadata: dict = None):
+        self.hip = hip
+        self.allocator = allocator
+        self.ir_graph = graph
+        self.tensor_mapping = tensor_mapping
+        self.metadata = metadata or {}
+
+        self.num_layers = 28
+        self.max_seq_len = 4096
+
+        self.decode_graph: Optional[ctypes.c_void_p] = None
+        self.prefill_graphs: "OrderedDict[int, ctypes.c_void_p]" = OrderedDict()
+
+        self._kernel_cache: Dict[str, tuple] = {}
+        self.arg_builder = KernelArgBuilder()
+
+        hipcc_available = shutil.which("hipcc") is not None
+        self._has_real_kernels = hipcc_available
+        if not hipcc_available:
+            logger.info("hipcc não encontrado. HIP Graph capturará grafo vazio (overhead mínimo via lançamento único).")
+
+        self.codegen = CodegenEngine()
+
+        self.staging_input = self.allocator.allocate(
+            size=self.max_seq_len * 4,
+            tag='staging_input',
+            region=MemoryRegion.SCRATCH
+        )
+
+        # Buffer de 1 int reutilizado por TODAS as capturas: o kernel lê o
+        # offset por ponteiro, então o mesmo grafo capturado uma vez continua
+        # correto em qualquer posição do KV cache — só este valor muda entre
+        # replays, nunca o grafo em si.
+        self.staging_kv_offset = self.allocator.allocate(
+            size=4,
+            tag='staging_kv_offset',
+            region=MemoryRegion.SCRATCH
+        )
+
+        self.staging_buffers = {
+            'input_ids': self.staging_input,
+            'input_embeddings': self.staging_input,
+        }
+
+        # Fusão Profunda: substitui os 5 kernels separados (attn_norm, q_proj,
+        # k_proj, v_proj, rope) por 3 lançamentos do kernel fundido, e os 4
+        # kernels do FFN (ffn_norm, gate_proj, up_proj, swiglu) por 1 — todos
+        # gravados no grafo com launch_kernel_recorded (mesma lógica do
+        # FallbackExecutor).
+        from vte.core.fused_qkv_dispatch import FusedQKVDispatcher, FusedFFNDispatcher, layer_input_tensor_name
+        self._fused_qkv = FusedQKVDispatcher(self.hip, self.codegen, self.metadata, allocator=self.allocator)
+        self._fused_ffn = FusedFFNDispatcher(self.hip, self.codegen, self.metadata)
+        self._layer_input_tensor_name = layer_input_tensor_name
+
+    def _get_or_compile_kernel(self, node: IRNode) -> Optional[ctypes.c_void_p]:
+        """
+        Compila e carrega o kernel para um nó, com cache para evitar recompilação.
+        Retorna None se hipcc não estiver disponível (modo simbólico).
+        """
+        if not self._has_real_kernels:
+            return None
+
+        arch = self.hip.get_gpu_architecture()
+
+        op_to_template = {
+            NodeType.RMSNORM: "rmsnorm",
+            NodeType.MATMUL: "matmul",
+            NodeType.ROPE: "rope",
+            NodeType.ATTENTION: "flash_attention",
+            NodeType.SWIGLU: "swiglu",
+            NodeType.ADD: "add",
+            "mega_kernel": "fused_rmsnorm_matmul_rope",
+        }
+        from vte.core.fallback_executor import _is_vectorized_matmul, _is_q4k_matmul, _is_q6k_matmul
+        if _is_q4k_matmul(node):
+            template = "gemv_q4k"
+        elif _is_q6k_matmul(node):
+            template = "gemv_q6k"
+        elif _is_vectorized_matmul(node):
+            template = "gemv_coalesced"
+        else:
+            template = op_to_template.get(node.op_type)
+        if template is None:
+            logger.warning(f"Sem template mapeado para op_type '{node.op_type}'. Nó ignorado na captura.")
+            return None
+
+        # A chave DEVE incluir o template: nós de MATMUL com a mesma shape mas
+        # kernels diferentes (ex.: down_proj Q4_K -> gemv_q4k vs attn_output
+        # FP16 -> gemv_coalesced, ambos shape (1,-1,1536)) colidiriam se a chave
+        # fosse só op_type+shape, fazendo um herdar o kernel do outro e ler o
+        # peso no formato errado (NaN). Este era o bug que só aparecia no grafo
+        # (o executor eager já chaveava por nome).
+        cache_key = f"{template}_{node.shape}"
+        if cache_key in self._kernel_cache:
+            return self._kernel_cache[cache_key][1]
+
+        try:
+            hsaco_path = self.codegen.compile_kernel(
+                template_name=template,
+                arch=arch,
+                hidden_size=node.shape[-1] if node.shape else 1536,
+                is_mega_kernel=(node.op_type == "mega_kernel")
+            )
+
+            module, function = self.hip.load_kernel(hsaco_path, f"{template}_kernel")
+            self._kernel_cache[cache_key] = (module, function)
+            return function
+        except Exception as e:
+            logger.warning(f"Kernel {template} não compilado: {e}. Nó ignorado na captura.")
+            return None
+
+    def _capture_embedding_lookup(self, seq_len: int):
+        """
+        Grava o kernel de embedding lookup como a PRIMEIRA operação do grafo,
+        lendo os token ids do staging_input (atualizado antes de cada replay)
+        e escrevendo em 'input_embeddings' (endereço fixo lido por
+        blk.0.attn_norm).
+
+        Sem isso, o grafo nunca calcula embeddings de verdade: o compute
+        graph (qwen_compute.py) só tem um nó INPUT marcador (sempre pulado no
+        despacho), não um nó de embedding real — só o FallbackExecutor tinha
+        um método manual para isso, nunca chamado pelo HIPGraphExecutor. O
+        resultado era que 'input_embeddings' ficava com o mesmo conteúdo
+        "congelado" em todo replay, ignorando o token realmente processado.
+        """
+        arch = self.hip.get_gpu_architecture()
+        from vte.core.fallback_executor import RAW_Q6K_WEIGHTS
+        template = "embedding_lookup_q6k" if 'token_embd.weight' in RAW_Q6K_WEIGHTS else "embedding_lookup"
+        cache_key = template
+        if cache_key not in self._kernel_cache:
+            hsaco_path = self.codegen.compile_kernel(template_name=template, arch=arch)
+            module, function = self.hip.load_kernel(hsaco_path, f"{template}_kernel")
+            self._kernel_cache[cache_key] = (module, function)
+        else:
+            function = self._kernel_cache[cache_key][1]
+
+        embed_weight_ptr = self.tensor_mapping.get('token_embd.weight')
+        embed_ptr_val = embed_weight_ptr.ptr if hasattr(embed_weight_ptr, 'ptr') else embed_weight_ptr
+        output_ptr = self.tensor_mapping.get('input_embeddings')
+        out_ptr_val = output_ptr.ptr if hasattr(output_ptr, 'ptr') else output_ptr
+        hidden_size = self.metadata.get('embedding_length', 1536)
+
+        args = [
+            ctypes.c_void_p(self.staging_input.ptr),
+            ctypes.c_void_p(embed_ptr_val),
+            ctypes.c_void_p(out_ptr_val),
+            ctypes.c_int(seq_len),
+            ctypes.c_int(hidden_size),
+        ]
+        total_elements = seq_len * hidden_size
+        block_size = 256
+        grid_size = max(1, (total_elements + block_size - 1) // block_size)
+        self.hip.launch_kernel_recorded(function, args, (grid_size, 1, 1), (block_size, 1, 1), 0)
+
+    def _build_kernel_args(self, node: IRNode, seq_len: int) -> list:
+        """
+        Monta os argumentos (ponteiros VRAM + escalares) na ABI exata esperada
+        pelo kernel, usando o mesmo KernelArgBuilder do FallbackExecutor.
+        Tensores de input dinâmico são redirecionados para o Staging Buffer.
+        O kv_cache_offset é sempre passado como PONTEIRO (staging_kv_offset),
+        nunca como escalar — é isso que permite reutilizar o grafo capturado.
+        """
+        args, _ = self.arg_builder.build_args(
+            node=node,
+            tensor_mapping=self.tensor_mapping,
+            staging_buffers=self.staging_buffers,
+            seq_len=seq_len,
+            metadata=self.metadata,
+            kv_offset_ptr=self.staging_kv_offset.ptr,
+        )
+        return args
+
+    def _calculate_launch_dims(self, node: IRNode, seq_len: int, batch: int = 1) -> tuple:
+        """
+        Calcula Grid (x, y, z), Block (x, y, z) e Shared Memory por tipo de nó,
+        replicando exatamente o indexing (blockIdx.x/y, threadIdx.x) esperado por
+        cada kernel .hip — usar uma fórmula genérica aqui desalinha blockIdx.y de
+        MATMUL/ATTENTION com o que o kernel espera (só a "linha 0" seria
+        computada corretamente) e gera lançamentos muito maiores que o
+        necessário, sobrecarregando a GPU sem necessidade.
+
+        `batch` default=1 preserva o comportamento de produção existente; a
+        Fase I (Batched Decode) passa o batch_size real.
+        """
+        block_size = 256
+
+        if node.op_type == NodeType.MATMUL:
+            from vte.core.fallback_executor import _is_vectorized_matmul, _is_q4k_matmul, _is_q6k_matmul, _coalesced_gemv_dims
+            if _is_q4k_matmul(node) or _is_q6k_matmul(node) or _is_vectorized_matmul(node):
+                return _coalesced_gemv_dims(node, seq_len, batch)
+            out_features = node.shape[-1]
+            m = batch * seq_len
+            grid_x = (out_features + block_size - 1) // block_size
+            return (grid_x, m, 1), (block_size, 1, 1), 0
+
+        if node.op_type == NodeType.RMSNORM:
+            return (batch * seq_len, 1, 1), (block_size, 1, 1), 0
+
+        if node.op_type == NodeType.ATTENTION:
+            # FlashDecoding: 1 bloco por (batch, q_head), head_dim threads/bloco
+            # (uma dimensão de saída por thread). LDS = q_sh + red = 2*head_dim.
+            num_q_heads = self.metadata.get('attention.head_count', 12)
+            head_dim = self.metadata.get('attention.key_length', 128)
+            shared = 2 * head_dim * 4
+            return (batch, num_q_heads, 1), (head_dim, 1, 1), shared
+
+        if node.op_type == NodeType.ROPE:
+            # blockIdx.y = batch_idx explícito (rope.hip.template, Fase I).
+            total_elements = seq_len
+            if node.shape:
+                for dim in node.shape:
+                    if dim > 0:
+                        total_elements *= dim
+            grid_x = max(1, (total_elements + block_size - 1) // block_size)
+            return (grid_x, batch, 1), (block_size, 1, 1), 0
+
+        if node.op_type in [NodeType.SWIGLU, NodeType.ADD]:
+            total_elements = batch * seq_len
+            if node.shape:
+                for dim in node.shape:
+                    if dim > 0:
+                        total_elements *= dim
+            grid_x = max(1, (total_elements + block_size - 1) // block_size)
+            return (grid_x, 1, 1), (block_size, 1, 1), 0
+
+        return (1, 1, 1), (block_size, 1, 1), 0
+
+    def _capture_graph(self, mode: str, seq_len: int) -> ctypes.c_void_p:
+        """
+        Captura o fluxo de kernels no stream da AMD.
+
+        Se hipcc estiver disponível: grava kernels reais compilados.
+        Se não estiver: grava um grafo vazio (overhead Python é removido via graph_launch).
+        """
+        logger.info(f"Iniciando captura de HIP Graph para mode='{mode}', seq_len={seq_len}")
+
+        nodes_recorded = 0
+        raw_graph = None
+
+        try:
+            self.hip.stream_begin_capture()
+
+            if self._has_real_kernels:
+                self._capture_embedding_lookup(seq_len)
+                nodes_recorded += 1
+
+            # Fusão Profunda: quando encontramos o attn_norm de uma camada
+            # (seq_len==1, único caso suportado pelo kernel fundido), gravamos
+            # 3 lançamentos do kernel fundido em vez dos 5 nós separados
+            # (attn_norm, q_proj, k_proj, v_proj, rope) e pulamos os outros 4
+            # nós dessa camada no restante do loop.
+            fused_skip_names: set = set()
+
+            from vte.core.fallback_executor import SKIP_ADD_NODES
+            for node in self.ir_graph.topological_sort():
+                if node.op_type in [NodeType.INPUT, NodeType.OUTPUT]:
+                    continue
+                if getattr(node, 'is_fused', False):
+                    continue
+                # Epilogue Fusion: o Add do residual foi fundido no GEMV anterior,
+                # então não gravamos esse nó no grafo (mata 56 launches/tok).
+                if node.name in SKIP_ADD_NODES:
+                    continue
+                if seq_len == 1 and node.name in fused_skip_names:
+                    continue
+
+                if seq_len == 1 and node.op_type == NodeType.RMSNORM and node.name.endswith('.attn_norm'):
+                    layer_idx = int(node.name.split('.')[1])
+                    try:
+                        launches = self._fused_qkv.build_launches(
+                            layer_idx, self.tensor_mapping, self.staging_kv_offset.ptr
+                        )
+                        for fn, args, grid, block, shared_mem in launches:
+                            self.hip.launch_kernel_recorded(fn, args, grid, block, shared_mem)
+                            nodes_recorded += 1
+                        fused_skip_names.update({
+                            f"blk.{layer_idx}.attn_norm", f"blk.{layer_idx}.q_proj",
+                            f"blk.{layer_idx}.k_proj", f"blk.{layer_idx}.v_proj",
+                            f"blk.{layer_idx}.rope",
+                        })
+                        continue
+                    except Exception as e:
+                        logger.warning(
+                            f"Fusão QKV falhou na captura (camada {layer_idx}): {e}. "
+                            f"Usando kernels separados para esta camada."
+                        )
+
+                # Fusão do FFN DESATIVADA por padrão: medida empiricamente, tanto
+                # a versão totalmente fundida (RMSNorm+Gate+Up+SiLU em 1 kernel)
+                # quanto a versão com RMSNorm separado (2 kernels) ficaram MAIS
+                # LENTAS que os 4 kernels originais (ffn_norm+gate_proj+up_proj+
+                # swiglu, cada um com cache em LDS) — 12.7-13.5 tok/s fundido vs
+                # 18.8 tok/s separado, no mesmo hardware/prompt. Provável causa:
+                # o loop de 2 acumuladores (gate_sum/up_sum) no mesmo laço
+                # aumenta a pressão de registradores por thread, reduzindo a
+                # ocupância o suficiente para superar o ganho de menos round-
+                # trips de VRAM. Ao contrário da fusão QKV (16 blocos, ganho
+                # real), aqui o grid tem ~35 blocos e o trade-off não compensa.
+                # Mantido como opt-in via VTE_ENABLE_FFN_FUSION para experimentos.
+                import os as _os
+                if seq_len == 1 and _os.environ.get('VTE_ENABLE_FFN_FUSION') and node.op_type == NodeType.RMSNORM and node.name.endswith('.ffn_norm'):
+                    layer_idx = int(node.name.split('.')[1])
+                    try:
+                        launches = self._fused_ffn.build_launches(
+                            layer_idx, self.tensor_mapping
+                        )
+                        for fn, args, grid, block, shared_mem in launches:
+                            self.hip.launch_kernel_recorded(fn, args, grid, block, shared_mem)
+                            nodes_recorded += 1
+                        fused_skip_names.update({
+                            f"blk.{layer_idx}.ffn_norm", f"blk.{layer_idx}.gate_proj",
+                            f"blk.{layer_idx}.up_proj", f"blk.{layer_idx}.swiglu",
+                        })
+                        continue
+                    except Exception as e:
+                        logger.warning(
+                            f"Fusão FFN falhou na captura (camada {layer_idx}): {e}. "
+                            f"Usando kernels separados para esta camada."
+                        )
+
+                kernel_func = self._get_or_compile_kernel(node)
+
+                if kernel_func is None:
+                    continue
+
+                args = self._build_kernel_args(node, seq_len)
+                grid, block, shared_mem = self._calculate_launch_dims(node, seq_len)
+
+                self.hip.launch_kernel_recorded(kernel_func, args, grid, block, shared_mem)
+                nodes_recorded += 1
+
+            raw_graph = self.hip.stream_end_capture()
+            graph_exec = self.hip.graph_instantiate(raw_graph)
+
+            # O hipGraph_t "molde" não é mais necessário depois de instanciado
+            # (só o hipGraphExec_t é usado nos replays); liberamos na hora para
+            # não acumular recursos de GPU a cada captura.
+            try:
+                self.hip.graph_destroy(raw_graph)
+            except Exception as cleanup_err:
+                logger.warning(f"Falha ao destruir hipGraph_t intermediário de '{mode}': {cleanup_err}")
+
+            logger.info(f"HIP Graph instanciado para '{mode}': {nodes_recorded} kernels gravados")
+            return graph_exec
+
+        except Exception as e:
+            logger.error(f"Falha na captura do grafo {mode}: {e}")
+            try:
+                self.hip.stream_end_capture()
+            except Exception:
+                pass
+            raise GraphCaptureError(f"Erro ao compilar HIP Graph: {e}")
+
+    def build_decode_graph(self):
+        """
+        Constrói o grafo de decode (1 token por passo auto-regressivo) — capturado
+        uma ÚNICA VEZ para toda a geração. Como o kv_cache_offset é lido por
+        ponteiro (não escalar), o mesmo grafo é válido para qualquer posição do
+        KV cache; apenas o valor em staging_kv_offset muda entre replays.
+        """
+        if self.decode_graph is None:
+            self.decode_graph = self._capture_graph(mode='decode', seq_len=1)
+
+    def build_prefill_graph(self, seq_len: int):
+        """
+        Constrói (ou reaproveita do cache) o grafo para o tamanho exato do prompt.
+        Mantém no máximo MAX_CACHED_PREFILL_GRAPHS grafos simultâneos na GPU,
+        destruindo o mais antigo (hipGraphExecDestroy) antes de capturar um novo,
+        para não acumular recursos indefinidamente entre gerações com prompts de
+        tamanhos diferentes.
+        """
+        if seq_len in self.prefill_graphs:
+            self.prefill_graphs.move_to_end(seq_len)
+            return
+
+        while len(self.prefill_graphs) >= self.MAX_CACHED_PREFILL_GRAPHS:
+            oldest_seq_len, oldest_graph = self.prefill_graphs.popitem(last=False)
+            try:
+                self.hip.graph_exec_destroy(oldest_graph)
+                logger.info(f"HIP Graph de prefill descartado (seq_len={oldest_seq_len}) para liberar recursos da GPU.")
+            except Exception as cleanup_err:
+                logger.warning(f"Falha ao destruir HIP Graph de prefill (seq_len={oldest_seq_len}): {cleanup_err}")
+
+        self.prefill_graphs[seq_len] = self._capture_graph(mode=f'prefill_{seq_len}', seq_len=seq_len)
+
+    def _update_staging_buffers(self, token_id: int, kv_offset: int):
+        """
+        Copia dados novos da RAM para VRAM nos Staging Buffers (~1-2µs).
+        Ocorre FORA da captura do grafo, respeitando a regra de ouro da API HIP.
+        """
+        tok_arr = np.array([token_id], dtype=np.int32)
+        kv_arr = np.array([kv_offset], dtype=np.int32)
+
+        self.hip.safe_memcpy_host_to_device(
+            ctypes.c_void_p(self.staging_input.ptr),
+            tok_arr.tobytes(),
+            tag="update_input_token"
+        )
+        self.hip.safe_memcpy_host_to_device(
+            ctypes.c_void_p(self.staging_kv_offset.ptr),
+            kv_arr.tobytes(),
+            tag="update_kv_offset"
+        )
+
+    def execute_prefill(self, tokens: List[int]):
+        """Executa a primeira passada no modelo (processa o prompt)."""
+        seq_len = len(tokens)
+
+        self.build_prefill_graph(seq_len)
+
+        tok_arr = np.array(tokens, dtype=np.int32)
+        self.hip.safe_memcpy_host_to_device(
+            ctypes.c_void_p(self.staging_input.ptr),
+            tok_arr.tobytes(),
+            tag="prefill_input"
+        )
+        self.hip.safe_memcpy_host_to_device(
+            ctypes.c_void_p(self.staging_kv_offset.ptr),
+            np.array([0], dtype=np.int32).tobytes(),
+            tag="update_kv_offset"
+        )
+
+        self.hip.graph_launch(self.prefill_graphs[seq_len])
+        self.hip.synchronize()
+
+    def execute_decode(self, token_id: int, kv_offset: int):
+        """Executa um passo auto-regressivo no grafo único de decode (replay puro)."""
+        self.build_decode_graph()
+
+        self._update_staging_buffers(token_id, kv_offset)
+
+        self.hip.graph_launch(self.decode_graph)
+        self.hip.synchronize()

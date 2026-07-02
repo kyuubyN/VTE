@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vte"
+version = "0.1.0"
+description = "VTE (Vector & Tensor Engine) - Motor de inferência AMD-native para Windows"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "VTE Contributors"}
+]
+keywords = ["llm", "inference", "amd", "rocm", "hip", "gpu", "windows"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Operating System :: Microsoft :: Windows :: Windows 10",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+]
+dependencies = [
+    "numpy>=1.21.0",
+    "flet>=0.85.3",
+    "tiktoken>=0.6.0",
+    "WMI>=1.5.10; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "mypy>=1.0.0",
+    "hip-python>=0.1.0",
+    "gguf>=0.19.0",
+    "transformers>=5.12.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/kyuubyN/VTE---Vector-Tensor-Engine"
+Repository = "https://github.com/kyuubyN/VTE---Vector-Tensor-Engine"
+Documentation = "https://github.com/kyuubyN/VTE---Vector-Tensor-Engine#readme"
+Issues = "https://github.com/kyuubyN/VTE---Vector-Tensor-Engine/issues"
+
+[project.scripts]
+vte-ui = "vte.ui.main:cli_main"
+
+[tool.setuptools]
+packages = ["vte", "vte.bridge", "vte.compiler", "vte.core", "vte.ui"]
+
+[tool.setuptools.package-data]
+vte = ["templates/*.hip.template", "reference/*.py"]

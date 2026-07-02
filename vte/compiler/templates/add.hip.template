@@ -1,0 +1,14 @@
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+
+extern "C" __global__ void add_kernel(
+    const __half* __restrict__ residual,
+    const __half* __restrict__ input,
+    __half* __restrict__ output,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = residual[idx] + input[idx];
+    }
+}
