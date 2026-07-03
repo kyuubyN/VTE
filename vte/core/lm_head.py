@@ -10,30 +10,43 @@ class LMHead:
     Projeção final: (batch, seq, hidden_size) @ (hidden_size, vocab_size) → logits
     """
     
-    def __init__(self, model, hip, allocator, tokenizer=None):
+    def __init__(self, model, hip, allocator, tokenizer=None, logits_buffer=None, kernel_info=None):
         self.model = model
         self.hip = hip
         self.allocator = allocator
         self.tokenizer = tokenizer
-        
+
         self.config = ModelConfig(model)
         self.hidden_size = self.config.hidden_size
-        
+
         self.vocab_size = self._resolve_vocab_size(self.config._metadata)
-        
+
         self._validate_weight_shape()
-        
-        # O matmul_kernel escreve a saída em FP16 (__float2half), então o
-        # buffer de logits DEVE ser FP16 (2 bytes/elemento). Antes era
-        # alocado/lido como FP32 (4 bytes): o host reinterpretava pares de
-        # valores FP16 adjacentes como um único FP32, produzindo logits
-        # completamente corrompidos (magnitude ~1e7) mesmo com o hidden state
-        # correto. Logits reais (~±40) cabem folgado na faixa do FP16.
-        self.logits_buffer = allocator.allocate(
-            size=self.vocab_size * 2,  # FP16 (2 bytes por elemento)
-            tag="logits_output",
-            region=MemoryRegion.SCRATCH
-        ).ptr
+
+        if logits_buffer is not None:
+            # Fase 2 (LM Head no HIP Graph): reaproveita o MESMO buffer já
+            # alocado e usado por model.py ao capturar o LM Head dentro do
+            # grafo de decode -- é o endereço que o replay realmente escreve,
+            # não pode ser um segundo buffer independente.
+            self.logits_buffer = logits_buffer
+        else:
+            # O matmul_kernel escreve a saída em FP16 (__float2half), então o
+            # buffer de logits DEVE ser FP16 (2 bytes/elemento). Antes era
+            # alocado/lido como FP32 (4 bytes): o host reinterpretava pares de
+            # valores FP16 adjacentes como um único FP32, produzindo logits
+            # completamente corrompidos (magnitude ~1e7) mesmo com o hidden state
+            # correto. Logits reais (~±40) cabem folgado na faixa do FP16.
+            self.logits_buffer = allocator.allocate(
+                size=self.vocab_size * 2,  # FP16 (2 bytes por elemento)
+                tag="logits_output",
+                region=MemoryRegion.SCRATCH
+            ).ptr
+
+        # Se pré-compilado (LM Head já capturado no grafo por model.py),
+        # compute_logits() reaproveita em vez de recompilar -- só é chamado
+        # de fato quando o caminho eager ainda está ativo (fallback sem HIP
+        # Graph, ou algum uso direto fora do loop principal de generate()).
+        self._kernel_info = kernel_info
 
         # Fase I (Batched Decode): buffer [batch_size, vocab_size] alocado sob
         # demanda na primeira chamada de compute_logits_batch (não sabemos o
@@ -104,21 +117,29 @@ class LMHead:
         # 2 bytes por fp16 element
         last_hidden_ptr = hidden_states_ptr + (seq_len - 1) * self.hidden_size * 2
 
-        # Fase D.1: o lm_head é o maior GEMV puro do modelo (vocab=151936 x
-        # hidden=1536, ~466MB em FP16). Se o peso ficou cru em Q6_K (tied
-        # embeddings, ver is_raw_q6k_weight), usamos o gemv_q6k (No-Sync Direct
-        # Unpack) — corta a leitura para ~189MB/token. Senão, FP16 coalescido.
-        from vte.compiler.qwen_mapper import is_raw_q6k_weight
-        tensor_info = self.model.parser.tensors.get(lm_head_name, {})
-        template = "gemv_q6k" if is_raw_q6k_weight(lm_head_name, tensor_info) else "gemv_coalesced"
+        if self._kernel_info is not None:
+            # Já resolvido por model.py antes da captura do grafo (Fase 2) --
+            # evita recompilar/recarregar o mesmo kernel à toa. Só chega
+            # aqui de fato se o caminho de chamada não for o grafo (ex.:
+            # fallback eager), já que o loop principal de generate() não
+            # invoca compute_logits() quando o LM Head já está no grafo.
+            kernel = self._kernel_info['kernel']
+        else:
+            # Fase D.1: o lm_head é o maior GEMV puro do modelo (vocab=151936 x
+            # hidden=1536, ~466MB em FP16). Se o peso ficou cru em Q6_K (tied
+            # embeddings, ver is_raw_q6k_weight), usamos o gemv_q6k (No-Sync Direct
+            # Unpack) — corta a leitura para ~189MB/token. Senão, FP16 coalescido.
+            from vte.compiler.qwen_mapper import is_raw_q6k_weight
+            tensor_info = self.model.parser.tensors.get(lm_head_name, {})
+            template = "gemv_q6k" if is_raw_q6k_weight(lm_head_name, tensor_info) else "gemv_coalesced"
 
-        hsaco_path = self.model.executor.codegen.compile_kernel(
-            template_name=template,
-            arch=self.hip.get_gpu_architecture(),
-            hidden_size=self.hidden_size,
-            tile_size=256
-        )
-        mod, kernel = self.hip.load_kernel(hsaco_path, f"{template}_kernel")
+            hsaco_path = self.model.executor.codegen.compile_kernel(
+                template_name=template,
+                arch=self.hip.get_gpu_architecture(),
+                hidden_size=self.hidden_size,
+                tile_size=256
+            )
+            mod, kernel = self.hip.load_kernel(hsaco_path, f"{template}_kernel")
 
         # Args: input, weight, output, batch, seq, in_features, out_features, bias
         # O LM head não tem bias no Qwen2.5 → bias = nullptr (0).

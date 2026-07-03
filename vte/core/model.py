@@ -236,20 +236,49 @@ class VTEModel:
         # Aloca buffers de ativação persistentes para o HIP Graph
         self._allocate_activation_buffers()
 
+        lm_head_capture_info = None
+        if self._use_hip_graph:
+            # Resolve os dados do LM Head (peso/tied embeddings, buffer de
+            # logits, kernel compilado) ANTES de construir o HIPGraphExecutor,
+            # para poder gravá-lo DENTRO do mesmo grafo de decode (elimina o
+            # lançamento eager separado a cada token, ~3.19ms/tok medidos).
+            # Não dá para simplesmente criar o LMHead primeiro: LMHead.
+            # compute_logits() reaproveita self.model.executor.codegen, que
+            # ainda não existiria — usamos aqui uma instância própria de
+            # CodegenEngine (o cache de kernel compilado é em disco, por hash
+            # de conteúdo, não fica preso à instância).
+            try:
+                lm_head_capture_info = self._resolve_lm_head_capture_info()
+            except Exception as e:
+                logger.warning(f"⚠️ Não foi possível pré-resolver o LM Head para captura no grafo: {e}. "
+                                f"LM Head continuará rodando eager, fora do grafo.")
+                lm_head_capture_info = None
+
         if self._use_hip_graph:
             try:
-                self.executor = HIPGraphExecutor(self._hip, self._allocator, self._graph, self.tensor_mapping, metadata=self.metadata)
+                self.executor = HIPGraphExecutor(self._hip, self._allocator, self._graph, self.tensor_mapping,
+                                                  metadata=self.metadata, lm_head_info=lm_head_capture_info)
                 self.executor.build_decode_graph()
                 logger.info(f"✅ HIP Graph executor inicializado com sucesso (Nós: {len(self._graph.nodes)})")
             except Exception as e:
                 logger.warning(f"⚠️ HIP Graph falhou: {e}. Fazendo fallback para executor legado.")
                 self.executor = FallbackExecutor(self._hip, self._allocator, self.arena, self._graph, self.tensor_mapping, metadata=self.metadata)
                 self._use_hip_graph = False
+                lm_head_capture_info = None
         else:
             logger.info("ℹ️ HIP Graphs desabilitado via flag. Usando FallbackExecutor.")
             self.executor = FallbackExecutor(self._hip, self._allocator, self.arena, self._graph, self.tensor_mapping, metadata=self.metadata)
 
-        self.lm_head = LMHead(self, self._hip, self._allocator, tokenizer=self.tokenizer)
+        if lm_head_capture_info is not None:
+            # HIP Graph capturou o LM Head: o LMHead reaproveita o MESMO
+            # buffer/kernel já resolvidos, em vez de alocar/compilar de novo
+            # (um segundo buffer não seria o que o grafo escreve).
+            self.lm_head = LMHead(self, self._hip, self._allocator, tokenizer=self.tokenizer,
+                                   logits_buffer=lm_head_capture_info['logits_buffer_ptr'],
+                                   kernel_info={'kernel': lm_head_capture_info['kernel_fn'],
+                                                'template': lm_head_capture_info['template']})
+        else:
+            self.lm_head = LMHead(self, self._hip, self._allocator, tokenizer=self.tokenizer)
 
         from vte.core.gpu_keepalive import GPUKeepAlive
         self._keepalive = GPUKeepAlive(self._hip, self._allocator)
@@ -302,8 +331,68 @@ class VTEModel:
             block = self._allocator.allocate(size, f"act_{out_name}", MemoryRegion.ACTIVATIONS)
             self.tensor_mapping[out_name] = block.ptr
             allocated += 1
-        
+
         logger.info(f"Buffers persistentes alocados: {allocated} tensores")
+
+    def _resolve_lm_head_capture_info(self) -> dict:
+        """
+        Resolve peso (com tied embeddings), aloca o buffer de logits e
+        compila o kernel do LM Head — tudo ANTES do HIPGraphExecutor existir,
+        para que a captura do grafo de decode possa gravar o LM Head como
+        mais um nó (mesmos requisitos de endereço fixo dos demais tensores).
+
+        Réplica deliberada da lógica de resolução em LMHead (nome do peso
+        tied, critério gemv_q6k vs gemv_coalesced) — não dá para reaproveitar
+        LMHead diretamente aqui porque LMHead.compute_logits() depende de
+        self.model.executor.codegen, e o executor ainda não existe neste
+        ponto. Usamos uma instância própria de CodegenEngine: o cache de
+        kernel compilado é em disco, por hash do template renderizado, então
+        não importa qual instância compila — o binário final é o mesmo.
+        """
+        from vte.compiler.codegen import CodegenEngine
+        from vte.compiler.qwen_mapper import is_raw_q6k_weight
+
+        hidden_size = self.metadata.get('embedding_length', 1536)
+
+        lm_head_name = 'output.weight'
+        lm_head_ptr = self.tensor_mapping.get(lm_head_name)
+        if lm_head_ptr is None:
+            lm_head_name = 'token_embd.weight'
+            lm_head_ptr = self.tensor_mapping.get(lm_head_name)
+        if lm_head_ptr is None:
+            raise ValueError("Peso do LM Head não encontrado em tensor_mapping (nem output.weight, nem token_embd.weight).")
+        weight_ptr = lm_head_ptr.ptr if hasattr(lm_head_ptr, 'ptr') else lm_head_ptr
+
+        tensor_info = self.parser.tensors.get(lm_head_name, {})
+        weight_shape = tensor_info.get('shape')
+        if not weight_shape:
+            raise ValueError(f"Shape do peso do LM Head não encontrado ({lm_head_name}).")
+        vocab_size = weight_shape[0]
+
+        logits_block = self._allocator.allocate(
+            size=vocab_size * 2,  # FP16, batch=1 (regime de decode) -- tamanho fixo, nunca muda
+            tag="logits_output",
+            region=MemoryRegion.SCRATCH
+        )
+
+        template = "gemv_q6k" if is_raw_q6k_weight(lm_head_name, tensor_info) else "gemv_coalesced"
+        codegen = CodegenEngine()
+        hsaco_path = codegen.compile_kernel(
+            template_name=template,
+            arch=self._hip.get_gpu_architecture(),
+            hidden_size=hidden_size,
+            tile_size=256
+        )
+        _, kernel_fn = self._hip.load_kernel(hsaco_path, f"{template}_kernel")
+
+        return {
+            'weight_ptr': weight_ptr,
+            'logits_buffer_ptr': logits_block.ptr,
+            'kernel_fn': kernel_fn,
+            'template': template,
+            'vocab_size': vocab_size,
+            'hidden_size': hidden_size,
+        }
 
     def generate(
         self, 
@@ -338,12 +427,25 @@ class VTEModel:
         else:
             self.executor.prefill(input_tokens)
 
+        # Fase 2 (LM Head no HIP Graph): quando o executor capturou o LM Head
+        # dentro do próprio grafo de decode, o replay de execute_decode() já
+        # escreveu os logits em lm_head.logits_buffer -- chamar
+        # compute_logits() de novo aqui recalcularia a mesma GEMV eager,
+        # duplicando o trabalho e anulando o ganho (~3.19ms/tok medidos).
+        # Nesse caso, _read_logits só lê o que já está pronto na VRAM.
+        lm_head_captured_in_graph = (
+            self._use_hip_graph and getattr(self.executor, 'lm_head_info', None) is not None
+        )
+
         def _read_logits():
-            hidden_ptr = self.tensor_mapping.get('output_norm.output')
-            hidden_val = hidden_ptr.ptr if hasattr(hidden_ptr, 'ptr') else hidden_ptr
-            logits_ptr = self.lm_head.compute_logits(hidden_val, seq_len=1)
-            # O LM head grava logits em FP16 (mesmo tipo do matmul_kernel).
             logits_buffer = bytearray(self.lm_head.vocab_size * 2)
+            if lm_head_captured_in_graph:
+                logits_ptr = self.lm_head.logits_buffer
+            else:
+                hidden_ptr = self.tensor_mapping.get('output_norm.output')
+                hidden_val = hidden_ptr.ptr if hasattr(hidden_ptr, 'ptr') else hidden_ptr
+                logits_ptr = self.lm_head.compute_logits(hidden_val, seq_len=1)
+            # O LM head grava logits em FP16 (mesmo tipo do matmul_kernel).
             self._hip.safe_memcpy_device_to_host(
                 logits_buffer, ctypes.c_void_p(logits_ptr), tag="logits_d2h"
             )

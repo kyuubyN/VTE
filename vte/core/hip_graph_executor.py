@@ -42,12 +42,20 @@ class HIPGraphExecutor:
 
     MAX_CACHED_PREFILL_GRAPHS = 2
 
-    def __init__(self, hip: HIPRuntime, allocator: SlabAllocator, graph: IRGraph, tensor_mapping: dict, metadata: dict = None):
+    def __init__(self, hip: HIPRuntime, allocator: SlabAllocator, graph: IRGraph, tensor_mapping: dict, metadata: dict = None, lm_head_info: dict = None):
         self.hip = hip
         self.allocator = allocator
         self.ir_graph = graph
         self.tensor_mapping = tensor_mapping
         self.metadata = metadata or {}
+
+        # Fase 2 (41->100 tok/s): se resolvido em model.py ANTES deste
+        # executor existir (peso/tied embeddings, logits_buffer, kernel já
+        # compilado -- todos endereços fixos), o LM Head é gravado DENTRO do
+        # grafo de decode em vez de rodar como lançamento eager separado a
+        # cada token (eliminava ~3.19ms/tok de overhead de despacho). Só se
+        # aplica ao grafo de decode (seq_len sempre 1) -- ver _capture_graph.
+        self.lm_head_info = lm_head_info
 
         self.num_layers = 28
         self.max_seq_len = 4096
@@ -269,6 +277,42 @@ class HIPGraphExecutor:
 
         return (1, 1, 1), (block_size, 1, 1), 0
 
+    def _capture_lm_head(self):
+        """
+        Grava o lançamento do LM Head (GEMV final, vocab x hidden) DENTRO do
+        grafo de decode, usando os ponteiros/kernel já resolvidos em
+        model.py._resolve_lm_head_capture_info() antes deste executor
+        existir. Mesma assinatura de 9 argumentos de gemv_coalesced/
+        gemv_q4k/gemv_q6k (input, weight, output, batch, seq_len,
+        in_features, out_features, bias_ptr, residual_ptr) -- batch e
+        seq_len são sempre 1 aqui (grafo de decode), então entram como
+        constantes, não como ponteiros: não mudam entre replays, ao
+        contrário do kv_cache_offset (que por isso é lido por ponteiro).
+        """
+        info = self.lm_head_info
+        last_hidden_ptr = self.tensor_mapping.get('output_norm.output')
+        last_hidden_val = last_hidden_ptr.ptr if hasattr(last_hidden_ptr, 'ptr') else last_hidden_ptr
+
+        args = [
+            ctypes.c_void_p(last_hidden_val),
+            ctypes.c_void_p(info['weight_ptr']),
+            ctypes.c_void_p(info['logits_buffer_ptr']),
+            ctypes.c_int(1),                     # batch
+            ctypes.c_int(1),                     # seq_len (decode: sempre 1)
+            ctypes.c_int(info['hidden_size']),
+            ctypes.c_int(info['vocab_size']),
+            ctypes.c_void_p(0),                  # bias (LM head não tem)
+            ctypes.c_void_p(0),                  # residual (sem epilogue aqui)
+        ]
+
+        self.hip.launch_kernel_recorded(
+            function=info['kernel_fn'],
+            args=args,
+            grid=(info['vocab_size'], 1, 1),
+            block=(64, 1, 1),
+            shared_mem=0,
+        )
+
     def _capture_graph(self, mode: str, seq_len: int) -> ctypes.c_void_p:
         """
         Captura o fluxo de kernels no stream da AMD.
@@ -371,6 +415,16 @@ class HIPGraphExecutor:
                 grid, block, shared_mem = self._calculate_launch_dims(node, seq_len)
 
                 self.hip.launch_kernel_recorded(kernel_func, args, grid, block, shared_mem)
+                nodes_recorded += 1
+
+            # Fase 2: grava o LM Head DENTRO do mesmo grafo, só no modo
+            # decode (seq_len sempre 1 aqui). O grafo de prefill não recebe
+            # isso -- shapes dinâmicas de prompt não combinam com um nó de
+            # LM Head fixo, e hoje o prefill em HIP Graph reaproveita o
+            # próprio grafo de decode token a token (ver VTEModel.generate),
+            # então este é o único ponto que precisa do LM Head capturado.
+            if mode == 'decode' and self.lm_head_info is not None:
+                self._capture_lm_head()
                 nodes_recorded += 1
 
             raw_graph = self.hip.stream_end_capture()
