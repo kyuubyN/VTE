@@ -334,12 +334,17 @@ class VTEModel:
 
         logger.info(f"Buffers persistentes alocados: {allocated} tensores")
 
-    def _resolve_lm_head_capture_info(self) -> dict:
+    def _resolve_lm_head_capture_info(self, batch_size: int = 1, tensor_mapping: dict = None) -> dict:
         """
         Resolve peso (com tied embeddings), aloca o buffer de logits e
-        compila o kernel do LM Head — tudo ANTES do HIPGraphExecutor existir,
-        para que a captura do grafo de decode possa gravar o LM Head como
-        mais um nó (mesmos requisitos de endereço fixo dos demais tensores).
+        compila o kernel do LM Head — tudo ANTES do HIPGraphExecutor/
+        BatchedHIPGraphExecutor existir, para que a captura do grafo de
+        decode possa gravar o LM Head como mais um nó (mesmos requisitos de
+        endereço fixo dos demais tensores). `batch_size` dimensiona o
+        buffer de logits ([batch_size, vocab_size]) e o grid da captura
+        (grid.y = batch_size); o peso e o kernel são os mesmos em qualquer
+        batch_size, já que gemv_coalesced/gemv_q4k/gemv_q6k já suportam
+        batch nativamente via blockIdx.y.
 
         Réplica deliberada da lógica de resolução em LMHead (nome do peso
         tied, critério gemv_q6k vs gemv_coalesced) — não dá para reaproveitar
@@ -352,13 +357,14 @@ class VTEModel:
         from vte.compiler.codegen import CodegenEngine
         from vte.compiler.qwen_mapper import is_raw_q6k_weight
 
+        tensor_mapping = tensor_mapping if tensor_mapping is not None else self.tensor_mapping
         hidden_size = self.metadata.get('embedding_length', 1536)
 
         lm_head_name = 'output.weight'
-        lm_head_ptr = self.tensor_mapping.get(lm_head_name)
+        lm_head_ptr = tensor_mapping.get(lm_head_name)
         if lm_head_ptr is None:
             lm_head_name = 'token_embd.weight'
-            lm_head_ptr = self.tensor_mapping.get(lm_head_name)
+            lm_head_ptr = tensor_mapping.get(lm_head_name)
         if lm_head_ptr is None:
             raise ValueError("Peso do LM Head não encontrado em tensor_mapping (nem output.weight, nem token_embd.weight).")
         weight_ptr = lm_head_ptr.ptr if hasattr(lm_head_ptr, 'ptr') else lm_head_ptr
@@ -370,8 +376,8 @@ class VTEModel:
         vocab_size = weight_shape[0]
 
         logits_block = self._allocator.allocate(
-            size=vocab_size * 2,  # FP16, batch=1 (regime de decode) -- tamanho fixo, nunca muda
-            tag="logits_output",
+            size=batch_size * vocab_size * 2,  # FP16, [batch_size, vocab_size] -- tamanho fixo, nunca muda
+            tag="logits_output" if batch_size == 1 else "logits_output_batch",
             region=MemoryRegion.SCRATCH
         )
 
@@ -389,6 +395,7 @@ class VTEModel:
             'weight_ptr': weight_ptr,
             'logits_buffer_ptr': logits_block.ptr,
             'kernel_fn': kernel_fn,
+            'batch_size': batch_size,
             'template': template,
             'vocab_size': vocab_size,
             'hidden_size': hidden_size,
@@ -526,21 +533,39 @@ class VTEModel:
             self.tensor_mapping, self._allocator, self._hip,
             self._context_length, batch_size, profiler=self.profiler
         )
+
+        # Mesmo padrão da Fase 2 (batch=1): resolve peso/buffer/kernel do LM
+        # Head ANTES do BatchedHIPGraphExecutor existir, para gravá-lo DENTRO
+        # do grafo batched (elimina o lançamento eager de compute_logits_batch,
+        # ~7.5ms/tick medidos). Regra de ouro: o grafo só ESCREVE os logits na
+        # VRAM -- o hipMemcpy D2H e o Sampler continuam rodando DEPOIS do
+        # graph_launch retornar, nunca dentro da captura.
+        lm_head_batch_info = None
+        try:
+            lm_head_batch_info = self._resolve_lm_head_capture_info(
+                batch_size=batch_size, tensor_mapping=batch_tensor_mapping
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Não foi possível pré-resolver o LM Head batched para captura no grafo: {e}. "
+                            f"LM Head batched continuará rodando eager, fora do grafo.")
+
         batch_executor = BatchedHIPGraphExecutor(
-            self._hip, self._allocator, self._graph, batch_tensor_mapping, self.metadata, batch_size=batch_size
+            self._hip, self._allocator, self._graph, batch_tensor_mapping, self.metadata,
+            batch_size=batch_size, lm_head_info=lm_head_batch_info
         )
 
         for pos in range(prompt_len):
             tokens_at_pos = [tokenized[b][pos] for b in range(batch_size)]
             batch_executor.execute_decode_batch(tokens_at_pos, [pos] * batch_size)
 
-        hidden_size = self.metadata.get('embedding_length', 1536)
-
         def _read_logits_batch():
-            hidden_ptr = batch_tensor_mapping['output_norm.output']
-            hidden_val = hidden_ptr.ptr if hasattr(hidden_ptr, 'ptr') else hidden_ptr
-            logits_ptr = self.lm_head.compute_logits_batch(hidden_val, batch_size)
             buf = bytearray(batch_size * self.lm_head.vocab_size * 2)
+            if lm_head_batch_info is not None:
+                logits_ptr = lm_head_batch_info['logits_buffer_ptr']
+            else:
+                hidden_ptr = batch_tensor_mapping['output_norm.output']
+                hidden_val = hidden_ptr.ptr if hasattr(hidden_ptr, 'ptr') else hidden_ptr
+                logits_ptr = self.lm_head.compute_logits_batch(hidden_val, batch_size)
             self._hip.safe_memcpy_device_to_host(buf, ctypes.c_void_p(logits_ptr), tag="logits_d2h")
             return np.frombuffer(bytes(buf), dtype=np.float16).astype(np.float32).reshape(batch_size, self.lm_head.vocab_size)
 

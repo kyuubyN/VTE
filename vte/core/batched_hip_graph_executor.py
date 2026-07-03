@@ -46,6 +46,7 @@ class BatchedHIPGraphExecutor:
         tensor_mapping: dict,
         metadata: dict,
         batch_size: int,
+        lm_head_info: dict = None,
     ):
         self.hip = hip
         self.allocator = allocator
@@ -53,6 +54,14 @@ class BatchedHIPGraphExecutor:
         self.tensor_mapping = tensor_mapping
         self.metadata = metadata or {}
         self.num_layers = self.metadata.get('block_count', 28)
+
+        # Mesmo padrão do HIPGraphExecutor single-sequence (Fase 2): se
+        # resolvido em model.py ANTES deste executor existir (peso/tied
+        # embeddings, logits_buffer [batch_size, vocab_size], kernel já
+        # compilado -- endereços fixos), o LM Head é gravado DENTRO do grafo
+        # batched em vez de rodar como lançamento eager separado a cada tick
+        # (eliminava ~7.5ms/tick de overhead de despacho medidos).
+        self.lm_head_info = lm_head_info
 
         # Garante que os buffers de ativação intermediária existem com o
         # tamanho certo ([batch_size, features]) ANTES de construir o
@@ -100,6 +109,41 @@ class BatchedHIPGraphExecutor:
         seq_len=batch_size (embedding_lookup*_kernel trata `seq_len` como
         'número de linhas' genericamente — ver BatchedFallbackExecutor)."""
         self._inner._capture_embedding_lookup(self.batch_size)
+
+    def _capture_lm_head_batch(self):
+        """
+        Grava o lançamento do LM Head DENTRO do grafo batched, geometria
+        [batch_size, vocab_size] (grid.y = batch_size — gemv_coalesced/
+        gemv_q4k/gemv_q6k já indexam X[batch_idx, k] via blockIdx.y
+        nativamente, mesmo kernel/critério usado no caminho single-sequence
+        e já validado numericamente ali). Regra de ouro: só ESCREVE no
+        logits_buffer da VRAM -- o hipMemcpy D2H e o Sampler continuam
+        rodando em model.py, depois do graph_launch retornar, nunca dentro
+        da captura.
+        """
+        info = self.lm_head_info
+        last_hidden_ptr = self.tensor_mapping.get('output_norm.output')
+        last_hidden_val = last_hidden_ptr.ptr if hasattr(last_hidden_ptr, 'ptr') else last_hidden_ptr
+
+        args = [
+            ctypes.c_void_p(last_hidden_val),
+            ctypes.c_void_p(info['weight_ptr']),
+            ctypes.c_void_p(info['logits_buffer_ptr']),
+            ctypes.c_int(self.batch_size),       # batch
+            ctypes.c_int(1),                     # seq_len (decode: sempre 1)
+            ctypes.c_int(info['hidden_size']),
+            ctypes.c_int(info['vocab_size']),
+            ctypes.c_void_p(0),                  # bias (LM head não tem)
+            ctypes.c_void_p(0),                  # residual (sem epilogue aqui)
+        ]
+
+        self.hip.launch_kernel_recorded(
+            function=info['kernel_fn'],
+            args=args,
+            grid=(info['vocab_size'], self.batch_size, 1),
+            block=(64, 1, 1),
+            shared_mem=0,
+        )
 
     def _capture_batched_decode_graph(self) -> ctypes.c_void_p:
         logger.info(f"Iniciando captura de HIP Graph batched (batch_size={self.batch_size})")
@@ -155,6 +199,10 @@ class BatchedHIPGraphExecutor:
                 grid, block, shared_mem = self._inner._calculate_launch_dims(node, seq_len=1, batch=self.batch_size)
 
                 self.hip.launch_kernel_recorded(kernel_func, args, grid, block, shared_mem)
+                nodes_recorded += 1
+
+            if self.lm_head_info is not None:
+                self._capture_lm_head_batch()
                 nodes_recorded += 1
 
             raw_graph = self.hip.stream_end_capture()
