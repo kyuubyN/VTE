@@ -42,7 +42,7 @@ Two things that were tried and measured as *not* worth it, kept disabled rather 
 
 Install:
 ```bash
-pip install git+https://github.com/kyuubyN/VTE-Vector-Tensor-Engine.git
+pip install git+https://github.com/kyuubyN/VTE.git
 ```
 
 ## How it fits together
