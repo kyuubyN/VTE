@@ -354,4 +354,4 @@ class QwenTensorMapper:
         
         tensor_mapping['rope_cos'] = cos_ptr
         tensor_mapping['rope_sin'] = sin_ptr
-        logger.info(f"✅ RoPE cache adicionado ao mapping: cos=0x{cos_ptr:016x}, sin=0x{sin_ptr:016x}")
+        logger.info(f"RoPE cache adicionado ao mapping: cos=0x{cos_ptr:016x}, sin=0x{sin_ptr:016x}")

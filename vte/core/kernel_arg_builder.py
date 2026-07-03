@@ -172,7 +172,7 @@ class KernelArgBuilder:
         elif tensor_name in ["input_ids", "input_embeddings"] and "input_ids" in staging_buffers:
             return staging_buffers['input_ids'].ptr
         else:
-            print(f"❌ DEBUG: Tensor '{tensor_name}' NÃO encontrado no tensor_mapping! (Retornando 0)")
+            print(f"DEBUG: Tensor '{tensor_name}' NÃO encontrado no tensor_mapping! (Retornando 0)")
             return 0
     
     def _build_rmsnorm_args(
@@ -337,12 +337,12 @@ class KernelArgBuilder:
                 v_ptr = pool_ptr + (layer_idx * kv_size_per_layer) + (kv_size_per_layer // 2)
                 
                 if layer_idx == 0:
-                    print(f"  ✅ Usando fallback de offset do pool único")
+                    print(f"  Usando fallback de offset do pool único")
                     print(f"     K ptr: 0x{k_ptr:016x}")
                     print(f"     V ptr: 0x{v_ptr:016x}")
         
         if k_ptr is None or v_ptr is None:
-            print(f"  ❌ CRÍTICO: KV Cache não encontrado para layer {layer_idx}!")
+            print(f"  CRÍTICO: KV Cache não encontrado para layer {layer_idx}!")
             k_ptr = 0
             v_ptr = 0
             

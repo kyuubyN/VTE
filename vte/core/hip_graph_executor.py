@@ -42,12 +42,17 @@ class HIPGraphExecutor:
 
     MAX_CACHED_PREFILL_GRAPHS = 2
 
-    def __init__(self, hip: HIPRuntime, allocator: SlabAllocator, graph: IRGraph, tensor_mapping: dict, metadata: dict = None, lm_head_info: dict = None):
+    def __init__(self, hip: HIPRuntime, allocator: SlabAllocator, graph: IRGraph, tensor_mapping: dict, metadata: dict = None, lm_head_info: dict = None, context_length: int = None):
         self.hip = hip
         self.allocator = allocator
         self.ir_graph = graph
         self.tensor_mapping = tensor_mapping
         self.metadata = metadata or {}
+        # `metadata['context_length']` é o valor NATIVO do GGUF (32768 no
+        # Qwen2.5), não o `context_length` runtime usado para dimensionar o
+        # KV cache de verdade (default 2048) -- por isso é um parâmetro
+        # próprio, usado só para dimensionar o scratchpad do Split-KV.
+        self.context_length = context_length or 4096
 
         # Fase 2 (41->100 tok/s): se resolvido em model.py ANTES deste
         # executor existir (peso/tied embeddings, logits_buffer, kernel já
@@ -103,6 +108,14 @@ class HIPGraphExecutor:
         self._fused_qkv = FusedQKVDispatcher(self.hip, self.codegen, self.metadata, allocator=self.allocator)
         self._fused_ffn = FusedFFNDispatcher(self.hip, self.codegen, self.metadata)
         self._layer_input_tensor_name = layer_input_tensor_name
+
+        # Split-KV (Flash-Decoding): opt-in via VTE_ENABLE_ATTN_SPLITKV, ver
+        # split_kv_attention.py para a motivação medida e o design completo.
+        from vte.core.split_kv_attention import SplitKVAttentionDispatcher
+        self._split_kv = SplitKVAttentionDispatcher(
+            self.hip, self.codegen, self.metadata, allocator=self.allocator,
+            context_length=self.context_length
+        )
 
     def _get_or_compile_kernel(self, node: IRNode) -> Optional[ctypes.c_void_p]:
         """
@@ -371,6 +384,27 @@ class HIPGraphExecutor:
                         logger.warning(
                             f"Fusão QKV falhou na captura (camada {layer_idx}): {e}. "
                             f"Usando kernels separados para esta camada."
+                        )
+
+                # Split-KV (Flash-Decoding): opt-in via VTE_ENABLE_ATTN_SPLITKV
+                # -- substitui o único flash_attention_kernel (12 blocos, laço
+                # serial sobre o KV cache) por 3 lançamentos (append + partial
+                # dividido em chunks + reduce), usando muito mais CUs. Ver
+                # split_kv_attention.py para a motivação medida.
+                if seq_len == 1 and self._split_kv.enabled and node.op_type == NodeType.ATTENTION:
+                    layer_idx = int(node.name.split('.')[1])
+                    try:
+                        launches = self._split_kv.build_launches(
+                            layer_idx, self.tensor_mapping, self.staging_kv_offset.ptr
+                        )
+                        for fn, args, grid, block, shared_mem in launches:
+                            self.hip.launch_kernel_recorded(fn, args, grid, block, shared_mem)
+                            nodes_recorded += 1
+                        continue
+                    except Exception as e:
+                        logger.warning(
+                            f"Split-KV falhou na captura (camada {layer_idx}): {e}. "
+                            f"Usando o flash_attention_kernel original para esta camada."
                         )
 
                 # Fusão do FFN DESATIVADA por padrão: medida empiricamente, tanto

@@ -123,7 +123,7 @@ class QwenTokenizer:
                 self.bpe_ranks[(parts[0], parts[1])] = rank
 
         logger.info(
-            f"✅ Tokenizer BPE carregado: {len(tokens)} tokens, {len(self.bpe_ranks)} regras de merge."
+            f"Tokenizer BPE carregado: {len(tokens)} tokens, {len(self.bpe_ranks)} regras de merge."
         )
 
     def _rebuild_inverse_vocab(self):
@@ -219,3 +219,38 @@ class QwenTokenizer:
         text = "".join(pieces)
         byte_arr = bytearray(self._byte_decoder.get(ch, ord("?") & 0xFF) for ch in text)
         return byte_arr.decode("utf-8", errors="replace")
+
+    DEFAULT_SYSTEM_PROMPT = (
+        "You are Qwen, created by Alibaba Cloud. You are a helpful assistant. "
+        "Always reply in the same language the user's message is written in "
+        "(e.g. reply in Portuguese to a Portuguese message, in Spanish to a "
+        "Spanish message) -- never switch to English unless the user wrote in "
+        "English."
+    )
+
+    def apply_chat_template(self, user_message: str, system: str = None) -> str:
+        """Formata uma mensagem de usuário no chat template do Qwen2.5 (ChatML).
+
+        Sem isto, o modelo Instruct recebe o texto cru e faz *completion*
+        (continua o texto como um documento) em vez de responder como
+        assistente -- é o que fazia um "oi" retornar texto incoerente de
+        divagação. Os marcadores <|im_start|>/<|im_end|> são reconhecidos
+        pelo encode() como tokens especiais (ver _split_special_tokens), e o
+        <|im_end|> ao final da resposta é o eos_token_id, o que faz a geração
+        parar sozinha no ponto certo.
+        """
+        system = system if system is not None else self.DEFAULT_SYSTEM_PROMPT
+        return (
+            f"<|im_start|>system\n{system}<|im_end|>\n"
+            f"<|im_start|>user\n{user_message}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+
+    @property
+    def stop_token_ids(self) -> set:
+        """Tokens que encerram a geração (fim de turno do assistente)."""
+        ids = {self.eos_token_id}
+        eot = self.special_tokens.get("<|endoftext|>")
+        if eot is not None:
+            ids.add(eot)
+        return {i for i in ids if i is not None}

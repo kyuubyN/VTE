@@ -80,20 +80,20 @@ class TextGenerator:
             
         self.generated_tokens = list(input_ids)
         
-        print(f"📝 Prompt: {len(input_ids)} tokens")
-        print(f"🎯 Gerando até {max_new_tokens} tokens...")
+        print(f"Prompt: {len(input_ids)} tokens")
+        print(f"Gerando até {max_new_tokens} tokens...")
         
         # 2. Fase de Prefill: processa todos os tokens do prompt
-        print("⚡ Fase de Prefill...")
+        print("Fase de Prefill...")
         self._prefill(input_ids)
         
         # 3. Fase de Decode: gera token por token
-        print("🔄 Fase de Decode:")
+        print("Fase de Decode:")
         generated_text = ""
         
         for i in range(max_new_tokens):
             if self.kv_cache_pos >= self.max_seq_len:
-                print(f"\n⚠️ Limite de KV Cache atingido ({self.max_seq_len}). Parando geração.")
+                print(f"\nLimite de KV Cache atingido ({self.max_seq_len}). Parando geração.")
                 break
                 
             # Gera próximo token
@@ -187,7 +187,7 @@ class TextGenerator:
         self.model._hip.synchronize()
         
         # ========================================================================
-        # 🔍 DEBUG: O Sinal está morrendo nas camadas ou no LM Head?
+        # DEBUG: O Sinal está morrendo nas camadas ou no LM Head?
         # ========================================================================
         hidden_ptr = self.model.tensor_mapping.get('blk.27.output')
         if hidden_ptr:
@@ -196,14 +196,14 @@ class TextGenerator:
             self.model._hip.safe_memcpy_device_to_host(buffer, ctypes.c_void_p(ptr_v), "output")
             hidden = np.frombuffer(buffer, dtype=np.float16)
             
-            print(f"\n🔍 [Decode Step {self.kv_cache_pos}] blk.27.output:")
+            print(f"\n[Decode Step {self.kv_cache_pos}] blk.27.output:")
             print(f"   Mean: {np.mean(hidden):.6f} | Std: {np.std(hidden):.6f} | Max: {np.max(hidden):.6f}")
             
             if np.all(hidden == 0):
-                print("   ❌ CRÍTICO: Hidden state final está ZERADO!")
-                print("   💡 Causa: O 'Argumento 11 nulo' está matando o sinal nas camadas de Attention/FFN.")
+                print("   CRÍTICO: Hidden state final está ZERADO!")
+                print("   Causa: O 'Argumento 11 nulo' está matando o sinal nas camadas de Attention/FFN.")
             else:
-                print("   ✅ Hidden state tem valores válidos. O problema está no LM Head.")
+                print("   Hidden state tem valores válidos. O problema está no LM Head.")
         # ========================================================================
         # Computa logits
         last_hidden_ptr = self.model.tensor_mapping.get('output_norm.output')

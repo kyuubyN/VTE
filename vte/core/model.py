@@ -26,6 +26,14 @@ import numpy as np
 
 logger = get_logger("VTE.Model")
 
+# vte/core/model.py -> raiz do repo é dois níveis acima. Resolvido a partir
+# de __file__ (não do cwd) porque `vte-ui`/`vte` são instalados como pacote
+# e podem ser invocados de qualquer diretório -- procurar "Model/" relativo
+# ao cwd atual falhava silenciosamente sempre que o processo não era
+# lançado a partir da raiz do projeto (ex.: atalho, outro terminal),
+# mesmo com o arquivo do modelo presente e no lugar certo.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
 class VTEModel:
     """
     Interface de alto nível para carregar e usar modelos de linguagem.
@@ -79,7 +87,8 @@ class VTEModel:
         enable_fusion: bool = True,
         idle_timeout_seconds: int = 300,
         enable_auto_unload: bool = True,
-        max_batch_size: int = 1
+        max_batch_size: int = 1,
+        context_length: int = None
     ) -> "VTEModel":
         if model_name not in cls.MODEL_REGISTRY:
             available = ", ".join(cls.MODEL_REGISTRY.keys())
@@ -89,18 +98,27 @@ class VTEModel:
             )
         
         filename = cls.MODEL_REGISTRY[model_name]
-        model_path = Path("Model") / filename
-        
-        if not model_path.exists():
+        # Tenta primeiro relativo ao diretório de trabalho atual (permite
+        # uma pasta Model/ própria fora do repo, se o usuário quiser rodar
+        # assim), e só depois relativo à raiz do projeto -- que é o que
+        # realmente resolve o caso comum de `vte-ui` ser instalado como
+        # comando e invocado de qualquer lugar.
+        candidates = [Path("Model") / filename, _REPO_ROOT / "Model" / filename]
+        model_path = next((p for p in candidates if p.exists()), None)
+
+        if model_path is None:
+            checked = "\n".join(f"  - {p.resolve()}" for p in candidates)
             raise FileNotFoundError(
-                f"Arquivo do modelo não encontrado: {model_path}\n"
-                f"Baixe o modelo e coloque-o na pasta 'Model/'"
+                f"Arquivo do modelo não encontrado. Caminhos checados:\n{checked}\n"
+                f"Baixe o modelo e coloque-o na pasta 'Model/' na raiz do projeto "
+                f"({_REPO_ROOT / 'Model'})."
             )
         
         instance = cls(
             str(model_path),
             use_hip_graph=use_hip_graph,
             enable_fusion=enable_fusion,
+            context_length=context_length,
             idle_timeout=idle_timeout_seconds,
             auto_unload=enable_auto_unload,
             max_batch_size=max_batch_size
@@ -250,23 +268,24 @@ class VTEModel:
             try:
                 lm_head_capture_info = self._resolve_lm_head_capture_info()
             except Exception as e:
-                logger.warning(f"⚠️ Não foi possível pré-resolver o LM Head para captura no grafo: {e}. "
+                logger.warning(f"Não foi possível pré-resolver o LM Head para captura no grafo: {e}. "
                                 f"LM Head continuará rodando eager, fora do grafo.")
                 lm_head_capture_info = None
 
         if self._use_hip_graph:
             try:
                 self.executor = HIPGraphExecutor(self._hip, self._allocator, self._graph, self.tensor_mapping,
-                                                  metadata=self.metadata, lm_head_info=lm_head_capture_info)
+                                                  metadata=self.metadata, lm_head_info=lm_head_capture_info,
+                                                  context_length=self._context_length)
                 self.executor.build_decode_graph()
-                logger.info(f"✅ HIP Graph executor inicializado com sucesso (Nós: {len(self._graph.nodes)})")
+                logger.info(f"HIP Graph executor inicializado com sucesso (Nós: {len(self._graph.nodes)})")
             except Exception as e:
-                logger.warning(f"⚠️ HIP Graph falhou: {e}. Fazendo fallback para executor legado.")
+                logger.warning(f"HIP Graph falhou: {e}. Fazendo fallback para executor legado.")
                 self.executor = FallbackExecutor(self._hip, self._allocator, self.arena, self._graph, self.tensor_mapping, metadata=self.metadata)
                 self._use_hip_graph = False
                 lm_head_capture_info = None
         else:
-            logger.info("ℹ️ HIP Graphs desabilitado via flag. Usando FallbackExecutor.")
+            logger.info("HIP Graphs desabilitado via flag. Usando FallbackExecutor.")
             self.executor = FallbackExecutor(self._hip, self._allocator, self.arena, self._graph, self.tensor_mapping, metadata=self.metadata)
 
         if lm_head_capture_info is not None:
@@ -282,6 +301,17 @@ class VTEModel:
 
         from vte.core.gpu_keepalive import GPUKeepAlive
         self._keepalive = GPUKeepAlive(self._hip, self._allocator)
+        # Válvula de escape: o pulso fixo de 2ms foi medido como obsoleto (e
+        # em 1.0ms, ativamente prejudicial -- picos de até 35ms, pior caso de
+        # todos os testados) depois que o Split-KV encurtou o tick de decode
+        # para ~9-10ms -- rápido o bastante para o DPM do WDDM nunca ter
+        # tempo de derrubar o clock entre tokens. Ver README ("Bugs found
+        # during development") para a medição completa (rajada contínua de
+        # 200 tokens + gaps reais de 3s entre turnos, sem TDR em nenhum
+        # caso). Mantido configurável via env var para reverter sem deploy
+        # de código, caso um driver futuro ou hardware diferente reintroduza
+        # o cenário que o pulso existia para prevenir.
+        self._keepalive_pulse_s = float(os.environ.get("VTE_KEEPALIVE_PULSE_MS", "0.0")) / 1000.0
 
         self._is_loaded = True
     
@@ -460,6 +490,8 @@ class VTEModel:
 
         logits = _read_logits()
 
+        stop_ids = self.tokenizer.stop_token_ids
+
         for i in range(max_tokens):
             next_token = self.sampler.sample(
                 logits=logits,
@@ -467,6 +499,15 @@ class VTEModel:
                 top_p=top_p,
                 generated_tokens=input_tokens,
             )
+
+            # Para no fim de turno (<|im_end|>) ou <|endoftext|>. Sem isto o
+            # modelo continua gerando muito além da resposta, divergindo para
+            # texto incoerente -- era o "texto quebrado no final". decode() já
+            # retorna "" para esses tokens, mas o loop precisa PARAR, não só
+            # emitir vazio.
+            if next_token in stop_ids:
+                break
+
             input_tokens.append(next_token)
             word = self.tokenizer.decode([next_token])
             yield word
@@ -481,13 +522,16 @@ class VTEModel:
             else:
                 self.executor.decode_step(next_token, current_seq_len - 1)
 
-            # Antes 15ms fixos por token — virou um teto artificial de
-            # velocidade (~66 tok/s) depois que HIP Graph + fusão reduziram o
-            # tempo real de GPU por token bem abaixo disso. 2ms ainda dá um
-            # pulso de keep-alive (a função dispara o kernel minúsculo pelo
-            # menos uma vez), suficiente para suavizar a transição de clock
-            # sem virar o novo gargalo.
-            self._keepalive.pulse(0.002)
+            # Histórico: 15ms fixos -> virou teto artificial de velocidade
+            # (~66 tok/s) quando HIP Graph + fusão baixaram o tempo real de
+            # GPU bem abaixo disso -> 2ms de pulso de keep-alive (proteção
+            # contra o DPM do WDDM derrubar o clock entre tokens) -> 0.0ms
+            # (padrão atual): com o Split-KV, o tick caiu para ~9-10ms,
+            # rápido o bastante para o DPM nunca ter uma janela ociosa longa
+            # o suficiente para agir — medido sem TDR em rajada contínua e em
+            # gaps reais de 3s entre turnos (ver README). Configurável via
+            # VTE_KEEPALIVE_PULSE_MS para reverter sem deploy de código.
+            self._keepalive.pulse(self._keepalive_pulse_s)
             logits = _read_logits()
 
     def generate_batch(
@@ -546,7 +590,7 @@ class VTEModel:
                 batch_size=batch_size, tensor_mapping=batch_tensor_mapping
             )
         except Exception as e:
-            logger.warning(f"⚠️ Não foi possível pré-resolver o LM Head batched para captura no grafo: {e}. "
+            logger.warning(f"Não foi possível pré-resolver o LM Head batched para captura no grafo: {e}. "
                             f"LM Head batched continuará rodando eager, fora do grafo.")
 
         batch_executor = BatchedHIPGraphExecutor(
@@ -590,7 +634,7 @@ class VTEModel:
                 break
 
             batch_executor.execute_decode_batch(next_tokens, [current_seq_len - 1] * batch_size)
-            self._keepalive.pulse(0.002)
+            self._keepalive.pulse(self._keepalive_pulse_s)
             logits_batch = _read_logits_batch()
 
     def unload(self):

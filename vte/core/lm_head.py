@@ -54,7 +54,7 @@ class LMHead:
         self._logits_buffer_batch = None
         self._logits_buffer_batch_size = 0
 
-        print(f"✅ LMHead inicializado: vocab_size={self.vocab_size}, hidden_size={self.hidden_size}")
+        print(f"LMHead inicializado: vocab_size={self.vocab_size}, hidden_size={self.hidden_size}")
     
     def _resolve_vocab_size(self, metadata: dict) -> int:
         """Resolve vocab_size (focado na forma real do peso GGUF)"""
@@ -73,7 +73,7 @@ class LMHead:
         if self.tokenizer is not None:
             return getattr(self.tokenizer, 'vocab_size', 151936)
             
-        print("⚠️ Não foi possível determinar vocab_size dinamicamente. Usando fallback: 151936")
+        print("Não foi possível determinar vocab_size dinamicamente. Usando fallback: 151936")
         return 151936
     
     def _validate_weight_shape(self):

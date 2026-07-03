@@ -28,7 +28,8 @@ dependencies = [
     "numpy>=1.21.0",
     "flet>=0.85.3",
     "tiktoken>=0.6.0",
-    "WMI>=1.5.10; sys_platform == 'win32'",
+    "WMI>=1.5.1; sys_platform == 'win32'",
+    "pywin32; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
@@ -48,7 +49,7 @@ Documentation = "https://github.com/kyuubyN/VTE---Vector-Tensor-Engine#readme"
 Issues = "https://github.com/kyuubyN/VTE---Vector-Tensor-Engine/issues"
 
 [project.scripts]
-vte-ui = "vte.ui.main:cli_main"
+vte-ui = "vte.ui.app:cli_main"
 
 [tool.setuptools]
 packages = ["vte", "vte.bridge", "vte.compiler", "vte.core", "vte.ui"]

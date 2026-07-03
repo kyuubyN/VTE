@@ -3,7 +3,8 @@
 numpy>=1.21.0
 flet>=0.85.3
 tiktoken>=0.6.0
-WMI>=1.5.10; sys_platform == "win32"
+WMI>=1.5.1; sys_platform == "win32"
+pywin32; sys_platform == "win32"
 pytest>=7.0.0
 pytest-cov>=4.0.0
 mypy>=1.0.0

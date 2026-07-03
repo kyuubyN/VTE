@@ -436,7 +436,7 @@ class FallbackExecutor:
         # Sincroniza APÓS a camada completa
         self.hip.synchronize()
         
-        # 🧹 Cleanup de memória dinâmica APENAS se não for persistente
+        # Cleanup de memória dinâmica APENAS se não for persistente
         # PARA DEBUG: mantemos os tensores mapeados
         # for tensor_name in self._dynamic_tensors:
         #     if tensor_name not in self.model._persistent_buffers:
@@ -525,10 +525,10 @@ class FallbackExecutor:
             # mesmo com o limitador ativo (ele só consegue pausar ENTRE
             # rajadas, nunca no meio de uma já em curso).
             self.hip.synchronize()
-            logger.debug(f"✅ Kernel {node.name} ({node.op_type}) lançado com {len(args_array)} args")
+            logger.debug(f"Kernel {node.name} ({node.op_type}) lançado com {len(args_array)} args")
         except Exception as e:
             logger.error(
-                f"❌ Kernel Panic no node {node.name}: {e}\n"
+                f"Kernel Panic no node {node.name}: {e}\n"
                 f"   Args fornecidos: {len(args_array)}\n"
                 f"   Grid: {grid}, Block: {block}"
             )

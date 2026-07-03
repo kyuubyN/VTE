@@ -16,11 +16,19 @@ def test_inference_pipeline_structural():
     parent_conn, child_conn = Pipe()
     engine = InferenceEngine(child_conn)
     
+    class MockTokenizer:
+        # O motor formata a mensagem no chat template antes de gerar; o mock
+        # só precisa devolver algo (passthrough basta para o teste estrutural).
+        def apply_chat_template(self, user_message, system=None):
+            return user_message
+
     class MockModel:
+        tokenizer = MockTokenizer()
+
         def generate(self, prompt, max_tokens):
             for i in range(max_tokens):
                 yield f"tok_{i}"
-    
+
     engine.model = MockModel()
     
     engine.generate("Olá, como você está?", max_tokens=3)

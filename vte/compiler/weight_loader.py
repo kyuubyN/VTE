@@ -74,7 +74,7 @@ class GGUFWeightLoader:
                     total_bytes += len(upload_bytes)
 
         logger.info(
-            f"✅ Pesos injetados na VRAM: {loaded} tensores, {total_bytes / (1024 * 1024):.1f} MB."
+            f"Pesos injetados na VRAM: {loaded} tensores, {total_bytes / (1024 * 1024):.1f} MB."
         )
         return loaded, total_bytes
 

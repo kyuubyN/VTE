@@ -68,7 +68,7 @@ class RoPECacheBuilder:
         sin_cache[:, freq_dim:] = sin_values.astype(np.float16)
         
         logger.info(
-            f"✅ RoPE cache Sliced (FP16) construído: "
+            f"RoPE cache Sliced (FP16) construído: "
             f"cos={cos_cache.shape}, sin={sin_cache.shape}"
         )
         
@@ -121,7 +121,7 @@ class RoPECacheBuilder:
         )
         
         logger.info(
-            f"✅ RoPE cache enviado para VRAM: "
+            f"RoPE cache enviado para VRAM: "
             f"cos={cos_size} bytes, sin={sin_size} bytes"
         )
         
