@@ -31,7 +31,12 @@ extern "C" __global__ void split_k_qkv_pass2_kernel(
     int head_dim,
     const int* __restrict__ kv_cache_offset_ptr,  // agora array de `batch` ints
     int apply_rope,
-    int num_heads
+    int num_heads,
+    int rope_type   // 0 = NEOX/split-half (Qwen2: par (j, j+half)); 1 = NORM/
+                     // intercalado (Granite: par (2i, 2i+1)) -- confirmado em
+                     // llama-model.cpp::llama_model_rope_type: QWEN2 usa
+                     // LLAMA_ROPE_TYPE_NEOX, GRANITE usa LLAMA_ROPE_TYPE_NORM.
+                     // Default 0 preserva o Qwen bit a bit.
 ) {
     __shared__ float raw_out[256];   // pré-RoPE deste head (indexado por j)
 
@@ -64,20 +69,40 @@ extern "C" __global__ void split_k_qkv_pass2_kernel(
     __syncthreads();
 
     if (apply_rope != 0) {
-        int half = head_dim / 2;
         int pos = kv_offset;
-        if (j < half) {
-            float v1 = raw_out[j];
-            float v2 = raw_out[j + half];
-            float c = __half2float(cos_cache[pos * head_dim + j]);
-            float s = __half2float(sin_cache[pos * head_dim + j]);
-            output_b[n] = __float2half(v1 * c - v2 * s);
+        if (rope_type == 1) {
+            // NORM/intercalado (Granite): par (2i, 2i+1) compartilha o ângulo
+            // do índice de frequência i = j/2 -- mesma tabela cos/sin (a
+            // metade [0, head_dim/2) já cobre todos os i possíveis), só a
+            // indexação por par muda em relação ao NEOX.
+            int i = j / 2;
+            float c = __half2float(cos_cache[pos * head_dim + i]);
+            float s = __half2float(sin_cache[pos * head_dim + i]);
+            if ((j & 1) == 0) {
+                float x0 = raw_out[j];
+                float x1 = raw_out[j + 1];
+                output_b[n] = __float2half(x0 * c - x1 * s);
+            } else {
+                float x0 = raw_out[j - 1];
+                float x1 = raw_out[j];
+                output_b[n] = __float2half(x0 * s + x1 * c);
+            }
         } else {
-            float v1 = raw_out[j - half];
-            float v2 = raw_out[j];
-            float c = __half2float(cos_cache[pos * head_dim + (j - half)]);
-            float s = __half2float(sin_cache[pos * head_dim + (j - half)]);
-            output_b[n] = __float2half(v1 * s + v2 * c);
+            // NEOX/split-half (Qwen2): par (j, j+half).
+            int half = head_dim / 2;
+            if (j < half) {
+                float v1 = raw_out[j];
+                float v2 = raw_out[j + half];
+                float c = __half2float(cos_cache[pos * head_dim + j]);
+                float s = __half2float(sin_cache[pos * head_dim + j]);
+                output_b[n] = __float2half(v1 * c - v2 * s);
+            } else {
+                float v1 = raw_out[j - half];
+                float v2 = raw_out[j];
+                float c = __half2float(cos_cache[pos * head_dim + (j - half)]);
+                float s = __half2float(sin_cache[pos * head_dim + (j - half)]);
+                output_b[n] = __float2half(v1 * s + v2 * c);
+            }
         }
     } else {
         output_b[n] = __float2half(raw_out[j]);

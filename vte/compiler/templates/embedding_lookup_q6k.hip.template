@@ -19,7 +19,8 @@ extern "C" __global__ void embedding_lookup_q6k_kernel(
     const void* __restrict__ embed_weight,   // Q6_K cru (vocab_size linhas)
     __half* __restrict__ output,             // (seq_len, hidden_size) FP16
     int seq_len,
-    int hidden_size
+    int hidden_size,
+    float embedding_scale                    // Default 1.0 (Qwen não usa).
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_elements = seq_len * hidden_size;
@@ -53,5 +54,5 @@ extern "C" __global__ void embedding_lookup_q6k_kernel(
     int q = (nib | (qhbits << 4)) - 32;
 
     float w = dscale * (float)sc[is_ + 2 * group] * (float)q;
-    output[idx] = __float2half(w);
+    output[idx] = __float2half(w * embedding_scale);
 }

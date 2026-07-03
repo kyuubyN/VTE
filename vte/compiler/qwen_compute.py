@@ -20,6 +20,14 @@ class QwenComputeGraphBuilder:
         self.num_kv_heads = metadata.get('attention.head_count_kv', 2)
         self.hidden_size = metadata.get('embedding_length', 1536)
         self.head_dim = metadata.get('attention.key_length', 96)
+        # Estrutura do bloco transformer (RMSNorm -> QKV -> RoPE -> GQA ->
+        # residual -> RMSNorm -> SwiGLU FFN -> residual) é a MESMA para
+        # qualquer arquitetura Llama-like (Qwen2, Granite) -- só os números
+        # de entrada mudam, por isso este builder é compartilhado (não
+        # duplicado por arquitetura). ffn_size era literal 8960 (Qwen) em
+        # 4 lugares abaixo; parametrizado para não quebrar arquiteturas com
+        # FFN de outro tamanho (Granite = 8192).
+        self.ffn_size = metadata.get('feed_forward_length', 8960)
         
     def build_compute_graph(self) -> IRGraph:
         """
@@ -213,7 +221,7 @@ class QwenComputeGraphBuilder:
                 f"blk.{layer_idx}.ffn_gate.weight"
             ],
             output_tensor=f"blk.{layer_idx}.gate_proj.output",
-            shape=(1, -1, 8960),  # intermediate_size
+            shape=(1, -1, self.ffn_size),  # intermediate_size
             dtype="f16"
         )
         nodes.append(gate_proj)
@@ -227,7 +235,7 @@ class QwenComputeGraphBuilder:
                 f"blk.{layer_idx}.ffn_up.weight"
             ],
             output_tensor=f"blk.{layer_idx}.up_proj.output",
-            shape=(1, -1, 8960),
+            shape=(1, -1, self.ffn_size),
             dtype="f16"
         )
         nodes.append(up_proj)
@@ -241,7 +249,7 @@ class QwenComputeGraphBuilder:
                 up_proj.output_tensor
             ],
             output_tensor=f"blk.{layer_idx}.swiglu.output",
-            shape=(1, -1, 8960),
+            shape=(1, -1, self.ffn_size),
             dtype="f16"
         )
         nodes.append(swiglu)

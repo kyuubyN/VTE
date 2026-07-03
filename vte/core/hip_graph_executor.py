@@ -62,7 +62,7 @@ class HIPGraphExecutor:
         # aplica ao grafo de decode (seq_len sempre 1) -- ver _capture_graph.
         self.lm_head_info = lm_head_info
 
-        self.num_layers = 28
+        self.num_layers = self.metadata.get('block_count', 28)
         self.max_seq_len = 4096
 
         self.decode_graph: Optional[ctypes.c_void_p] = None
@@ -136,11 +136,13 @@ class HIPGraphExecutor:
             NodeType.ADD: "add",
             "mega_kernel": "fused_rmsnorm_matmul_rope",
         }
-        from vte.core.fallback_executor import _is_vectorized_matmul, _is_q4k_matmul, _is_q6k_matmul
+        from vte.core.fallback_executor import _is_vectorized_matmul, _is_q4k_matmul, _is_q6k_matmul, _is_q8_0_matmul
         if _is_q4k_matmul(node):
             template = "gemv_q4k"
         elif _is_q6k_matmul(node):
             template = "gemv_q6k"
+        elif _is_q8_0_matmul(node):
+            template = "gemv_q8_0"
         elif _is_vectorized_matmul(node):
             template = "gemv_coalesced"
         else:
@@ -189,8 +191,13 @@ class HIPGraphExecutor:
         "congelado" em todo replay, ignorando o token realmente processado.
         """
         arch = self.hip.get_gpu_architecture()
-        from vte.core.fallback_executor import RAW_Q6K_WEIGHTS
-        template = "embedding_lookup_q6k" if 'token_embd.weight' in RAW_Q6K_WEIGHTS else "embedding_lookup"
+        from vte.core.fallback_executor import RAW_Q6K_WEIGHTS, RAW_Q8_0_WEIGHTS
+        if 'token_embd.weight' in RAW_Q6K_WEIGHTS:
+            template = "embedding_lookup_q6k"
+        elif 'token_embd.weight' in RAW_Q8_0_WEIGHTS:
+            template = "embedding_lookup_q8_0"
+        else:
+            template = "embedding_lookup"
         cache_key = template
         if cache_key not in self._kernel_cache:
             hsaco_path = self.codegen.compile_kernel(template_name=template, arch=arch)
@@ -211,6 +218,7 @@ class HIPGraphExecutor:
             ctypes.c_void_p(out_ptr_val),
             ctypes.c_int(seq_len),
             ctypes.c_int(hidden_size),
+            ctypes.c_float(self.metadata.get('embedding_scale', 1.0)),
         ]
         total_elements = seq_len * hidden_size
         block_size = 256
@@ -250,8 +258,8 @@ class HIPGraphExecutor:
         block_size = 256
 
         if node.op_type == NodeType.MATMUL:
-            from vte.core.fallback_executor import _is_vectorized_matmul, _is_q4k_matmul, _is_q6k_matmul, _coalesced_gemv_dims
-            if _is_q4k_matmul(node) or _is_q6k_matmul(node) or _is_vectorized_matmul(node):
+            from vte.core.fallback_executor import _is_vectorized_matmul, _is_q4k_matmul, _is_q6k_matmul, _is_q8_0_matmul, _coalesced_gemv_dims
+            if _is_q4k_matmul(node) or _is_q6k_matmul(node) or _is_q8_0_matmul(node) or _is_vectorized_matmul(node):
                 return _coalesced_gemv_dims(node, seq_len, batch)
             out_features = node.shape[-1]
             m = batch * seq_len
@@ -306,6 +314,16 @@ class HIPGraphExecutor:
         last_hidden_ptr = self.tensor_mapping.get('output_norm.output')
         last_hidden_val = last_hidden_ptr.ptr if hasattr(last_hidden_ptr, 'ptr') else last_hidden_ptr
 
+        # Reaproveita o slot de residual_scale do epílogo do GEMV para aplicar
+        # o logit_scale do Granite: como o LM Head nunca tem residual_ptr
+        # (sempre nullptr), `total = dot_product * residual_scale` é
+        # exatamente `logits = hidden @ W * (1/logit_scale)` -- confirmado em
+        # granite.cpp: ggml_scale(cur, 1.0f/hparams.f_logit_scale) DIVIDE os
+        # logits (não multiplica por 10 -- verificado direto no código-fonte,
+        # não em paráfrase). Default 1.0 (Qwen não tem logit_scale).
+        logit_scale = self.metadata.get('logit_scale', 1.0) or 1.0
+        c_logit_mul = ctypes.c_float(1.0 / logit_scale)
+
         args = [
             ctypes.c_void_p(last_hidden_val),
             ctypes.c_void_p(info['weight_ptr']),
@@ -316,6 +334,7 @@ class HIPGraphExecutor:
             ctypes.c_int(info['vocab_size']),
             ctypes.c_void_p(0),                  # bias (LM head não tem)
             ctypes.c_void_p(0),                  # residual (sem epilogue aqui)
+            c_logit_mul,
         ]
 
         self.hip.launch_kernel_recorded(

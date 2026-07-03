@@ -127,11 +127,18 @@ class LMHead:
         else:
             # Fase D.1: o lm_head é o maior GEMV puro do modelo (vocab=151936 x
             # hidden=1536, ~466MB em FP16). Se o peso ficou cru em Q6_K (tied
-            # embeddings, ver is_raw_q6k_weight), usamos o gemv_q6k (No-Sync Direct
-            # Unpack) — corta a leitura para ~189MB/token. Senão, FP16 coalescido.
+            # embeddings, ver is_raw_q6k_weight) ou Q8_0 (tied embeddings do
+            # Granite, ver is_raw_q8_0_weight), usamos o gemv_* dequant
+            # in-kernel correspondente. Senão, FP16 coalescido.
             from vte.compiler.qwen_mapper import is_raw_q6k_weight
+            from vte.compiler.granite_mapper import is_raw_q8_0_weight
             tensor_info = self.model.parser.tensors.get(lm_head_name, {})
-            template = "gemv_q6k" if is_raw_q6k_weight(lm_head_name, tensor_info) else "gemv_coalesced"
+            if is_raw_q6k_weight(lm_head_name, tensor_info):
+                template = "gemv_q6k"
+            elif is_raw_q8_0_weight(lm_head_name, tensor_info):
+                template = "gemv_q8_0"
+            else:
+                template = "gemv_coalesced"
 
             hsaco_path = self.model.executor.codegen.compile_kernel(
                 template_name=template,
@@ -141,8 +148,13 @@ class LMHead:
             )
             mod, kernel = self.hip.load_kernel(hsaco_path, f"{template}_kernel")
 
-        # Args: input, weight, output, batch, seq, in_features, out_features, bias
-        # O LM head não tem bias no Qwen2.5 → bias = nullptr (0).
+        # Args: input, weight, output, batch, seq, in_features, out_features, bias, residual, residual_scale
+        # O LM head não tem bias/residual -> ambos nullptr. O slot de
+        # residual_scale é reaproveitado para aplicar o logit_scale do
+        # Granite (residual=nullptr => total = dot_product * residual_scale,
+        # exatamente logits/logit_scale -- ver _capture_lm_head em
+        # hip_graph_executor.py para a mesma lógica e a fonte confirmada).
+        logit_scale = self.model.metadata.get('logit_scale', 1.0) or 1.0
         args = [
             ctypes.c_void_p(last_hidden_ptr),
             ctypes.c_void_p(lm_head_val),
@@ -153,6 +165,7 @@ class LMHead:
             ctypes.c_int(self.vocab_size),      # out_features
             ctypes.c_void_p(0),                 # bias (nullptr)
             ctypes.c_void_p(0),                 # residual (nullptr) — sem epilogue no lm_head
+            ctypes.c_float(1.0 / logit_scale),
         ]
 
         # 1 bloco por neurônio de saída (vocab), 64 threads dividindo K.
@@ -169,7 +182,7 @@ class LMHead:
             grid=(grid_size, 1, 1),
             block=(block_size, 1, 1),
             shared_mem=0,
-            expected_args=9
+            expected_args=10
         )
 
         return self.logits_buffer
@@ -194,8 +207,14 @@ class LMHead:
         lm_head_val = lm_head_ptr.ptr if hasattr(lm_head_ptr, 'ptr') else lm_head_ptr
 
         from vte.compiler.qwen_mapper import is_raw_q6k_weight
+        from vte.compiler.granite_mapper import is_raw_q8_0_weight
         tensor_info = self.model.parser.tensors.get(lm_head_name, {})
-        template = "gemv_q6k" if is_raw_q6k_weight(lm_head_name, tensor_info) else "gemv_coalesced"
+        if is_raw_q6k_weight(lm_head_name, tensor_info):
+            template = "gemv_q6k"
+        elif is_raw_q8_0_weight(lm_head_name, tensor_info):
+            template = "gemv_q8_0"
+        else:
+            template = "gemv_coalesced"
 
         hsaco_path = self.model.executor.codegen.compile_kernel(
             template_name=template, arch=self.hip.get_gpu_architecture(),
@@ -209,6 +228,7 @@ class LMHead:
             ).ptr
             self._logits_buffer_batch_size = batch_size
 
+        logit_scale = self.model.metadata.get('logit_scale', 1.0) or 1.0
         args = [
             ctypes.c_void_p(hidden_states_ptr),
             ctypes.c_void_p(lm_head_val),
@@ -219,6 +239,7 @@ class LMHead:
             ctypes.c_int(self.vocab_size),
             ctypes.c_void_p(0),
             ctypes.c_void_p(0),
+            ctypes.c_float(1.0 / logit_scale),
         ]
 
         block_size = 64
@@ -230,7 +251,7 @@ class LMHead:
             grid=(self.vocab_size, batch_size, 1),
             block=(block_size, 1, 1),
             shared_mem=0,
-            expected_args=9
+            expected_args=10
         )
 
         return self._logits_buffer_batch

@@ -26,7 +26,10 @@
 // blockDim.x deve ser múltiplo de warpSize e de head_dim/nwarps inteiro
 // (256 threads = 8 wavefronts em gfx11 wave32; head_dim=128 -> 16 iterações).
 
-#define FUSED_MAX_HIDDEN 1536
+// 2560 cobre o hidden_size do Granite (2560); Qwen2.5 (1536) continua
+// folgado dentro do mesmo limite -- só afeta o tamanho da LDS reservada,
+// não a lógica de nenhum dos dois.
+#define FUSED_MAX_HIDDEN 2560
 
 extern "C" __global__ void fused_norm_matmul_rope_kernel(
     const __half* __restrict__ x,            // [hidden_size] — saída da camada anterior (residual)
@@ -41,7 +44,9 @@ extern "C" __global__ void fused_norm_matmul_rope_kernel(
     int head_dim,
     float eps,
     const int* __restrict__ kv_cache_offset_ptr,
-    int apply_rope
+    int apply_rope,
+    int rope_type   // 0 = NEOX/split-half (Qwen2); 1 = NORM/intercalado
+                     // (Granite) -- ver split_k_qkv_pass2.hip.template.
 ) {
     __shared__ __align__(16) __half x_sh[FUSED_MAX_HIDDEN];  // 16B aligned p/ uint4
     __shared__ float red[256];
@@ -137,20 +142,35 @@ extern "C" __global__ void fused_norm_matmul_rope_kernel(
         if (n >= out_features) continue;
 
         if (apply_rope != 0) {
-            int half = head_dim / 2;
             int pos = *kv_cache_offset_ptr;
-            if (local < half) {
-                float v1 = raw_out[local];
-                float v2 = raw_out[local + half];
-                float c = __half2float(cos_cache[pos * head_dim + local]);
-                float s = __half2float(sin_cache[pos * head_dim + local]);
-                output[n] = __float2half(v1 * c - v2 * s);
+            if (rope_type == 1) {
+                int i = local / 2;
+                float c = __half2float(cos_cache[pos * head_dim + i]);
+                float s = __half2float(sin_cache[pos * head_dim + i]);
+                if ((local & 1) == 0) {
+                    float x0 = raw_out[local];
+                    float x1 = raw_out[local + 1];
+                    output[n] = __float2half(x0 * c - x1 * s);
+                } else {
+                    float x0 = raw_out[local - 1];
+                    float x1 = raw_out[local];
+                    output[n] = __float2half(x0 * s + x1 * c);
+                }
             } else {
-                float v1 = raw_out[local - half];
-                float v2 = raw_out[local];
-                float c = __half2float(cos_cache[pos * head_dim + (local - half)]);
-                float s = __half2float(sin_cache[pos * head_dim + (local - half)]);
-                output[n] = __float2half(v1 * s + v2 * c);
+                int half = head_dim / 2;
+                if (local < half) {
+                    float v1 = raw_out[local];
+                    float v2 = raw_out[local + half];
+                    float c = __half2float(cos_cache[pos * head_dim + local]);
+                    float s = __half2float(sin_cache[pos * head_dim + local]);
+                    output[n] = __float2half(v1 * c - v2 * s);
+                } else {
+                    float v1 = raw_out[local - half];
+                    float v2 = raw_out[local];
+                    float c = __half2float(cos_cache[pos * head_dim + (local - half)]);
+                    float s = __half2float(sin_cache[pos * head_dim + (local - half)]);
+                    output[n] = __float2half(v1 * s + v2 * c);
+                }
             }
         } else {
             output[n] = __float2half(raw_out[local]);

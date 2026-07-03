@@ -17,6 +17,7 @@ from vte.bridge.logger import get_logger
 logger = get_logger("VTE.Motor")
 
 DEFAULT_CONTEXT_LENGTH = 2048
+DEFAULT_MODEL_NAME = "qwen2.5:1.5b-q4_k_m"
 
 
 class PipeLogHandler(logging.Handler):
@@ -47,7 +48,7 @@ class PipeLogHandler(logging.Handler):
 
 
 class InferenceEngine:
-    def __init__(self, pipe_conn: Connection, context_length: int = DEFAULT_CONTEXT_LENGTH):
+    def __init__(self, pipe_conn: Connection, context_length: int = DEFAULT_CONTEXT_LENGTH, model_name: str = DEFAULT_MODEL_NAME):
         self.conn = pipe_conn
         self.running = True
         self.is_generating = False
@@ -65,7 +66,7 @@ class InferenceEngine:
         self.last_tps = 0.0
         self.last_ms_per_token = 0.0
 
-        self.model_name = "qwen2.5:1.5b-q4_k_m"
+        self.model_name = model_name
         self.model = None
         self._gpu_monitor: Optional[GPUMonitor] = None
         self._last_metrics_snapshot: Optional[MotorMsgMetrics] = None
@@ -240,9 +241,12 @@ class InferenceEngine:
         cancelled = False
 
         try:
-            # A UI é um chat: formata a mensagem no template ChatML do Qwen2.5
-            # (Instruct) antes de gerar. Sem isto o modelo faz completion de
-            # texto cru em vez de responder como assistente.
+            # A UI é um chat: formata a mensagem no chat template do modelo
+            # atualmente carregado (cada tokenizer -- QwenTokenizer,
+            # GraniteTokenizer -- implementa apply_chat_template() com o
+            # formato certo do seu próprio modelo) antes de gerar. Sem isto
+            # o modelo faz completion de texto cru em vez de responder como
+            # assistente.
             chat_prompt = self.model.tokenizer.apply_chat_template(prompt)
             generator = self.model.generate(chat_prompt, max_tokens=max_tokens)
 
@@ -313,7 +317,7 @@ class InferenceEngine:
                 logger.warning(f"Pacote IPC ignorado devido a erro de parsing: {e}")
 
 
-def motor_entry(pipe_conn: Connection, context_length: int = DEFAULT_CONTEXT_LENGTH):
+def motor_entry(pipe_conn: Connection, context_length: int = DEFAULT_CONTEXT_LENGTH, model_name: str = DEFAULT_MODEL_NAME):
     """Entry point do subprocesso"""
-    engine = InferenceEngine(pipe_conn, context_length=context_length)
+    engine = InferenceEngine(pipe_conn, context_length=context_length, model_name=model_name)
     engine.loop()

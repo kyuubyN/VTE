@@ -45,6 +45,7 @@ class VTEModel:
     
     MODEL_REGISTRY = {
         "qwen2.5:1.5b-q4_k_m": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+        "granite-4.1:3b-q8_0": "granite-4.1-3b-Q8_0.gguf",
     }
     
     DEFAULT_CONTEXT_LENGTH = 2048
@@ -127,16 +128,14 @@ class VTEModel:
         instance._lifecycle.start_monitoring()
         return instance
     
-    def _load(self):
-        sanitizer = GGUFSanitizer(Path(self._path))
-        sanitizer.validate()
-
-        # Lê os hiperparâmetros REAIS do GGUF em vez de depender de defaults
-        # espalhados pelo código. Vários defaults estavam ERRADOS para o
-        # Qwen2.5-1.5B (head_count=12 não 16, rope.freq_base=1e6 não 1e4,
-        # eps=1e-6 não 1e-5), quebrando GQA, RoPE e lançando blocos de cabeça
-        # fora dos limites. As chaves aqui são as (sem prefixo 'qwen2.') que
-        # kernel_arg_builder/qwen_compute/qwen_mapper consultam.
+    def _load_qwen2_metadata(self, sanitizer) -> dict:
+        """Lê os hiperparâmetros REAIS do GGUF em vez de depender de defaults
+        espalhados pelo código. Vários defaults estavam ERRADOS para o
+        Qwen2.5-1.5B (head_count=12 não 16, rope.freq_base=1e6 não 1e4,
+        eps=1e-6 não 1e-5), quebrando GQA, RoPE e lançando blocos de cabeça
+        fora dos limites. As chaves aqui são as (sem prefixo 'qwen2.') que
+        kernel_arg_builder/qwen_compute/qwen_mapper consultam. Comportamento
+        INTOCADO em relação à versão anterior (pré-Granite) desta função."""
         from ..compiler.gguf_metadata import read_gguf_metadata
         raw = read_gguf_metadata(self._path, wanted_keys={
             "qwen2.embedding_length", "qwen2.block_count", "qwen2.context_length",
@@ -161,13 +160,86 @@ class VTEModel:
             "rope.freq_base": raw.get("qwen2.rope.freq_base", 1000000.0),
             "attention.layer_norm_rms_epsilon": raw.get("qwen2.attention.layer_norm_rms_epsilon", 1e-6),
         }
-        self.metadata = metadata
         logger.info(
-            f"Hiperparâmetros GGUF: hidden={embedding_length}, heads={head_count}, "
+            f"Hiperparâmetros GGUF (Qwen2.5): hidden={embedding_length}, heads={head_count}, "
             f"kv_heads={metadata['attention.head_count_kv']}, head_dim={head_dim}, "
             f"ffn={metadata['feed_forward_length']}, rope_theta={metadata['rope.freq_base']}, "
             f"eps={metadata['attention.layer_norm_rms_epsilon']:.2e}"
         )
+        return metadata
+
+    def _load_granite_metadata(self, sanitizer) -> dict:
+        """Mesma ideia de `_load_qwen2_metadata`, mas para o Granite 4.1:
+        lê hiperparâmetros reais do namespace 'granite.*' do GGUF, incluindo
+        os 4 multiplicadores de escala (embedding_scale/attention_scale/
+        residual_scale/logit_scale) que o Qwen2.5 não tem -- ausentes aqui
+        eles ficam com o valor neutro (1.0, ou None para deixar o cálculo
+        padrão de 1/sqrt(head_dim) assumir, no caso do attention_scale),
+        que é como o resto do pipeline compartilhado (kernel_arg_builder,
+        fallback_executor, etc.) já trata a ausência dessas chaves para o
+        Qwen. Valores confirmados contra os bytes reais do GGUF, não
+        adivinhados: attention.scale=0.015625, embedding_scale=12.0,
+        residual_scale=0.22, logit_scale=10.0."""
+        from ..compiler.gguf_metadata import read_gguf_metadata
+        raw = read_gguf_metadata(self._path, wanted_keys={
+            "granite.embedding_length", "granite.block_count", "granite.context_length",
+            "granite.attention.head_count", "granite.attention.head_count_kv",
+            "granite.rope.dimension_count", "granite.feed_forward_length",
+            "granite.rope.freq_base", "granite.attention.layer_norm_rms_epsilon",
+            "granite.attention.scale", "granite.embedding_scale",
+            "granite.residual_scale", "granite.logit_scale",
+        })
+
+        embedding_length = raw.get("granite.embedding_length", sanitizer.header.embedding_length)
+        head_count = raw.get("granite.attention.head_count", 40)
+        head_dim = raw.get("granite.rope.dimension_count", embedding_length // head_count)
+
+        metadata = {
+            "embedding_length": embedding_length,
+            "block_count": raw.get("granite.block_count", sanitizer.header.block_count),
+            "context_length": raw.get("granite.context_length", sanitizer.header.context_length),
+            "attention.head_count": head_count,
+            "attention.head_count_kv": raw.get("granite.attention.head_count_kv", 8),
+            "attention.key_length": head_dim,
+            "feed_forward_length": raw.get("granite.feed_forward_length", 8192),
+            "rope.freq_base": raw.get("granite.rope.freq_base", 1.0e7),
+            "attention.layer_norm_rms_epsilon": raw.get("granite.attention.layer_norm_rms_epsilon", 1e-5),
+            "attention_scale": raw.get("granite.attention.scale"),
+            "embedding_scale": raw.get("granite.embedding_scale", 1.0),
+            "residual_scale": raw.get("granite.residual_scale", 1.0),
+            "logit_scale": raw.get("granite.logit_scale", 1.0),
+            # 1 = NORM/intercalado (llama-model.cpp::llama_model_rope_type ->
+            # LLAMA_ROPE_TYPE_NORM para LLM_ARCH_GRANITE) -- NÃO é o mesmo
+            # NEOX/split-half do Qwen2.5 (que fica com o default 0). Não vem
+            # do GGUF: é uma propriedade fixa da arquitetura, hardcoded pelo
+            # próprio llama.cpp por arch, não por chave de metadado.
+            "rope_type": 1,
+        }
+        logger.info(
+            f"Hiperparâmetros GGUF (Granite): hidden={embedding_length}, heads={head_count}, "
+            f"kv_heads={metadata['attention.head_count_kv']}, head_dim={head_dim}, "
+            f"ffn={metadata['feed_forward_length']}, rope_theta={metadata['rope.freq_base']}, "
+            f"eps={metadata['attention.layer_norm_rms_epsilon']:.2e}, "
+            f"attention_scale={metadata['attention_scale']}, embedding_scale={metadata['embedding_scale']}, "
+            f"residual_scale={metadata['residual_scale']}, logit_scale={metadata['logit_scale']}"
+        )
+        return metadata
+
+    def _load(self):
+        sanitizer = GGUFSanitizer(Path(self._path))
+        sanitizer.validate()
+
+        # Arquitetura já foi validada pelo sanitizer (SUPPORTED_ARCHITECTURES)
+        # -- aqui só escolhemos QUAL leitor de metadados/mapper/tokenizer usar,
+        # nunca um terceiro caminho "desconhecido" (isso já teria sido
+        # rejeitado por sanitizer.validate() antes de chegarmos aqui).
+        architecture = sanitizer.header.architecture
+        if architecture == "granite":
+            metadata = self._load_granite_metadata(sanitizer)
+        else:
+            metadata = self._load_qwen2_metadata(sanitizer)
+        self.metadata = metadata
+        self._architecture = architecture
 
         if self._hip is None:
             self._hip = HIPRuntime()
@@ -179,18 +251,25 @@ class VTEModel:
             self.parser = GGUFParser(Path(self._path))
             self.parser.parse_tensors(sanitizer.header)
 
-            # Etapa C: registra os pesos que ficam CRUS em Q4_K (gate/up) a
+            # Etapa C: registra os pesos que ficam CRUS em Q4_K/Q6_K/Q8_0 a
             # partir da MESMA função usada pelo loader/mapper, para o executor
-            # rotear esses nós ao gemv_q4k. Fonte única de verdade.
+            # rotear esses nós ao gemv_* correto. Fonte única de verdade.
             from vte.compiler.qwen_mapper import is_raw_q4k_weight, is_raw_q6k_weight
-            from vte.core.fallback_executor import register_raw_q4k_weights, register_raw_q6k_weights
+            from vte.compiler.granite_mapper import is_raw_q8_0_weight
+            from vte.core.fallback_executor import register_raw_q4k_weights, register_raw_q6k_weights, register_raw_q8_0_weights
             raw_q4k = {n for n, t in self.parser.tensors.items() if is_raw_q4k_weight(n, t)}
             raw_q6k = {n for n, t in self.parser.tensors.items() if is_raw_q6k_weight(n, t)}
+            raw_q8_0 = {n for n, t in self.parser.tensors.items() if is_raw_q8_0_weight(n, t)}
             register_raw_q4k_weights(raw_q4k)
             register_raw_q6k_weights(raw_q6k)
-            logger.info(f"Pesos crus in-kernel: Q4_K={len(raw_q4k)} (gemv_q4k), Q6_K={len(raw_q6k)} (gemv_q6k)")
+            register_raw_q8_0_weights(raw_q8_0)
+            logger.info(f"Pesos crus in-kernel: Q4_K={len(raw_q4k)} (gemv_q4k), Q6_K={len(raw_q6k)} (gemv_q6k), Q8_0={len(raw_q8_0)} (gemv_q8_0)")
 
-            mapper = QwenTensorMapper(self.parser, metadata)
+            if architecture == "granite":
+                from vte.compiler.granite_mapper import GraniteTensorMapper
+                mapper = GraniteTensorMapper(self.parser, metadata)
+            else:
+                mapper = QwenTensorMapper(self.parser, metadata)
             self._mapper = mapper  # Fase II (prep): reaproveitado por generate_batch()
 
             # Dimensiona o pool para o MAIOR batch_size pretendido (padrão 1 —
@@ -240,7 +319,11 @@ class VTEModel:
             build_residual_fusion(list(self._graph.nodes.values()))
             logger.info(f"Fusão de residual (epilogue): {len(RESIDUAL_FUSION)} GEMVs fundidos")
 
-        self.tokenizer = QwenTokenizer(gguf_path=self._path)
+        if architecture == "granite":
+            from vte.compiler.tokenizer import GraniteTokenizer
+            self.tokenizer = GraniteTokenizer(gguf_path=self._path)
+        else:
+            self.tokenizer = QwenTokenizer(gguf_path=self._path)
         self.sampler = Sampler()
 
         # Recupera o bloco de arena pré-alocado pelo mapper (Evita sobreposicao)
@@ -386,6 +469,7 @@ class VTEModel:
         """
         from vte.compiler.codegen import CodegenEngine
         from vte.compiler.qwen_mapper import is_raw_q6k_weight
+        from vte.compiler.granite_mapper import is_raw_q8_0_weight
 
         tensor_mapping = tensor_mapping if tensor_mapping is not None else self.tensor_mapping
         hidden_size = self.metadata.get('embedding_length', 1536)
@@ -411,7 +495,12 @@ class VTEModel:
             region=MemoryRegion.SCRATCH
         )
 
-        template = "gemv_q6k" if is_raw_q6k_weight(lm_head_name, tensor_info) else "gemv_coalesced"
+        if is_raw_q6k_weight(lm_head_name, tensor_info):
+            template = "gemv_q6k"
+        elif is_raw_q8_0_weight(lm_head_name, tensor_info):
+            template = "gemv_q8_0"
+        else:
+            template = "gemv_coalesced"
         codegen = CodegenEngine()
         hsaco_path = codegen.compile_kernel(
             template_name=template,
@@ -513,7 +602,7 @@ class VTEModel:
             yield word
 
             current_seq_len += 1
-            if current_seq_len >= 4096:
+            if current_seq_len >= self._context_length:
                 break
 
             # Processa o token recém-gerado na sua posição para prever o próximo.
@@ -630,7 +719,7 @@ class VTEModel:
             yield words
 
             current_seq_len += 1
-            if current_seq_len >= 4096:
+            if current_seq_len >= self._context_length:
                 break
 
             batch_executor.execute_decode_batch(next_tokens, [current_seq_len - 1] * batch_size)

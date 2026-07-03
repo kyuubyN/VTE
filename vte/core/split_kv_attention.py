@@ -121,7 +121,12 @@ class SplitKVAttentionDispatcher:
         num_q_heads = self.metadata.get('attention.head_count', 12)
         num_kv_heads = self.metadata.get('attention.head_count_kv', 2)
         head_dim = self.metadata.get('attention.key_length', 128)
-        scale = 1.0 / (head_dim ** 0.5)
+        # Mesmo raciocínio de KernelArgBuilder._build_attention_args: usa o
+        # attention_scale explícito do GGUF quando presente (SUBSTITUI o
+        # cálculo padrão, não combina com ele -- Granite: 0.015625 vs
+        # 1/sqrt(64)=0.125, valores bem diferentes).
+        attention_scale = self.metadata.get('attention_scale')
+        scale = attention_scale if attention_scale else 1.0 / (head_dim ** 0.5)
 
         node_name = f"blk.{layer_idx}.attention"
         # input_tensors: [q_pos_rope, k_proj_atual, v_proj_atual] -- mesma

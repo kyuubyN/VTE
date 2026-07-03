@@ -35,7 +35,8 @@ extern "C" __global__ void gemv_q4k_kernel(
     int in_features,
     int out_features,
     const void* __restrict__ bias_ptr,
-    const void* __restrict__ residual_ptr   // Epilogue Fusion: out += residual[row]
+    const void* __restrict__ residual_ptr,  // Epilogue Fusion: out += residual[row]
+    float residual_scale                    // Granite: 0.22 (ver gemv_q8_0.hip.template). Default 1.0.
 ) {
     __shared__ float warp_sums[32];
 
@@ -113,6 +114,7 @@ extern "C" __global__ void gemv_q4k_kernel(
         if (bias_ptr != nullptr) {
             total += __half2float(((const __half*)bias_ptr)[row]);
         }
+        total *= residual_scale;
         if (residual_ptr != nullptr) {
             total += __half2float(((const __half*)residual_ptr)[(size_t)m * out_features + row]);
         }

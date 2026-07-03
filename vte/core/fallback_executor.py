@@ -28,6 +28,7 @@ GEMV_COALESCED_BLOCK = 64
 # que "peso cru" e "kernel de desquant" nunca fiquem dessincronizados.
 RAW_Q4K_WEIGHTS: set = set()
 RAW_Q6K_WEIGHTS: set = set()
+RAW_Q8_0_WEIGHTS: set = set()
 
 # Epilogue Fusion do residual: {gemv_node_name: (out_tensor, residual_tensor)}.
 # O GEMV escreve direto na saída do Add e soma residual[row] no epílogo; o nó
@@ -74,6 +75,11 @@ def register_raw_q6k_weights(names) -> None:
     RAW_Q6K_WEIGHTS.update(names)
 
 
+def register_raw_q8_0_weights(names) -> None:
+    RAW_Q8_0_WEIGHTS.clear()
+    RAW_Q8_0_WEIGHTS.update(names)
+
+
 def _is_q4k_matmul(node: IRNode) -> bool:
     """True se o peso do MATMUL está cru em Q4_K (roteia para gemv_q4k)."""
     if node.op_type != NodeType.MATMUL:
@@ -88,6 +94,14 @@ def _is_q6k_matmul(node: IRNode) -> bool:
         return False
     inputs = getattr(node, 'input_tensors', None) or []
     return len(inputs) >= 2 and inputs[1] in RAW_Q6K_WEIGHTS
+
+
+def _is_q8_0_matmul(node: IRNode) -> bool:
+    """True se o peso do MATMUL está cru em Q8_0 (roteia para gemv_q8_0)."""
+    if node.op_type != NodeType.MATMUL:
+        return False
+    inputs = getattr(node, 'input_tensors', None) or []
+    return len(inputs) >= 2 and inputs[1] in RAW_Q8_0_WEIGHTS
 
 # Nós MATMUL roteados para o kernel GEMV coalescido (Split-K, 1 bloco/neurônio,
 # leitura de peso coalescida entre lanes + redução via __shfl_down).
@@ -177,7 +191,7 @@ class FallbackExecutor:
         
         self.execution_order = self._build_topological_order()
         self.context = ExecutionContext()
-        self.num_layers = 28
+        self.num_layers = self.metadata.get('block_count', 28)
         
         self._arch = self.hip.get_gpu_architecture()
         self.codegen = CodegenEngine()
@@ -255,21 +269,27 @@ class FallbackExecutor:
         token_ids_ptr = self.tensor_mapping.get('input_ids')
         embed_weight_ptr = self.tensor_mapping.get('token_embd.weight')
         output_ptr = self.tensor_mapping.get('input_embeddings')
-        hidden_size = 1536
-        
+        hidden_size = self.metadata.get('embedding_length', 1536)
+
         # Se os pesos do embedding não estao carregados ou ids, não conseguimos fazer o lookup.
         # Mas para o teste, o user pediu para implementarmos!
         if not embed_weight_ptr or not output_ptr:
             return
-            
+
         embed_ptr_val = embed_weight_ptr.ptr if hasattr(embed_weight_ptr, 'ptr') else embed_weight_ptr
         out_ptr_val = output_ptr.ptr if hasattr(output_ptr, 'ptr') else output_ptr
         token_ids_val = token_ids_ptr.ptr if hasattr(token_ids_ptr, 'ptr') else token_ids_ptr
 
-        # Fase D.1: token_embd.weight cru em Q6_K (tied embeddings) exige
-        # dequant no lookup, não leitura FP16 direta.
-        is_raw = 'token_embd.weight' in RAW_Q6K_WEIGHTS
-        template = "embedding_lookup_q6k" if is_raw else "embedding_lookup"
+        # Tied embeddings cruas exigem dequant no lookup, não leitura FP16
+        # direta: Q6_K no Qwen (Fase D.1), Q8_0 no Granite (Fase 1) -- o
+        # mesmo tensor token_embd.weight serve de peso do lm_head E de
+        # embedding, então tem que casar com o formato em que ficou cru.
+        if 'token_embd.weight' in RAW_Q6K_WEIGHTS:
+            template = "embedding_lookup_q6k"
+        elif 'token_embd.weight' in RAW_Q8_0_WEIGHTS:
+            template = "embedding_lookup_q8_0"
+        else:
+            template = "embedding_lookup"
 
         # Cria ou pega kernel de embedding_lookup
         cache_key = f"{NodeType.EMBEDDING}_{template}"
@@ -286,31 +306,33 @@ class FallbackExecutor:
             
         c_seq = ctypes.c_int(seq_len)
         c_hidden = ctypes.c_int(hidden_size)
-        
+        c_embedding_scale = ctypes.c_float(self.metadata.get('embedding_scale', 1.0))
+
         args = [
             ctypes.c_void_p(token_ids_val),
             ctypes.c_void_p(embed_ptr_val),
             ctypes.c_void_p(out_ptr_val),
             c_seq,
-            c_hidden
+            c_hidden,
+            c_embedding_scale,
         ]
-        
+
         # Converte para array de ponteiros
         c_args = (ctypes.c_void_p * len(args))()
         for i, arg in enumerate(args):
             c_args[i] = ctypes.cast(ctypes.byref(arg), ctypes.c_void_p)
-            
+
         total_elements = seq_len * hidden_size
         block_size = 256
         grid_size = max(1, (total_elements + block_size - 1) // block_size)
-        
+
         self.hip.launch_kernel(
             function=kernel,
             args=args, # launch_kernel cuida do byref
             grid=(grid_size, 1, 1),
             block=(block_size, 1, 1),
             shared_mem=0,
-            expected_args=5
+            expected_args=6
         )
 
     def execute_layer(self, layer_idx: int, seq_len: int = 1, kv_cache_offset: int = 0):
@@ -552,6 +574,8 @@ class FallbackExecutor:
                 template_name = "gemv_q4k"
             elif _is_q6k_matmul(node):
                 template_name = "gemv_q6k"
+            elif _is_q8_0_matmul(node):
+                template_name = "gemv_q8_0"
             elif _is_vectorized_matmul(node):
                 template_name = "gemv_coalesced"
             else:
@@ -588,7 +612,7 @@ class FallbackExecutor:
         if node.op_type == NodeType.MATMUL:
             # gate/up (Q4_K -> gemv_q4k) e down/attn_output (FP16 -> gemv_coalesced)
             # usam a mesma geometria: 1 bloco/neurônio, 64 threads dividindo K.
-            if _is_q4k_matmul(node) or _is_q6k_matmul(node) or _is_vectorized_matmul(node):
+            if _is_q4k_matmul(node) or _is_q6k_matmul(node) or _is_q8_0_matmul(node) or _is_vectorized_matmul(node):
                 return _coalesced_gemv_dims(node, seq_len, batch)
             out_features = node.shape[-1]
             m = batch * seq_len

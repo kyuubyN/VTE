@@ -6,6 +6,7 @@ from vte.bridge.errors import HIPSafetyError
 from vte.bridge.logger import get_logger
 from vte.compiler.dequantizer import to_fp16_bytes
 from vte.compiler.qwen_mapper import is_raw_q4k_weight, is_raw_q6k_weight
+from vte.compiler.granite_mapper import is_raw_q8_0_weight
 
 logger = get_logger(__name__)
 
@@ -61,9 +62,10 @@ class GGUFWeightLoader:
 
                     raw_bytes = mm[offset:offset + size]
 
-                    # Etapa C: pesos roteados ao gemv_q4k/gemv_q6k ficam CRUS na
-                    # VRAM (desquantização in-kernel). O resto vai FP16.
-                    if is_raw_q4k_weight(name, t_info) or is_raw_q6k_weight(name, t_info):
+                    # Etapa C: pesos roteados ao gemv_q4k/gemv_q6k/gemv_q8_0
+                    # ficam CRUS na VRAM (desquantização in-kernel). O resto
+                    # vai FP16.
+                    if is_raw_q4k_weight(name, t_info) or is_raw_q6k_weight(name, t_info) or is_raw_q8_0_weight(name, t_info):
                         upload_bytes = bytes(raw_bytes)
                     else:
                         upload_bytes = to_fp16_bytes(raw_bytes, t_info['dtype'], n_elements)

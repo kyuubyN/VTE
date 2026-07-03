@@ -30,6 +30,8 @@ dependencies = [
     "tiktoken>=0.6.0",
     "WMI>=1.5.1; sys_platform == 'win32'",
     "pywin32; sys_platform == 'win32'",
+    "jinja2>=3.1.0",
+    "regex>=2023.0.0",
 ]
 
 [project.optional-dependencies]

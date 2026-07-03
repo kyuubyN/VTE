@@ -58,9 +58,20 @@ extern "C" __global__ void split_k_qkv_pass1_kernel(
     int n = head_idx * head_dim + j;
     const __half* w_row = proj_weight + (size_t)n * hidden_size + k_start;
 
+    // Leitura vetorizada em pares (__half2): reduz pela metade o número de
+    // iterações/transações de memória global vs ler um __half por vez.
+    // Seguro: hidden_size e chunk_size (hidden_size/32) são sempre pares
+    // (1536/32=48, 2560/32=80), então k_start e n*hidden_size também são
+    // pares -> w_row fica alinhado a 4 bytes (VRAM já alinha a 64 bytes).
     float acc = 0.0f;
-    for (int k = 0; k < chunk_size; k++) {
-        acc = fmaf(__half2float(x_chunk_sh[k]), __half2float(w_row[k]), acc);
+    int chunk_size2 = chunk_size / 2;
+    const __half2* w_row2 = reinterpret_cast<const __half2*>(w_row);
+    const __half2* x_chunk_sh2 = reinterpret_cast<const __half2*>(x_chunk_sh);
+    for (int k2 = 0; k2 < chunk_size2; k2++) {
+        __half2 wv = w_row2[k2];
+        __half2 xv = x_chunk_sh2[k2];
+        acc = fmaf(__half2float(xv.x), __half2float(wv.x), acc);
+        acc = fmaf(__half2float(xv.y), __half2float(wv.y), acc);
     }
 
     float* scratch_b = scratch + (size_t)batch_idx * num_heads * 32 * head_dim;

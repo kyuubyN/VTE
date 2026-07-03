@@ -73,22 +73,22 @@ def test_invalid_metadata_consistency(mock_gguf_file, monkeypatch):
     monkeypatch.setattr(config, "ALLOWED_MODEL_SIZE_MIN", 10)
     
     sanitizer = GGUFSanitizer(mock_gguf_file)
-    monkeypatch.setattr(sanitizer, "_validate_or_generate_hash", lambda: True)
-    
+    monkeypatch.setattr(sanitizer, "_validate_or_generate_hash", lambda profile: True)
+
     import struct
     with open(mock_gguf_file, "r+b") as f:
         f.seek(8)
         f.write(struct.pack("<Q", 1001))
-    
+
     with pytest.raises(HIPSafetyError, match="excessivo"):
         sanitizer.validate()
 
 def test_valid_mock_flow(mock_gguf_file, monkeypatch):
     import vte.config as config
     monkeypatch.setattr(config, "ALLOWED_MODEL_SIZE_MIN", 10)
-    
+
     sanitizer = GGUFSanitizer(mock_gguf_file)
-    monkeypatch.setattr(sanitizer, "_validate_or_generate_hash", lambda: True)
+    monkeypatch.setattr(sanitizer, "_validate_or_generate_hash", lambda profile: True)
     
     assert sanitizer.validate() is True
     assert sanitizer.header.architecture == "qwen2"

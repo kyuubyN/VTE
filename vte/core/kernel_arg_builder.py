@@ -38,6 +38,7 @@ class KernelArgBuilder:
             ("out_features", ctypes.c_int),
             ("bias", ctypes.c_void_p),
             ("residual", ctypes.c_void_p),
+            ("residual_scale", ctypes.c_float),
         ],
         NodeType.ROPE: [
             ("q", ctypes.c_void_p),
@@ -49,6 +50,7 @@ class KernelArgBuilder:
             ("num_kv_heads", ctypes.c_int),
             ("head_dim", ctypes.c_int),
             ("kv_cache_offset_ptr", ctypes.c_void_p),
+            ("rope_type", ctypes.c_int),
         ],
         NodeType.ATTENTION: [
             ("q", ctypes.c_void_p),
@@ -76,6 +78,7 @@ class KernelArgBuilder:
             ("input", ctypes.c_void_p),
             ("output", ctypes.c_void_p),
             ("n", ctypes.c_int),
+            ("residual_scale", ctypes.c_float),
         ],
     }
     
@@ -134,7 +137,7 @@ class KernelArgBuilder:
             )
         elif node.op_type == NodeType.ADD:
             args_array, strong_refs = self._build_add_args(
-                node, tensor_mapping, seq_len, batch
+                node, tensor_mapping, seq_len, metadata, batch
             )
         
         # Validação de ABI: número de argumentos deve bater com assinatura
@@ -257,6 +260,16 @@ class KernelArgBuilder:
         c_seq = ctypes.c_int(seq_len)
         c_in = ctypes.c_int(in_features)
         c_out = ctypes.c_int(out_features)
+        # Granite escala a SAÍDA do sub-bloco (não o residual em si) ANTES de
+        # somá-la ao residual -- confirmado em granite.cpp: só o `cur` que
+        # entra em ggml_add(cur, inpSA/ffn_inp) é escalado, nunca gate_proj/
+        # up_proj/q_proj/k_proj/v_proj isoladamente. Por isso só aplicamos o
+        # valor real quando este nó É o que funde com o residual (`fusion`
+        # truthy — exatamente attn_output/down_proj); todo o resto usa 1.0,
+        # senão gate_proj/up_proj ficariam encolhidos por 0.22x sem motivo
+        # (bug real encontrado nesta sessão: SiLU(gate*0.22)*(up*0.22) some
+        # com o sinal do FFN antes mesmo do down_proj rodar).
+        c_residual_scale = ctypes.c_float(metadata.get('residual_scale', 1.0) if fusion else 1.0)
 
         args = [
             ctypes.c_void_p(input_ptr),
@@ -268,9 +281,10 @@ class KernelArgBuilder:
             c_out,
             ctypes.c_void_p(bias_ptr),
             ctypes.c_void_p(residual_ptr),
+            c_residual_scale,
         ]
 
-        strong_refs = [c_batch, c_seq, c_in, c_out]
+        strong_refs = [c_batch, c_seq, c_in, c_out, c_residual_scale]
         return args, strong_refs
     
     def _build_rope_args(
@@ -285,11 +299,13 @@ class KernelArgBuilder:
         num_q_heads = self._get_meta(metadata, 'attention.head_count', 16)
         num_kv_heads = self._get_meta(metadata, 'attention.head_count_kv', 2)
         head_dim = self._get_meta(metadata, 'attention.key_length', 128)
+        rope_type = metadata.get('rope_type', 0)
 
         c_seq = ctypes.c_int(seq_len)
         c_q_heads = ctypes.c_int(num_q_heads)
         c_kv_heads = ctypes.c_int(num_kv_heads)
         c_dim = ctypes.c_int(head_dim)
+        c_rope_type = ctypes.c_int(rope_type)
 
         args = [
             ctypes.c_void_p(q_ptr),
@@ -301,9 +317,10 @@ class KernelArgBuilder:
             c_kv_heads,
             c_dim,
             ctypes.c_void_p(kv_offset_ptr),
+            c_rope_type,
         ]
 
-        strong_refs = [c_seq, c_q_heads, c_kv_heads, c_dim]
+        strong_refs = [c_seq, c_q_heads, c_kv_heads, c_dim, c_rope_type]
         return args, strong_refs
 
     def _build_attention_args(
@@ -358,8 +375,12 @@ class KernelArgBuilder:
         c_kv_heads = ctypes.c_int(num_kv_heads)
         c_dim = ctypes.c_int(head_dim)
         
-        # Cria escala de atenção (1 / sqrt(dim))
-        scale = 1.0 / (head_dim ** 0.5)
+        # Escala de atenção: usa o valor explícito do GGUF quando presente
+        # (Granite: attention.scale=0.015625, SUBSTITUI o cálculo padrão —
+        # não multiplica/soma a ele, confirmado contra llama-graph.cpp) ou
+        # cai no cálculo padrão 1/sqrt(head_dim) quando ausente (Qwen).
+        attention_scale = metadata.get('attention_scale')
+        scale = attention_scale if attention_scale else 1.0 / (head_dim ** 0.5)
         c_scale = ctypes.c_float(scale)
 
         # Fase I: stride (em elementos __half) entre sequências do batch no
@@ -422,12 +443,14 @@ class KernelArgBuilder:
         return args, strong_refs
     
     def _build_add_args(
-        self, node: IRNode, tensor_mapping: dict, seq_len: int, batch: int = 1
+        self, node: IRNode, tensor_mapping: dict, seq_len: int, metadata: dict = None, batch: int = 1
     ) -> Tuple[list, list]:
-        """Add (residual): (residual, input, output, n).
+        """Add (residual): (residual, input, output, n, residual_scale).
 
         add_kernel é puramente elementwise — já suporta batch>1 sem mudança
-        de kernel, desde que n inclua o multiplicador de batch.
+        de kernel, desde que n inclua o multiplicador de batch. Só é
+        realmente exercitado com VTE_DISABLE_RESIDUAL_FUSION=1 (produção usa
+        o epilogue fundido no GEMV anterior, ver build_residual_fusion).
         """
         residual_ptr = self._resolve_tensor_ptr(node.input_tensors[0], tensor_mapping, {})
         input_ptr = self._resolve_tensor_ptr(node.input_tensors[1], tensor_mapping, {})
@@ -435,15 +458,17 @@ class KernelArgBuilder:
 
         n = batch * seq_len * node.shape[-1]
         c_n = ctypes.c_int(n)
-        
+        c_residual_scale = ctypes.c_float((metadata or {}).get('residual_scale', 1.0))
+
         args = [
             ctypes.c_void_p(residual_ptr),
             ctypes.c_void_p(input_ptr),
             ctypes.c_void_p(output_ptr),
             c_n,
+            c_residual_scale,
         ]
-        
-        strong_refs = [c_n]
+
+        strong_refs = [c_n, c_residual_scale]
         return args, strong_refs
     
     def clear_refs(self):

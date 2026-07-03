@@ -34,7 +34,10 @@ extern "C" __global__ void gemv_coalesced_kernel(
     int in_features,
     int out_features,
     const void* __restrict__ bias_ptr,      // nullptr quando não há bias
-    const void* __restrict__ residual_ptr   // Epilogue Fusion: out += residual[row] (nullptr = sem)
+    const void* __restrict__ residual_ptr,  // Epilogue Fusion: out += residual[row] (nullptr = sem)
+    float residual_scale                    // Granite: 0.22, escala a saída deste
+                                             // sub-bloco ANTES de somar ao residual
+                                             // (ver gemv_q8_0.hip.template). Default 1.0.
 ) {
     __shared__ float warp_sums[32];   // até 32 wavefronts/bloco (>=1024 threads)
 
@@ -94,6 +97,7 @@ extern "C" __global__ void gemv_coalesced_kernel(
         if (bias_ptr != nullptr) {
             total += __half2float(((const __half*)bias_ptr)[row]);
         }
+        total *= residual_scale;
         // Epilogue Fusion do residual: o kernel anterior (attention) acabou de
         // escrever residual_ptr[row] -> hit quente no L2/Infinity Cache. Evita
         // um kernel Add separado (56 launches/tok).

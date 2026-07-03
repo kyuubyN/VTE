@@ -113,6 +113,33 @@ def dequantize_q6_k(raw: bytes, n_elements: int) -> np.ndarray:
     return out.reshape(-1)[:n_elements]
 
 
+def dequantize_q8_0(raw: bytes, n_elements: int) -> np.ndarray:
+    """
+    Dequantiza um tensor Q8_0 (llama.cpp block format) para float32.
+
+    Layout do bloco (34 bytes / 32 elementos) -- confirmado empiricamente
+    contra os bytes reais do GGUF do Granite (gguf.GGUFReader, comparando
+    contra hipóteses concorrentes de tamanho de bloco), não a partir de
+    documentação de terceiros:
+        d:  fp16 (2 bytes) - escala do bloco
+        qs: 32 bytes       - 32 pesos int8, SIMÉTRICOS (sem min/offset)
+
+    Formato mais simples que Q4_K/Q6_K: um único fator de escala por bloco,
+    sem hierarquia de scale-of-scale.
+        w[i] = d * qs[i]
+    """
+    QK8_0 = 32
+    n_blocks = n_elements // QK8_0
+    block_bytes = 2 + 32
+    blocks = np.frombuffer(raw, dtype=np.uint8, count=n_blocks * block_bytes).reshape(n_blocks, block_bytes)
+
+    d = blocks[:, 0:2].copy().view(np.float16).astype(np.float32)[:, 0]
+    qs = blocks[:, 2:34].copy().view(np.int8).astype(np.float32)
+
+    out = d[:, None] * qs
+    return out.reshape(-1)[:n_elements]
+
+
 def to_fp16_bytes(raw: bytes, dtype: int, n_elements: int) -> bytes:
     """Converte os bytes crus de um tensor GGUF (qualquer dtype suportado) para FP16 contíguo."""
     if dtype == 0:  # F32
@@ -120,6 +147,9 @@ def to_fp16_bytes(raw: bytes, dtype: int, n_elements: int) -> bytes:
         return arr.astype(np.float16).tobytes()
     if dtype == 1:  # F16 (já no formato certo)
         return raw[:n_elements * 2]
+    if dtype == 8:  # Q8_0
+        arr = dequantize_q8_0(raw, n_elements)
+        return arr.astype(np.float16).tobytes()
     if dtype == 12:  # Q4_K
         arr = dequantize_q4_k(raw, n_elements)
         return arr.astype(np.float16).tobytes()
