@@ -16,14 +16,20 @@
 //
 // Down_proj continua separado (matmul_kernel já otimizado com LDS).
 // Sem bias no Qwen2.5 para gate_proj/up_proj (confirmado no GGUF).
+//
+// Suporte a batch (experimento Fase M, batch>1): blockIdx.y = batch_idx,
+// mesmo padrão de gemv_coalesced_kernel. x_norm/output indexados por
+// batch_idx * stride; gate_weight/up_weight são compartilhados entre todas
+// as sequências do batch (mesmo peso, lido uma vez por bloco via LDS).
+// batch=1 (grid.y=1) reduz exatamente ao comportamento original.
 
 #define FUSED_FFN_MAX_HIDDEN 1536
 
 extern "C" __global__ void fused_gate_up_silu_kernel(
-    const __half* __restrict__ x_norm,        // [hidden_size] — já normalizado (RMSNorm em kernel separado)
+    const __half* __restrict__ x_norm,        // [batch, hidden_size] — já normalizado (RMSNorm em kernel separado)
     const __half* __restrict__ gate_weight,   // [intermediate_size, hidden_size]
     const __half* __restrict__ up_weight,     // [intermediate_size, hidden_size]
-    __half* __restrict__ output,              // [intermediate_size] — SiLU(gate) * up
+    __half* __restrict__ output,              // [batch, intermediate_size] — SiLU(gate) * up
     int hidden_size,
     int intermediate_size
 ) {
@@ -31,11 +37,15 @@ extern "C" __global__ void fused_gate_up_silu_kernel(
 
     int tid = threadIdx.x;
     int n = blockIdx.x * blockDim.x + tid;
+    int batch_idx = blockIdx.y;
+
+    const __half* x_norm_row = x_norm + (size_t)batch_idx * hidden_size;
+    __half* output_row = output + (size_t)batch_idx * intermediate_size;
 
     // Carrega x_norm cooperativamente na LDS uma única vez por bloco —
     // reaproveitado tanto para o dot product do Gate quanto do Up.
     for (int i = tid; i < hidden_size; i += blockDim.x) {
-        x_sh[i] = x_norm[i];
+        x_sh[i] = x_norm_row[i];
     }
     __syncthreads();
 
@@ -56,5 +66,5 @@ extern "C" __global__ void fused_gate_up_silu_kernel(
     float silu = gate_sum * sigmoid;
     float result = silu * up_sum;
 
-    output[n] = __float2half(result);
+    output_row[n] = __float2half(result);
 }

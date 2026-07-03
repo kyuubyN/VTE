@@ -237,8 +237,16 @@ class FusedFFNDispatcher:
             return 0
         return p.ptr if hasattr(p, 'ptr') else int(p)
 
-    def build_launches(self, layer_idx: int, tensor_mapping: dict):
-        """Retorna lista de (kernel_fn, args, grid, block, shared_mem): [rmsnorm, gate_up_silu]."""
+    def build_launches(self, layer_idx: int, tensor_mapping: dict, batch: int = 1):
+        """Retorna lista de (kernel_fn, args, grid, block, shared_mem): [rmsnorm, gate_up_silu].
+
+        `batch` (experimento Fase M): rmsnorm_kernel já suporta batch
+        nativamente (blockIdx.x = row, basta grid.x=batch); o kernel fundido
+        gate_up_silu foi estendido com blockIdx.y = batch_idx (ver template)
+        -- gate_weight/up_weight são compartilhados entre as sequências do
+        batch, só x_norm/output são indexados por batch_idx. batch=1
+        (default) reduz exatamente ao comportamento original.
+        """
         hidden_size = self.metadata.get('embedding_length', 1536)
         intermediate_size = self.metadata.get('feed_forward_length', 8960)
         eps = self.metadata.get('attention.layer_norm_rms_epsilon', 1e-6)
@@ -258,7 +266,7 @@ class FusedFFNDispatcher:
             ctypes.c_int(hidden_size),
             ctypes.c_float(eps),
         ]
-        norm_launch = (norm_fn, norm_args, (1, 1, 1), (256, 1, 1), 0)
+        norm_launch = (norm_fn, norm_args, (batch, 1, 1), (256, 1, 1), 0)
 
         gu_fn = self._get_gate_up_silu_kernel()
         gu_args = [
@@ -270,7 +278,7 @@ class FusedFFNDispatcher:
             ctypes.c_int(intermediate_size),
         ]
         block_size = 256
-        grid = ((intermediate_size + block_size - 1) // block_size, 1, 1)
+        grid = ((intermediate_size + block_size - 1) // block_size, batch, 1)
         gu_launch = (gu_fn, gu_args, grid, (block_size, 1, 1), 0)
 
         return [norm_launch, gu_launch]
