@@ -96,6 +96,9 @@ class FusedQKVDispatcher:
         # confirmado em llama-model.cpp::llama_model_rope_type. Default 0
         # preserva o Qwen (a única arquitetura que não seta esta chave).
         rope_type = self.metadata.get('rope_type', 0)
+        # 2 = NEOX parcial (Qwen3.5); default head_dim preserva Qwen2.5/
+        # Granite bit a bit -- ver kernel_arg_builder.py::_build_rope_args.
+        rotary_dim = self.metadata.get('rotary_dim', head_dim)
 
         x_name = layer_input_tensor_name(layer_idx)
         x_ptr = self._resolve_ptr(tensor_mapping, x_name)
@@ -138,7 +141,7 @@ class FusedQKVDispatcher:
                 ctypes.c_void_p(self._scratch_buf.ptr), ctypes.c_void_p(b_ptr), ctypes.c_void_p(cos_ptr),
                 ctypes.c_void_p(sin_ptr), ctypes.c_void_p(out_ptr), ctypes.c_int(head_dim),
                 ctypes.c_void_p(kv_offset_ptr), ctypes.c_int(1 if apply_rope else 0), ctypes.c_int(num_heads),
-                ctypes.c_int(rope_type),
+                ctypes.c_int(rope_type), ctypes.c_int(rotary_dim),
             ]
             launches.append((fn_p2, p2_args, (num_heads, batch, 1), (head_dim, 1, 1), 0))
 
@@ -152,6 +155,7 @@ class FusedQKVDispatcher:
         num_kv_heads = self.metadata.get('attention.head_count_kv', 2)
         eps = self.metadata.get('attention.layer_norm_rms_epsilon', 1e-6)
         rope_type = self.metadata.get('rope_type', 0)
+        rotary_dim = self.metadata.get('rotary_dim', head_dim)
 
         x_name = layer_input_tensor_name(layer_idx)
         x_ptr = self._resolve_ptr(tensor_mapping, x_name)
@@ -186,6 +190,7 @@ class FusedQKVDispatcher:
                 ctypes.c_void_p(kv_offset_ptr),
                 ctypes.c_int(1 if apply_rope else 0),
                 ctypes.c_int(rope_type),
+                ctypes.c_int(rotary_dim),
             ]
             # 1 bloco por head; 256 threads = 8 wavefronts (gfx11 wave32) fazendo
             # Split-K coalescido (nwarps=8 divide head_dim=128 em 16 iterações).

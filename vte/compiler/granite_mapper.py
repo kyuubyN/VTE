@@ -28,30 +28,26 @@ def is_raw_q8_0_weight(name: str, tensor_info: dict) -> bool:
     is_raw_q4k_weight/is_raw_q6k_weight em qwen_mapper.py, mas vivendo aqui
     (arquivo próprio do Granite).
 
-    NÃO cobre attn_q/attn_k/attn_v/attn_output: mesma restrição do Qwen
-    (is_raw_q4k_weight/is_raw_q6k_weight também excluem attn_*).
-
-    attn_q/k/v: os kernels FUNDIDOS de QKV (fused_norm_matmul_rope,
-    split_k_qkv_pass1) leem `proj_weight` como `__half*` puro, sem nenhuma
-    lógica de dequant Q8_0 -- roteá-los como crus produz NaN.
-
-    attn_output: TESTADO e MEDIDO nesta sessão (não suposição) -- ao
-    contrário de q/k/v, o_proj É seguro rotear pra gemv_q8_0 (nó MATMUL
-    isolado, kernel já sabe desquantizar). Só que o gemv_q8_0 atual não é
-    vetorizado (bloco de 34 bytes não alinha a 16B, sem uint4 como o
-    gemv_coalesced), então o throughput MEDIU PIOR com attn_output cru
-    (~32.4 tok/s) do que em FP16 (~36.3 tok/s) -- a redução de banda não
-    compensou o overhead do loop escalar de desquant. Reverter para FP16
-    até o gemv_q8_0 ganhar uma versão vetorizada.
+    Histórico: attn_q/attn_k/attn_v/attn_output ficavam excluídos (sempre
+    FP16) -- decisão revertida nesta sessão pra priorizar VRAM (usuário:
+    "o granite esta sim com vram demais"). Antes: 1200MB em FP16 (500+500+
+    100+100) pra essas 4 matrizes, ~558MB acima do tamanho real do arquivo
+    Q8_0 (só por essas 4). Agora roteadas cruas, junto com a fusão QKV
+    DESATIVADA especificamente pro Granite (ver rope_type==1 em
+    fallback_executor.py/hip_graph_executor.py) -- os kernels FUNDIDOS de
+    QKV+RoPE (fused_norm_matmul_rope/split_k_qkv_pass1) leem os pesos como
+    `__half*` puro sem dequant Q8_0 (produziriam NaN se recebessem cru);
+    sem a fusão, o despacho genérico por-nó já roteia corretamente pro
+    gemv_q8_0 (que sabe desquantizar). Trade-off aceito: perde o ganho de
+    desempenho da fusão QKV pro Granite (attn_output isolado já media
+    ~32.4 tok/s cru vs ~36.3 tok/s em FP16 -- suficiente pra o usuário
+    preferir a VRAM menor).
 
     ffn_gate/ffn_up/ffn_down e token_embd usam kernels PRÓPRIOS
     (gemv_q8_0/embedding_lookup_q8_0) que sabem dequantizar, por isso
     ficam crus (ali o ganho de VRAM/banda é obrigatório, não opcional).
     """
-    if tensor_info.get('dtype') != GGML_TYPE_Q8_0:
-        return False
-    return not (name.endswith("attn_q.weight") or name.endswith("attn_k.weight")
-                or name.endswith("attn_v.weight") or name.endswith("attn_output.weight"))
+    return tensor_info.get('dtype') == GGML_TYPE_Q8_0
 
 
 class GraniteTensorMapper:

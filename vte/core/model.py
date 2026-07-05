@@ -18,6 +18,7 @@ from vte.core.vram_profiler import VRAMProfiler
 from ..compiler.gguf_parser import GGUFParser
 from ..compiler.weight_loader import GGUFWeightLoader
 from ..core.lm_head import LMHead
+from ..core.incremental_decoder import IncrementalUTF8Decoder
 import os
 import time
 import threading
@@ -46,6 +47,7 @@ class VTEModel:
     MODEL_REGISTRY = {
         "qwen2.5:1.5b-q4_k_m": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
         "granite-4.1:3b-q8_0": "granite-4.1-3b-Q8_0.gguf",
+        "qwen3.5:2b-q6_k": "Qwen3.5-2B-Q6_K.gguf",
     }
     
     DEFAULT_CONTEXT_LENGTH = 2048
@@ -225,6 +227,69 @@ class VTEModel:
         )
         return metadata
 
+    def _load_qwen3_5_metadata(self, sanitizer) -> dict:
+        """Mesma ideia de `_load_qwen2_metadata`/`_load_granite_metadata`,
+        pro Qwen 3.5 2B. Duas chaves NÃO vêm do GGUF (mesma situação do
+        `rope_type=1` do Granite -- são propriedades fixas da arquitetura,
+        confirmadas em config.json/modeling_qwen3_5.py reais, não em
+        metadata do GGUF):
+        - `rope_type=2` (NEOX parcial) e `rotary_dim=64`
+          (partial_rotary_factor=0.25 * head_dim=256), só usados nas 6
+          camadas `full_attention`.
+        - As dimensões do Gated DeltaNet (`linear_attn.*`) também são fixas
+          da arquitetura, não do GGUF -- vêm de `qwen3_5_mapper.py`."""
+        from ..compiler.gguf_metadata import read_gguf_metadata
+        from ..compiler.qwen3_5_mapper import (
+            QWEN35_DEFAULT_HEAD_COUNT, QWEN35_DEFAULT_HEAD_COUNT_KV,
+            QWEN35_DEFAULT_HEAD_DIM, QWEN35_DEFAULT_ROTARY_DIM, QWEN35_DEFAULT_FFN,
+            QWEN35_DEFAULT_ROPE_THETA, QWEN35_LINEAR_NUM_HEADS,
+            QWEN35_LINEAR_HEAD_K_DIM, QWEN35_LINEAR_HEAD_V_DIM,
+            QWEN35_LINEAR_KEY_DIM, QWEN35_LINEAR_VALUE_DIM, QWEN35_CONV_DIM,
+        )
+        raw = read_gguf_metadata(self._path, wanted_keys={
+            "qwen35.embedding_length", "qwen35.block_count", "qwen35.context_length",
+            "qwen35.attention.head_count", "qwen35.attention.head_count_kv",
+            "qwen35.attention.key_length", "qwen35.feed_forward_length",
+            "qwen35.rope.freq_base", "qwen35.attention.layer_norm_rms_epsilon",
+            "qwen35.rope.dimension_count",
+        })
+
+        embedding_length = raw.get("qwen35.embedding_length", sanitizer.header.embedding_length)
+        head_count = raw.get("qwen35.attention.head_count", QWEN35_DEFAULT_HEAD_COUNT)
+        head_dim = raw.get("qwen35.attention.key_length", QWEN35_DEFAULT_HEAD_DIM)
+        rotary_dim = raw.get("qwen35.rope.dimension_count", QWEN35_DEFAULT_ROTARY_DIM)
+
+        metadata = {
+            "embedding_length": embedding_length,
+            "block_count": raw.get("qwen35.block_count", sanitizer.header.block_count),
+            "context_length": raw.get("qwen35.context_length", sanitizer.header.context_length),
+            "attention.head_count": head_count,
+            "attention.head_count_kv": raw.get("qwen35.attention.head_count_kv", QWEN35_DEFAULT_HEAD_COUNT_KV),
+            "attention.key_length": head_dim,
+            "feed_forward_length": raw.get("qwen35.feed_forward_length", QWEN35_DEFAULT_FFN),
+            "rope.freq_base": raw.get("qwen35.rope.freq_base", QWEN35_DEFAULT_ROPE_THETA),
+            "attention.layer_norm_rms_epsilon": raw.get("qwen35.attention.layer_norm_rms_epsilon", 1e-6),
+            # RoPE parcial (Fase 1 do plano) -- fixo pela arquitetura, não
+            # lido do GGUF (mesma natureza do rope_type=1 do Granite).
+            "rope_type": 2,
+            "rotary_dim": rotary_dim,
+            # Gated DeltaNet (Fase 2/3) -- dimensões fixas da arquitetura.
+            "linear_attn.num_heads": QWEN35_LINEAR_NUM_HEADS,
+            "linear_attn.head_k_dim": QWEN35_LINEAR_HEAD_K_DIM,
+            "linear_attn.head_v_dim": QWEN35_LINEAR_HEAD_V_DIM,
+            "linear_attn.key_dim": QWEN35_LINEAR_KEY_DIM,
+            "linear_attn.value_dim": QWEN35_LINEAR_VALUE_DIM,
+            "linear_attn.conv_dim": QWEN35_CONV_DIM,
+        }
+        logger.info(
+            f"Hiperparâmetros GGUF (Qwen3.5): hidden={embedding_length}, heads={head_count}, "
+            f"kv_heads={metadata['attention.head_count_kv']}, head_dim={head_dim}, "
+            f"rotary_dim={rotary_dim}, ffn={metadata['feed_forward_length']}, "
+            f"rope_theta={metadata['rope.freq_base']}, "
+            f"eps={metadata['attention.layer_norm_rms_epsilon']:.2e}"
+        )
+        return metadata
+
     def _load(self):
         sanitizer = GGUFSanitizer(Path(self._path))
         sanitizer.validate()
@@ -236,6 +301,8 @@ class VTEModel:
         architecture = sanitizer.header.architecture
         if architecture == "granite":
             metadata = self._load_granite_metadata(sanitizer)
+        elif architecture == "qwen35":
+            metadata = self._load_qwen3_5_metadata(sanitizer)
         else:
             metadata = self._load_qwen2_metadata(sanitizer)
         self.metadata = metadata
@@ -260,6 +327,19 @@ class VTEModel:
             raw_q4k = {n for n, t in self.parser.tensors.items() if is_raw_q4k_weight(n, t)}
             raw_q6k = {n for n, t in self.parser.tensors.items() if is_raw_q6k_weight(n, t)}
             raw_q8_0 = {n for n, t in self.parser.tensors.items() if is_raw_q8_0_weight(n, t)}
+            if architecture == "qwen35":
+                # qwen_mapper.is_raw_q6k_weight (linha acima) é restrito por
+                # NOME (ffn_down/token_embd) -- pensado pro GGUF misto
+                # Q4_K/Q6_K do Qwen2.5. O GGUF do Qwen3.5 não mistura: TODA
+                # matriz grande é Q6_K (attn_qkv, attn_gate, ffn_*,
+                # token_embd), confirmado via gguf.GGUFReader real. Sem esta
+                # união, attn_qkv/attn_gate/ffn_gate/ffn_up ficariam alocados
+                # CRUS (qwen3_5_mapper.py) mas roteados como se fossem FP16
+                # pelo executor -- corrupção silenciosa de dados. Aditivo:
+                # não muda nada pro Qwen2.5/Granite (só roda quando
+                # architecture=="qwen35").
+                from vte.compiler.qwen3_5_mapper import is_raw_q6k_weight as qwen35_is_raw_q6k_weight
+                raw_q6k |= {n for n, t in self.parser.tensors.items() if qwen35_is_raw_q6k_weight(n, t)}
             register_raw_q4k_weights(raw_q4k)
             register_raw_q6k_weights(raw_q6k)
             register_raw_q8_0_weights(raw_q8_0)
@@ -268,6 +348,9 @@ class VTEModel:
             if architecture == "granite":
                 from vte.compiler.granite_mapper import GraniteTensorMapper
                 mapper = GraniteTensorMapper(self.parser, metadata)
+            elif architecture == "qwen35":
+                from vte.compiler.qwen3_5_mapper import Qwen3_5TensorMapper
+                mapper = Qwen3_5TensorMapper(self.parser, metadata)
             else:
                 mapper = QwenTensorMapper(self.parser, metadata)
             self._mapper = mapper  # Fase II (prep): reaproveitado por generate_batch()
@@ -286,13 +369,25 @@ class VTEModel:
             
             self.tensor_mapping = mapper.map_and_allocate_tensors(self._allocator, self._hip, profiler=self.profiler, context_length=self._context_length)
 
-            weight_loader = GGUFWeightLoader(self._path, self.parser, self.tensor_mapping)
+            weight_loader = GGUFWeightLoader(
+                self._path, self.parser, self.tensor_mapping,
+                raw_q4k=raw_q4k, raw_q6k=raw_q6k, raw_q8_0=raw_q8_0,
+            )
             loaded, total_bytes = weight_loader.load_all(self._hip)
             logger.info(f"Pesos injetados na VRAM: {loaded} tensores ({total_bytes / (1024*1024):.1f} MB)")
 
             logger.info("Construindo grafo de operações...")
-            from vte.compiler.qwen_compute import QwenComputeGraphBuilder
-            compute_builder = QwenComputeGraphBuilder(metadata)
+            if architecture == "qwen35":
+                # Grafo próprio (não QwenComputeGraphBuilder): as camadas do
+                # Qwen3.5 NÃO têm todas a mesma sequência de nós (6
+                # full_attention vs 18 linear_attention/Gated DeltaNet) --
+                # diferente de Qwen2.5/Granite, que são estruturalmente
+                # idênticos camada a camada (só os números mudam).
+                from vte.compiler.qwen3_5_compute import Qwen3_5ComputeGraphBuilder
+                compute_builder = Qwen3_5ComputeGraphBuilder(metadata)
+            else:
+                from vte.compiler.qwen_compute import QwenComputeGraphBuilder
+                compute_builder = QwenComputeGraphBuilder(metadata)
             self.compute_graph = compute_builder.build_compute_graph()
             self._graph = self.compute_graph  # Alias para compatibilidade
             
@@ -322,6 +417,9 @@ class VTEModel:
         if architecture == "granite":
             from vte.compiler.tokenizer import GraniteTokenizer
             self.tokenizer = GraniteTokenizer(gguf_path=self._path)
+        elif architecture == "qwen35":
+            from vte.compiler.tokenizer import Qwen3_5Tokenizer
+            self.tokenizer = Qwen3_5Tokenizer(gguf_path=self._path)
         else:
             self.tokenizer = QwenTokenizer(gguf_path=self._path)
         self.sampler = Sampler()
@@ -520,17 +618,82 @@ class VTEModel:
             'hidden_size': hidden_size,
         }
 
+    def _reset_gdn_state_if_needed(self):
+        """Zera o estado persistente do Gated DeltaNet (Qwen3.5) + histórico
+        do conv1d causal ANTES de cada nova chamada de generate().
+
+        Bug real encontrado nesta sessão: `hipMemset` só era chamado UMA VEZ,
+        em `map_and_allocate_tensors()` (carregamento do modelo) -- nunca de
+        novo entre chamadas de generate(). Igual o KV cache (que reinicia
+        implicitamente em kv_offset=0 a cada generate(), tratando cada
+        chamada como uma sequência nova e independente), o estado do Gated
+        DeltaNet também precisa reiniciar do zero a cada nova sequência --
+        sem isto, uma segunda mensagem/geração na mesma instância do modelo
+        carregado herdava o estado (contaminado) da geração ANTERIOR,
+        explicando degradação que só aparece em conversas com mais de uma
+        mensagem/chamada."""
+        if getattr(self, '_architecture', None) != "qwen35":
+            return
+        from vte.compiler.qwen3_5_mapper import (
+            QWEN35_FULL_ATTENTION_LAYERS, QWEN35_DEFAULT_LAYERS,
+            QWEN35_LINEAR_NUM_HEADS, QWEN35_LINEAR_HEAD_K_DIM, QWEN35_LINEAR_HEAD_V_DIM,
+            QWEN35_CONV_DIM, QWEN35_CONV_KERNEL_SIZE,
+        )
+        num_layers = self.metadata.get('block_count', QWEN35_DEFAULT_LAYERS)
+        linear_attn_layers = sorted(set(range(num_layers)) - QWEN35_FULL_ATTENTION_LAYERS)
+        state_size = QWEN35_LINEAR_NUM_HEADS * QWEN35_LINEAR_HEAD_K_DIM * QWEN35_LINEAR_HEAD_V_DIM * 4
+        conv_hist_size = QWEN35_CONV_DIM * (QWEN35_CONV_KERNEL_SIZE - 1) * 4
+        for l in linear_attn_layers:
+            for key, size in ((f'blk.{l}.linear_attn_state', state_size),
+                               (f'blk.{l}.conv1d_history', conv_hist_size)):
+                ptr = self.tensor_mapping.get(key)
+                if ptr is None:
+                    continue
+                pv = ptr.ptr if hasattr(ptr, 'ptr') else ptr
+                self._hip.safe_memset(ctypes.c_void_p(pv), size, tag=key)
+
+    def _default_repetition_penalty(self) -> float:
+        """1.1 é o valor calibrado para Qwen2.5/Granite, mas é fraco demais
+        para o Qwen3.5: em greedy decode (`temperature=0`) com textos mais
+        longos, 1.1 deixa o modelo colapsar num loop (`**Cultura:** **Cultura:**...`
+        até só `**` repetido); 1.3 evita o loop e termina naturalmente sem
+        degenerar em ruído de pontuação (1.5 já super-corrige nessa direção).
+        Medido comparando as três diretamente, mesmo prompt/seed."""
+        return 1.3 if self._architecture == "qwen35" else 1.1
+
+    def _default_temperature(self) -> float:
+        """0.7 é o default global (sampling normal), mas o Qwen3.5 tem mais
+        ruído numérico residual acumulado ao longo de 24 camadas do que
+        Qwen2.5/Granite (ver docs/QWEN35.md) -- pequeno demais pra mudar QUAL
+        token vence (por isso greedy/temperature=0 fica coerente), grande o
+        bastante pra distorcer a cauda da distribuição de onde o sampling
+        estocástico tira variedade. Testado 0.1/0.2/0.3/0.5/0.7: todo valor
+        >0 degenerou (frases corridas sem pontuação, troca de idioma no meio
+        da resposta); só 0.0 ficou consistentemente coerente. Trade-off
+        aceito: respostas do Qwen3.5 ficam determinísticas (mesmo prompt =
+        mesma resposta) até a causa do ruído em si ser reduzida."""
+        return 0.0 if self._architecture == "qwen35" else 0.7
+
     def generate(
-        self, 
-        prompt: str, 
+        self,
+        prompt: str,
         max_tokens: int = 100,
-        temperature: float = 0.7,
-        top_p: float = 0.9
+        temperature: float = None,
+        top_p: float = 0.9,
+        top_k: int = 50,
+        repetition_penalty: float = None,
     ):
         """Gera texto como um Generator, permitindo interrupção caller-side."""
         self._lifecycle.ensure_loaded()
         self._lifecycle.touch()
-        
+
+        if temperature is None:
+            temperature = self._default_temperature()
+        if repetition_penalty is None:
+            repetition_penalty = self._default_repetition_penalty()
+
+        self._reset_gdn_state_if_needed()
+
         input_tokens = self.tokenizer.encode(prompt)
         current_seq_len = len(input_tokens)
 
@@ -580,12 +743,20 @@ class VTEModel:
         logits = _read_logits()
 
         stop_ids = self.tokenizer.stop_token_ids
+        # Um token BPE byte-level pode carregar só METADE dos bytes de um
+        # caractere multi-byte (emoji, acento) -- decodificar cada token
+        # isoladamente cortava essas sequências no meio e produzia "�" (ver
+        # vte/core/incremental_decoder.py). O decoder segura bytes
+        # incompletos entre chamadas de feed() até a sequência completar.
+        utf8_decoder = IncrementalUTF8Decoder()
 
         for i in range(max_tokens):
             next_token = self.sampler.sample(
                 logits=logits,
                 temperature=temperature,
                 top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
                 generated_tokens=input_tokens,
             )
 
@@ -598,8 +769,9 @@ class VTEModel:
                 break
 
             input_tokens.append(next_token)
-            word = self.tokenizer.decode([next_token])
-            yield word
+            word = utf8_decoder.feed(self.tokenizer.decode_bytes([next_token]))
+            if word:
+                yield word
 
             current_seq_len += 1
             if current_seq_len >= self._context_length:
@@ -623,12 +795,18 @@ class VTEModel:
             self._keepalive.pulse(self._keepalive_pulse_s)
             logits = _read_logits()
 
+        tail = utf8_decoder.flush()
+        if tail:
+            yield tail
+
     def generate_batch(
         self,
         prompts: list,
         max_tokens: int = 100,
-        temperature: float = 0.7,
+        temperature: float = None,
         top_p: float = 0.9,
+        top_k: int = 50,
+        repetition_penalty: float = None,
     ):
         """
         Fase II (preparação para scheduler): gera para `len(prompts)`
@@ -649,6 +827,11 @@ class VTEModel:
         """
         self._lifecycle.ensure_loaded()
         self._lifecycle.touch()
+
+        if temperature is None:
+            temperature = self._default_temperature()
+        if repetition_penalty is None:
+            repetition_penalty = self._default_repetition_penalty()
 
         batch_size = len(prompts)
         tokenized = [self.tokenizer.encode(p) for p in prompts]
@@ -704,6 +887,10 @@ class VTEModel:
 
         logits_batch = _read_logits_batch()
         current_seq_len = prompt_len
+        # Um decoder incremental POR sequência do batch -- cada uma tem seu
+        # próprio buffer de bytes pendentes, independente das outras (ver
+        # vte/core/incremental_decoder.py e o mesmo tratamento em generate()).
+        utf8_decoders = [IncrementalUTF8Decoder() for _ in range(batch_size)]
 
         for i in range(max_tokens):
             next_tokens = []
@@ -711,11 +898,12 @@ class VTEModel:
             for b in range(batch_size):
                 tok = self.sampler.sample(
                     logits=logits_batch[b], temperature=temperature, top_p=top_p,
+                    top_k=top_k, repetition_penalty=repetition_penalty,
                     generated_tokens=tokenized[b],
                 )
                 tokenized[b].append(tok)
                 next_tokens.append(tok)
-                words.append(self.tokenizer.decode([tok]))
+                words.append(utf8_decoders[b].feed(self.tokenizer.decode_bytes([tok])))
             yield words
 
             current_seq_len += 1
@@ -725,6 +913,10 @@ class VTEModel:
             batch_executor.execute_decode_batch(next_tokens, [current_seq_len - 1] * batch_size)
             self._keepalive.pulse(self._keepalive_pulse_s)
             logits_batch = _read_logits_batch()
+
+        tails = [d.flush() for d in utf8_decoders]
+        if any(tails):
+            yield tails
 
     def unload(self):
         """Descarrega o modelo da VRAM (limpa slabs e libera HIP)."""

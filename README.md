@@ -76,6 +76,7 @@ The full write-up is split by topic — each page is self-contained and links ba
 | [**Performance**](docs/PERFORMANCE.md) | Stage-by-stage optimization history (18.8 → 100 tok/s), batched decode, the full VTE-vs-Ollama benchmark, and what was tried and rejected |
 | [**Architecture**](docs/ARCHITECTURE.md) | How `vte/bridge`, `vte/compiler`, `vte/core`, and `vte/ui` fit together; why QKV fusion is on but FFN fusion is off; notes for AMD/ROCm reviewers |
 | [**Multi-architecture support**](docs/GRANITE.md) | Adding Granite 4.1 3B: the RoPE convention bug, the `residual_scale` scoping bug, and the Flet UI's model-switch race conditions |
+| [**Qwen 3.5 (hybrid Gated DeltaNet)**](docs/QWEN35.md) | Adding a hybrid recurrent-attention architecture: the FP16-read-as-float32 bug that caused "oi" to degenerate into garbage, the missing QK-Norm/gate architecture piece, and the streaming/thinking-mode bugs found via real UI testing |
 | [**Bugs found during development**](docs/BUGS.md) | The full "symptom → root cause → fix → measurement" history — silent data corruption, a real Windows TDR crash, and everything in between |
 | [**Known limitations**](docs/LIMITATIONS.md) | What's genuinely unfinished or unresolved right now |
 | [**Getting started**](docs/USAGE.md) | Full Python API examples and desktop-UI setup details |

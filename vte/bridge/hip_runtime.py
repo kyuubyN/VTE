@@ -215,6 +215,8 @@ class HIPRuntime:
         self._lib.hipFree.restype = ctypes.c_int
         self._lib.hipMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
         self._lib.hipMemcpy.restype = ctypes.c_int
+        self._lib.hipMemset.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
+        self._lib.hipMemset.restype = ctypes.c_int
         self._lib.hipModuleLoad.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p]
         self._lib.hipModuleLoad.restype = ctypes.c_int
         self._lib.hipModuleGetFunction.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_char_p]
@@ -433,6 +435,40 @@ class HIPRuntime:
         c_src = (ctypes.c_char * src_len).from_buffer_copy(src)
         err = self._lib.hipMemcpy(dst, ctypes.byref(c_src), src_len, hipMemcpyHostToDevice)
         self._check_error(err, "hipMemcpy (H2D)")
+        return True
+
+    def safe_memset(self, dst: ctypes.c_void_p, size_bytes: int, tag: str = "unnamed", value: int = 0) -> bool:
+        """Zera (ou preenche com `value`) uma região de VRAM, com a mesma
+        validação de fronteira do safe_memcpy_host_to_device -- usado pelos
+        buffers de estado persistente (ex: Gated DeltaNet do Qwen3.5) que,
+        ao contrário do KV cache (só lido depois de escrito por um token
+        real), são LIDOS antes de qualquer escrita no primeiro passo de
+        decode. hipMalloc não zera memória por conta própria -- sem isto, o
+        estado inicial é lixo de VRAM residual, não os zeros que a
+        implementação de referência assume (`torch.zeros(...)`)."""
+        if not self._initialized:
+            raise HIPSafetyError("HIP não inicializado.")
+
+        dst_val = dst.value or 0
+        valid_ptr = False
+        actual_alloc_base = 0
+        actual_alloc_size = 0
+
+        for alloc_base, (size, t) in self._active_allocations.items():
+            if alloc_base <= dst_val < alloc_base + size:
+                valid_ptr = True
+                actual_alloc_base = alloc_base
+                actual_alloc_size = size
+                break
+
+        if not valid_ptr:
+            raise HIPSafetyError(f"memset: Ponteiro de destino não rastreado: 0x{dst_val:016X} [{tag}]")
+
+        if dst_val + size_bytes > actual_alloc_base + actual_alloc_size:
+            raise HIPSafetyError(f"memset Overflow: size ({size_bytes}) cruza fronteira da alocação principal [{tag}].")
+
+        err = self._lib.hipMemset(dst, ctypes.c_int(value), size_bytes)
+        self._check_error(err, "hipMemset")
         return True
 
     def safe_memcpy_device_to_host(self, dst: bytearray, src: ctypes.c_void_p, tag: str = "unnamed") -> bool:

@@ -7,7 +7,7 @@
   <meta name="description" content="Um motor de inferência de LLMs construído do zero para GPUs AMD no Windows. Sem llama.cpp, sem PyTorch. Só HIP, GGUF e muita medição." />
 
   <meta property="og:title" content="VTE — Vector Tensor Engine" />
-  <meta property="og:description" content="Motor de inferência de LLMs do zero para o ecossistema AMD. ~89% do throughput do llama.cpp, em Python." />
+  <meta property="og:description" content="Motor de inferência de LLMs do zero para o ecossistema AMD. Já supera o llama.cpp no Granite, em Python." />
   <meta property="og:type" content="website" />
   <link rel="icon" type="image/svg+xml" href="assets/earth_pixelated.svg" />
 
@@ -108,8 +108,8 @@
       <div class="mt-16 grid grid-cols-2 sm:grid-cols-4 gap-4 max-w-2xl mx-auto reveal">
         <div class="stat-chip"><div class="stat-num" data-target="100" data-suffix=" tok/s">0</div><div class="stat-label">decode single-seq</div></div>
         <div class="stat-chip"><div class="stat-num" data-target="200" data-suffix=" tok/s">0</div><div class="stat-label">batch agregado</div></div>
-        <div class="stat-chip"><div class="stat-num" data-target="88.7" data-suffix="%" data-decimals="1">0</div><div class="stat-label">comparação com llama.cpp</div></div>
-        <div class="stat-chip"><div class="stat-num" data-target="2" data-suffix="">0</div><div class="stat-label">Modelos de arquitetura de IA</div></div>
+        <div class="stat-chip"><div class="stat-num" data-target="109.5" data-suffix="%" data-decimals="1">0</div><div class="stat-label">supera o llama.cpp (Granite)</div></div>
+        <div class="stat-chip"><div class="stat-num" data-target="3" data-suffix="">0</div><div class="stat-label">Modelos de arquitetura de IA</div></div>
       </div>
     </div>
 
@@ -152,52 +152,70 @@
     <div class="meteors" aria-hidden="true"></div>
     <div class="max-w-5xl mx-auto relative">
       <div class="section-eyebrow reveal">// Benchmark</div>
-      <h2 class="section-title reveal">Python, no empate com um motor C++ com anos de otimização.</h2>
+      <h2 class="section-title reveal">Python que já supera um motor C++ com anos de otimização.</h2>
       <p class="section-lead reveal">
         Mesmos arquivos GGUF em disco, mesmo prompt, <code>temperature=0</code>. O código que faz o dispatch aqui é
-        <span class="text-accent-green">Python</span> puro dirigindo cada launch HIP por ctypes — e mesmo assim entrega
-        <span class="text-accent-green">~89% do throughput do llama.cpp</span> nas duas arquiteturas, de forma idêntica.
+        <span class="text-accent-green">Python</span> puro dirigindo cada launch HIP por ctypes — e no Granite isso já entrega
+        <span class="text-accent-blue">mais tok/s que o próprio llama.cpp</span>; no Qwen2.5 é um empate técnico.
       </p>
 
       <div class="mt-14 grid sm:grid-cols-2 gap-6">
         <div class="bench-card reveal">
           <div class="flex items-baseline justify-between mb-1">
             <h3 class="font-mono text-sm text-text-primary">Qwen2.5 1.5B <span class="text-text-muted">· Q4_K_M</span></h3>
-            <span class="ratio-badge">88.7%</span>
+            <span class="ratio-badge">97.4%</span>
           </div>
           <div class="bench-row">
             <span class="bench-label">VTE</span>
-            <div class="bench-track"><div class="bench-fill vte" style="--w:88.7%"></div></div>
-            <span class="bench-val">101.68 <em>tok/s</em></span>
+            <div class="bench-track"><div class="bench-fill vte" style="--w:97.4%"></div></div>
+            <span class="bench-val">107.85 <em>tok/s</em></span>
           </div>
           <div class="bench-row">
             <span class="bench-label">Ollama</span>
             <div class="bench-track"><div class="bench-fill ref" style="--w:100%"></div></div>
-            <span class="bench-val">114.67 <em>tok/s</em></span>
+            <span class="bench-val">110.76 <em>tok/s</em></span>
           </div>
         </div>
 
         <div class="bench-card reveal">
           <div class="flex items-baseline justify-between mb-1">
             <h3 class="font-mono text-sm text-text-primary">Granite 4.1 3B <span class="text-text-muted">· Q8_0</span></h3>
-            <span class="ratio-badge">88.7%</span>
+            <span class="ratio-badge lead">109.5% ↑</span>
           </div>
           <div class="bench-row">
             <span class="bench-label">VTE</span>
-            <div class="bench-track"><div class="bench-fill vte" style="--w:88.7%"></div></div>
-            <span class="bench-val">45.66 <em>tok/s</em></span>
+            <div class="bench-track"><div class="bench-fill vte" style="--w:100%"></div></div>
+            <span class="bench-val">55.65 <em>tok/s</em></span>
+          </div>
+          <div class="bench-row">
+            <span class="bench-label">Ollama</span>
+            <div class="bench-track"><div class="bench-fill ref" style="--w:91.4%"></div></div>
+            <span class="bench-val">50.84 <em>tok/s</em></span>
+          </div>
+        </div>
+
+        <div class="bench-card reveal">
+          <div class="flex items-baseline justify-between mb-1">
+            <h3 class="font-mono text-sm text-text-primary">Qwen3.5 2B <span class="text-text-muted">· Q6_K, híbrido Gated DeltaNet</span></h3>
+            <span class="ratio-badge">~85%</span>
+          </div>
+          <div class="bench-row">
+            <span class="bench-label">VTE</span>
+            <div class="bench-track"><div class="bench-fill vte" style="--w:84.7%"></div></div>
+            <span class="bench-val">~66.5 <em>tok/s</em></span>
           </div>
           <div class="bench-row">
             <span class="bench-label">Ollama</span>
             <div class="bench-track"><div class="bench-fill ref" style="--w:100%"></div></div>
-            <span class="bench-val">51.46 <em>tok/s</em></span>
+            <span class="bench-val">78.56 <em>tok/s</em></span>
           </div>
         </div>
       </div>
 
       <p class="mt-8 text-sm text-text-muted font-mono reveal">
-        → A mesma proporção em duas arquiteturas sem quase nada em comum (RoPE, quantização, ~2× os parâmetros) é evidência de que o
-        gap restante é overhead sistêmico de kernel, não um bug escondido num modelo. Dispatch é um problema de engenharia — não um imposto da linguagem.
+        → Três arquiteturas sem quase nada em comum entre si (RoPE, quantização, e no Qwen3.5 uma recorrência linear com estado
+        persistente que nenhuma das outras duas tem) chegando a resultados competitivos — e num caso ultrapassando o llama.cpp —
+        é evidência de que dispatch em Python é um problema de engenharia, não um imposto fixo da linguagem.
       </p>
 
       <div class="live-terminal reveal">
@@ -302,7 +320,7 @@
         <p class="mt-5 text-lg leading-relaxed text-text-muted">
           E, no fundo, foi um <span class="text-text-primary font-medium">desafio pessoal</span>: descobrir se dava
           para construir um motor de LLM inteiro do zero — parser, kernels, gerenciador de memória, UI — sobre o HIP no
-          Windows, medir tudo com honestidade, e chegar perto de uma engine madura com anos de vantagem. Chegou a 89%.
+          Windows, medir tudo com honestidade, e chegar perto de uma engine madura com anos de vantagem. No Granite, chegou a superá-la.
         </p>
       </div>
 
@@ -342,8 +360,8 @@
     </div>
   </footer>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-  <script src="js/scene.js"></script>
-  <script src="js/gpu.js"></script>
-  <script src="js/main.js"></script>
+  <script src="js/scene.js?v=2"></script>
+  <script src="js/gpu.js?v=2"></script>
+  <script src="js/main.js?v=2"></script>
 </body>
 </html>

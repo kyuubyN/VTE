@@ -162,6 +162,16 @@ def _profile_category(node: IRNode) -> str:
         if "lm_head" in name or "output" in name:
             return "LMHead"
         return "MatMul_other"
+    if op == NodeType.CAUSAL_CONV1D:
+        return "GDN_Conv1d"
+    if op == NodeType.LINEAR_ATTENTION:
+        return "GDN_Recurrent"
+    if op == NodeType.RMSNORM_GATED:
+        return "GDN_NormGated"
+    if op == NodeType.PER_HEAD_RMSNORM:
+        return "QK_Norm"
+    if op == NodeType.SIGMOID_GATE_MUL:
+        return "AttnGateMul"
     return "Other"
 
 class ExecutionContext:
@@ -335,6 +345,78 @@ class FallbackExecutor:
             expected_args=6
         )
 
+    def _dispatch_fused_gdn_proj(self, layer_idx: int, seq_len: int):
+        """Qwen3.5 Gated DeltaNet: lança qkv_proj+z_proj+a_proj+b_proj num
+        único kernel (ver fused_gdn_proj.hip.template) -- as 4 partem da
+        MESMA entrada (attn_norm.output); qkv/z usam pesos Q6_K crus,
+        a/b usam Q8_0 crus."""
+        cache_key = "fused_gdn_proj"
+        if cache_key not in self._kernel_cache:
+            hsaco_path = self.codegen.compile_kernel(template_name=cache_key, arch=self._arch)
+            _, fn = self.hip.load_kernel(hsaco_path, f"{cache_key}_kernel")
+            self._kernel_cache[cache_key] = fn
+        kernel = self._kernel_cache[cache_key]
+
+        input_ptr = self.arg_builder._resolve_tensor_ptr(
+            f"blk.{layer_idx}.attn_norm.output", self.tensor_mapping, {}
+        )
+        weight_qkv_ptr = self.arg_builder._resolve_tensor_ptr(
+            f"blk.{layer_idx}.attn_qkv.weight", self.tensor_mapping, {}
+        )
+        weight_z_ptr = self.arg_builder._resolve_tensor_ptr(
+            f"blk.{layer_idx}.attn_gate.weight", self.tensor_mapping, {}
+        )
+        weight_a_ptr = self.arg_builder._resolve_tensor_ptr(
+            f"blk.{layer_idx}.ssm_alpha.weight", self.tensor_mapping, {}
+        )
+        weight_b_ptr = self.arg_builder._resolve_tensor_ptr(
+            f"blk.{layer_idx}.ssm_beta.weight", self.tensor_mapping, {}
+        )
+
+        num_heads = self.metadata.get('linear_attn.num_heads', 16)
+        conv_dim = self.metadata.get('linear_attn.conv_dim', 6144)
+        value_dim = self.metadata.get('linear_attn.value_dim', 2048)
+        for out_name, n_elem in (
+            (f"blk.{layer_idx}.qkv_proj.output", conv_dim),
+            (f"blk.{layer_idx}.z_proj.output", value_dim),
+            (f"blk.{layer_idx}.a_proj.output", num_heads),
+            (f"blk.{layer_idx}.b_proj.output", num_heads),
+        ):
+            if out_name not in self.tensor_mapping:
+                size = max(n_elem * 2, 512)
+                self.tensor_mapping[out_name] = self.arena.allocate(size)[0]
+                if not hasattr(self, '_dynamic_tensors'):
+                    self._dynamic_tensors = []
+                self._dynamic_tensors.append(out_name)
+        output_qkv_ptr = self.arg_builder._resolve_tensor_ptr(f"blk.{layer_idx}.qkv_proj.output", self.tensor_mapping, {})
+        output_z_ptr = self.arg_builder._resolve_tensor_ptr(f"blk.{layer_idx}.z_proj.output", self.tensor_mapping, {})
+        output_a_ptr = self.arg_builder._resolve_tensor_ptr(f"blk.{layer_idx}.a_proj.output", self.tensor_mapping, {})
+        output_b_ptr = self.arg_builder._resolve_tensor_ptr(f"blk.{layer_idx}.b_proj.output", self.tensor_mapping, {})
+
+        hidden_size = self.metadata.get('embedding_length', 2048)
+        args = [
+            ctypes.c_void_p(input_ptr),
+            ctypes.c_void_p(weight_qkv_ptr),
+            ctypes.c_void_p(weight_z_ptr),
+            ctypes.c_void_p(weight_a_ptr),
+            ctypes.c_void_p(weight_b_ptr),
+            ctypes.c_void_p(output_qkv_ptr),
+            ctypes.c_void_p(output_z_ptr),
+            ctypes.c_void_p(output_a_ptr),
+            ctypes.c_void_p(output_b_ptr),
+            ctypes.c_int(hidden_size),
+            ctypes.c_int(conv_dim),
+            ctypes.c_int(value_dim),
+            ctypes.c_int(num_heads),
+        ]
+        total_rows = conv_dim + value_dim + 2 * num_heads
+        self.hip.launch_kernel(
+            function=kernel, args=args,
+            grid=(total_rows, 1, 1), block=(64, 1, 1), shared_mem=0,
+            expected_args=len(args),
+        )
+        self.hip.synchronize()
+
     def execute_layer(self, layer_idx: int, seq_len: int = 1, kv_cache_offset: int = 0):
         """Executa uma camada completa do transformer"""
         layer_prefix = f"blk.{layer_idx}."
@@ -356,11 +438,23 @@ class FallbackExecutor:
         # Só válido para seq_len==1 (VTE processa prompt e decode token a
         # token). down_proj e os ADD de residual continuam despachados
         # normalmente pelo loop principal.
+        # Só monta o conjunto de "nomes escondidos atrás da fusão" quando a
+        # camada REALMENTE tem pesos Q/K/V separados -- caso contrário
+        # (camadas linear_attention do Qwen3.5/Gated DeltaNet) esses nomes
+        # nem existem no grafo, e incluí-los aqui incondicionalmente faria
+        # o "blk.N.attn_norm" real ser pulado no loop principal mesmo com a
+        # tentativa de fusão desativada acima -- mesmo bug, caminho diferente.
+        _attn_q_name = f"blk.{layer_idx}.attn_q.weight"
+        _qkv_fusable = (_attn_q_name in self.tensor_mapping
+                        and _attn_q_name not in RAW_Q4K_WEIGHTS
+                        and _attn_q_name not in RAW_Q6K_WEIGHTS
+                        and _attn_q_name not in RAW_Q8_0_WEIGHTS
+                        and self.metadata.get('rope_type') != 2)
         qkv_fused_names = {
             f"blk.{layer_idx}.attn_norm", f"blk.{layer_idx}.q_proj",
             f"blk.{layer_idx}.k_proj", f"blk.{layer_idx}.v_proj",
             f"blk.{layer_idx}.rope",
-        }
+        } if _qkv_fusable else set()
         ffn_fused_names = {
             f"blk.{layer_idx}.ffn_norm", f"blk.{layer_idx}.gate_proj",
             f"blk.{layer_idx}.up_proj", f"blk.{layer_idx}.swiglu",
@@ -371,7 +465,25 @@ class FallbackExecutor:
         # fundido — o FFN inteiro sumiria (bug pego pelo profiler da Etapa A).
         import os as _os
         _ffn_fusion_on = bool(_os.environ.get('VTE_ENABLE_FFN_FUSION'))
-        fused_names = qkv_fused_names | (ffn_fused_names if _ffn_fusion_on else set())
+        # Qwen3.5 Gated DeltaNet: qkv_proj+z_proj+a_proj+b_proj fundidos.
+        # IMPORTANTE (bug real encontrado e corrigido nesta sessão): este
+        # conjunto precisa ser recalculado do ZERO a cada chamada de
+        # execute_layer (igual qkv_fused_names/ffn_fused_names acima), NUNCA
+        # via `self.context.executed_nodes` -- esse set persiste e ACUMULA
+        # por TODA a geração (só é limpo uma vez, no início de generate()),
+        # então qualquer checagem baseada nele ("já rodou antes?") ficava
+        # permanentemente verdadeira a partir da 2a posição em diante,
+        # fazendo TODOS os nós da camada (não só z/a/b_proj) serem pulados
+        # sem nunca serem recalculados -- collapse total da geração a partir
+        # do 2o token. `fused_names` abaixo é local/stateless (recriado a
+        # cada chamada), mesmo padrão já usado e validado pelo QKV/FFN.
+        _gdn_fusable = (f"blk.{layer_idx}.ssm_beta.weight" in self.tensor_mapping
+                        and not _os.environ.get('VTE_DISABLE_GDN_FUSION'))
+        gdn_fused_names = {
+            f"blk.{layer_idx}.qkv_proj", f"blk.{layer_idx}.z_proj",
+            f"blk.{layer_idx}.a_proj", f"blk.{layer_idx}.b_proj",
+        } if _gdn_fusable else set()
+        fused_names = qkv_fused_names | gdn_fused_names | (ffn_fused_names if _ffn_fusion_on else set())
 
         for node in self.execution_order:
             is_layer_node = node.name.startswith(layer_prefix)
@@ -383,7 +495,38 @@ class FallbackExecutor:
                 self.context.executed_nodes.add(node.name)
                 continue
 
-            if seq_len == 1 and node.name == f"blk.{layer_idx}.attn_norm":
+            # A fusão QKV+RoPE assume pesos Q/K/V SEPARADOS (attn_q/attn_k/
+            # attn_v.weight) -- verdade pro Qwen2.5/Granite e pras camadas
+            # full_attention do Qwen3.5, mas FALSO pras camadas
+            # linear_attention do Qwen3.5 (Gated DeltaNet): estas têm um
+            # nó também chamado "attn_norm" só que seguido de attn_qkv.weight
+            # fundido (formato completamente diferente). Sem esta checagem,
+            # a fusão disparava por NOME em toda camada, resolvia os pesos
+            # inexistentes pra ponteiro nulo (_resolve_ptr silencioso) e —
+            # pior — PULAVA o RMSNorm real da camada, deixando
+            # attn_norm.output zerado e propagando zero pro resto do modelo
+            # inteiro (causa raiz do "!!!!!!!!" repetido na geração real).
+            #
+            # rope_type==2 identifica as camadas full_attention do Qwen3.5
+            # (ver metadata['rope_type'] em _load_qwen3_5_metadata) -- essas
+            # têm q_norm/k_norm (RMSNorm por-head) e um gate sigmoide entre
+            # q_proj/k_proj e o RoPE/atenção (Qwen3_5Attention real, ver
+            # qwen3_5_compute.py) que o kernel fundido de QKV+RoPE não sabe
+            # calcular. Desativado especificamente pra essas camadas -- usa
+            # o pipeline próprio (nós separados) em vez do fundido.
+            #
+            # attn_q.weight em RAW_Q4K/Q6K/Q8_0_WEIGHTS: o kernel fundido lê
+            # os pesos como `__half*` puro, sem dequant embutido -- roteá-
+            # los crus (Granite/Qwen2.5, decisão desta sessão pra reduzir
+            # VRAM) produziria valores errados/NaN se a fusão tentasse
+            # usá-los. Sem a fusão, o despacho genérico por-nó já roteia
+            # pro gemv_q4k/q6k/q8_0 (que sabem desquantizar) automaticamente.
+            if (seq_len == 1 and node.name == f"blk.{layer_idx}.attn_norm"
+                    and _attn_q_name in self.tensor_mapping
+                    and _attn_q_name not in RAW_Q4K_WEIGHTS
+                    and _attn_q_name not in RAW_Q6K_WEIGHTS
+                    and _attn_q_name not in RAW_Q8_0_WEIGHTS
+                    and self.metadata.get('rope_type') != 2):
                 try:
                     prof = getattr(self.hip, '_profiler', None)
                     if prof is not None and prof.enabled:
@@ -400,6 +543,24 @@ class FallbackExecutor:
                     self.context.executed_nodes.update(qkv_fused_names)
                 except Exception as e:
                     logger.error(f"Kernel Panic na fusão QKV da camada {layer_idx}: {e}")
+                    self.context.rollback()
+                    raise
+                continue
+
+            # Fusão qkv_proj+z_proj+a_proj+b_proj (Qwen3.5 Gated DeltaNet):
+            # as 4 projeções partem da MESMA entrada (attn_norm.output) --
+            # funde num único lançamento em vez de 4 (ver
+            # fused_gdn_proj.hip.template). O skip de z_proj/a_proj/b_proj
+            # é feito pelo check ESTÁTICO `node.name in fused_names` mais
+            # abaixo (gdn_fused_names, calculado no topo desta função) --
+            # não aqui, ver comentário acima sobre o bug de usar
+            # `executed_nodes` (que acumula por toda a geração).
+            if (seq_len == 1 and node.name == f"blk.{layer_idx}.qkv_proj"
+                    and _gdn_fusable):
+                try:
+                    self._dispatch_fused_gdn_proj(layer_idx, seq_len)
+                except Exception as e:
+                    logger.error(f"Kernel Panic na fusão GDN da camada {layer_idx}: {e}")
                     self.context.rollback()
                     raise
                 continue
@@ -569,6 +730,21 @@ class FallbackExecutor:
                 NodeType.ATTENTION: "flash_attention",
                 NodeType.SWIGLU: "swiglu",
                 NodeType.ADD: "add",
+                # Gated DeltaNet (Qwen3.5 "linear_attention") -- terceira
+                # cópia deste mesmo dict de despacho (as outras duas são
+                # kernel_arg_builder.py::KERNEL_SIGNATURES e
+                # hip_graph_executor.py::op_to_template, ambas já
+                # atualizadas). Faltando aqui, _get_or_compile_kernel
+                # retornava None silenciosamente pra estes 3 tipos, e
+                # _dispatch_node simplesmente não fazia nada -- causa raiz
+                # do conv1d.output/linear_attention.output ficarem zerados
+                # no caminho FallbackExecutor (use_hip_graph=False).
+                NodeType.CAUSAL_CONV1D: "causal_conv1d",
+                NodeType.LINEAR_ATTENTION: "gated_delta_recurrent",
+                NodeType.RMSNORM_GATED: "rmsnorm_gated",
+                # Qwen3.5 full_attention: q_norm/k_norm + gate sigmoide.
+                NodeType.PER_HEAD_RMSNORM: "per_head_rmsnorm",
+                NodeType.SIGMOID_GATE_MUL: "sigmoid_gate_mul",
             }
             if _is_q4k_matmul(node):
                 template_name = "gemv_q4k"
@@ -659,7 +835,49 @@ class FallbackExecutor:
             grid_x = (total_elements + block_size - 1) // block_size
             grid_x = max(1, grid_x)
             return (grid_x, 1, 1), (block_size, 1, 1), 0
-            
+
+        elif node.op_type == NodeType.CAUSAL_CONV1D:
+            # 1 thread por canal, sem __syncthreads/LDS (cada thread é
+            # 100% independente) -- caso ideal pra ocupação em RDNA
+            # (wavefront=64): block=64 (exatamente 1 wavefront, zero thread
+            # mascarado) em vez do block_size genérico de 256, o que
+            # QUADRUPLICA o número de blocos (24->96) sem mudar o total de
+            # threads/trabalho -- espalha por todos os 32 CUs da RX 7600 em
+            # vez de deixar metade ociosa com só 24 blocos.
+            conv_dim = self.metadata.get('linear_attn.conv_dim', 6144)
+            conv1d_block = 64
+            grid_x = max(1, (conv_dim + conv1d_block - 1) // conv1d_block)
+            return (grid_x, 1, 1), (conv1d_block, 1, 1), 0
+
+        elif node.op_type == NodeType.LINEAR_ATTENTION:
+            # 1 bloco por head, head_v_dim threads/bloco -- ver
+            # gated_delta_recurrent.hip.template (early-return antes de
+            # __syncthreads() exige EXATAMENTE head_v_dim threads/bloco).
+            num_heads = self.metadata.get('linear_attn.num_heads', 16)
+            head_v_dim = self.metadata.get('linear_attn.head_v_dim', 128)
+            return (num_heads, batch, 1), (head_v_dim, 1, 1), 0
+
+        elif node.op_type == NodeType.RMSNORM_GATED:
+            # 1 linha (blockIdx.x) por HEAD, não por token.
+            num_heads = self.metadata.get('linear_attn.num_heads', 16)
+            head_v_dim = self.metadata.get('linear_attn.head_v_dim', 128)
+            return (num_heads * batch, 1, 1), (head_v_dim, 1, 1), 0
+
+        elif node.op_type == NodeType.PER_HEAD_RMSNORM:
+            head_dim = self.metadata.get('attention.key_length', 128)
+            if node.name.endswith('.q_norm'):
+                num_heads = self.metadata.get('attention.head_count', 12)
+            else:
+                num_heads = self.metadata.get('attention.head_count_kv', 2)
+            return (num_heads, 1, 1), (head_dim, 1, 1), head_dim * 4
+
+        elif node.op_type == NodeType.SIGMOID_GATE_MUL:
+            head_dim = self.metadata.get('attention.key_length', 128)
+            num_heads = self.metadata.get('attention.head_count', 12)
+            total = num_heads * head_dim
+            grid_x = max(1, (total + block_size - 1) // block_size)
+            return (grid_x, 1, 1), (block_size, 1, 1), 0
+
         return (1, 1, 1), (block_size, 1, 1), 0
 
     def _execute_rope_test(

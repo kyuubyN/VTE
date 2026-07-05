@@ -55,7 +55,38 @@
   // ---- Three.js base ----
   var scene = new THREE.Scene();
   var camera = new THREE.PerspectiveCamera(42, 1, 0.1, 100);
-  camera.position.set(0, 2.2, 9);
+  var BASE_DIST = 9; // distância "de fábrica", ajustada olhando pra um viewport widescreen
+  // A placa tem ~7 unidades de largura (mais ~2.6 quando explode no scroll). Com FOV
+  // vertical fixo, o FOV HORIZONTAL efetivo é proporcional ao aspect ratio -- numa tela
+  // em retrato (mobile, aspect ~0.46) ele encolhe bastante, então a mesma distância de
+  // câmera deixa a placa ocupando muito mais da largura da tela (o "grande demais" /
+  // cortado embaixo reportado no mobile). BASE_HALF_WIDTH congela o meio-largura visível
+  // que BASE_DIST produzia no aspect de referência (1.6, desktop widescreen) -- resize()
+  // usa isso pra recuar a câmera em telas mais estreitas, preservando a mesma largura
+  // visível em vez da mesma distância.
+  var BASE_HALF_WIDTH = BASE_DIST * Math.tan((camera.fov * Math.PI) / 360) * 1.6;
+  camera.position.set(0, 2.2, BASE_DIST);
+  // A câmera nunca teve um lookAt(): sem ele, olha reto no eixo -Z (nível,
+  // não inclinada pra baixo), então com a câmera em y=2.2 e a placa toda
+  // perto de y=0, a placa inteira cai na metade DE BAIXO do frame -- é por
+  // isso que ela aparecia cortada embaixo (desktop). O card de texto
+  // (`.gpu-info`) fica na metade de baixo da tela por CSS -- a placa
+  // precisa ficar deslocada pra CIMA da tela, não centralizada nela, senão
+  // fica atrás do próprio card (o que aconteceu ao mirar num Y fixo).
+  // Um Y de mira fixo não funciona: a distância da câmera varia MUITO
+  // entre desktop (~9) e mobile (~30+, ver resize() abaixo), e o mesmo
+  // deslocamento vertical em unidades de mundo produz um deslocamento de
+  // TELA bem menor quanto mais longe a câmera está. Por isso o alvo de
+  // mira é recalculado em função da distância atual (BOARD_CENTER_Y menos
+  // um deslocamento proporcional à distância vezes tan(TILT_UP_RAD)),
+  // mantendo o mesmo deslocamento ANGULAR -- e portanto a mesma posição
+  // relativa na tela -- em qualquer aspect ratio. Ver resize().
+  var BOARD_CENTER_Y = 0.55;
+  var TILT_UP_RAD = (10 * Math.PI) / 180;
+  function aimCamera(dist) {
+    camera.lookAt(0, BOARD_CENTER_Y - dist * Math.tan(TILT_UP_RAD), 0);
+  }
+  aimCamera(BASE_DIST);
 
   var renderer = new THREE.WebGLRenderer({ canvas: canvas, alpha: true, antialias: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -250,7 +281,13 @@
     var w = canvas.clientWidth || window.innerWidth;
     var h = canvas.clientHeight || window.innerHeight;
     renderer.setSize(w, h, false);
-    camera.aspect = w / h;
+    var aspect = w / h;
+    camera.aspect = aspect;
+
+    var vFovRad = (camera.fov * Math.PI) / 180;
+    var distForWidth = BASE_HALF_WIDTH / (Math.tan(vFovRad / 2) * aspect);
+    camera.position.z = Math.max(BASE_DIST, distForWidth);
+    aimCamera(camera.position.z); // recalcula o alvo pra manter o mesmo deslocamento ANGULAR
     camera.updateProjectionMatrix();
   }
   window.addEventListener("resize", resize);

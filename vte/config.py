@@ -25,10 +25,16 @@ CACHE_LINE_SIZE = 64
 ALLOWED_MODEL_HASH = "sha256:PLACEHOLDER"
 QWEN2_5_EXPECTED_HASH = "sha256:PLACEHOLDER"
 GRANITE_4_1_3B_EXPECTED_HASH = "sha256:PLACEHOLDER"
+QWEN35_2B_EXPECTED_HASH = "sha256:PLACEHOLDER"
 ALLOWED_MODEL_SIZE_MIN = 800 * 1024 * 1024
 ALLOWED_MODEL_SIZE_MAX = 1200 * 1024 * 1024
 GRANITE_4_1_3B_SIZE_MIN = 3 * 1024 * 1024 * 1024
 GRANITE_4_1_3B_SIZE_MAX = 4 * 1024 * 1024 * 1024
+# Arquivo real medido nesta sessão: 1574961408 bytes (~1.47GB) -- margem
+# generosa em torno disso, mesmo padrão de banda usado pros outros dois
+# modelos (não um cheque em branco, mas não colado no byte exato).
+QWEN35_2B_SIZE_MIN = 1 * 1024 * 1024 * 1024
+QWEN35_2B_SIZE_MAX = 2 * 1024 * 1024 * 1024
 
 DEFAULT_GPU_ARCH = "gfx1100"
 GPU_ARCH_MAP = {

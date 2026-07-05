@@ -32,11 +32,18 @@ extern "C" __global__ void split_k_qkv_pass2_kernel(
     const int* __restrict__ kv_cache_offset_ptr,  // agora array de `batch` ints
     int apply_rope,
     int num_heads,
-    int rope_type   // 0 = NEOX/split-half (Qwen2: par (j, j+half)); 1 = NORM/
+    int rope_type,  // 0 = NEOX/split-half (Qwen2: par (j, j+half)); 1 = NORM/
                      // intercalado (Granite: par (2i, 2i+1)) -- confirmado em
                      // llama-model.cpp::llama_model_rope_type: QWEN2 usa
                      // LLAMA_ROPE_TYPE_NEOX, GRANITE usa LLAMA_ROPE_TYPE_NORM.
-                     // Default 0 preserva o Qwen bit a bit.
+                     // Default 0 preserva o Qwen bit a bit. 2 = NEOX parcial
+                     // (Qwen3.5 -- ver rotary_dim abaixo).
+    int rotary_dim  // canais rotacionados quando rope_type==2 (ignorado nos
+                    // outros dois tipos). Qwen3.5: 64 de head_dim=256
+                    // (partial_rotary_factor=0.25, confirmado em
+                    // modeling_qwen3_5.py). Canais >= rotary_dim passam sem
+                    // rotação (cópia direta de raw_out). cos/sin_cache têm
+                    // stride rotary_dim por posição neste modo.
 ) {
     __shared__ float raw_out[256];   // pré-RoPE deste head (indexado por j)
 
@@ -86,6 +93,26 @@ extern "C" __global__ void split_k_qkv_pass2_kernel(
                 float x0 = raw_out[j - 1];
                 float x1 = raw_out[j];
                 output_b[n] = __float2half(x0 * s + x1 * c);
+            }
+        } else if (rope_type == 2) {
+            // NEOX parcial (Qwen3.5): só os primeiros `rotary_dim` canais
+            // giram, no mesmo padrão split-half do NEOX comum, só que numa
+            // janela menor; canais >= rotary_dim passam direto (cópia).
+            int half_rot = rotary_dim / 2;
+            if (j < half_rot) {
+                float v1 = raw_out[j];
+                float v2 = raw_out[j + half_rot];
+                float c = __half2float(cos_cache[pos * rotary_dim + j]);
+                float s = __half2float(sin_cache[pos * rotary_dim + j]);
+                output_b[n] = __float2half(v1 * c - v2 * s);
+            } else if (j < rotary_dim) {
+                float v1 = raw_out[j - half_rot];
+                float v2 = raw_out[j];
+                float c = __half2float(cos_cache[pos * rotary_dim + (j - half_rot)]);
+                float s = __half2float(sin_cache[pos * rotary_dim + (j - half_rot)]);
+                output_b[n] = __float2half(v1 * s + v2 * c);
+            } else {
+                output_b[n] = __float2half(raw_out[j]);
             }
         } else {
             // NEOX/split-half (Qwen2): par (j, j+half).

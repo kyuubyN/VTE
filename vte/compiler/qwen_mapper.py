@@ -18,14 +18,24 @@ def is_raw_q4k_weight(name: str, tensor_info: dict) -> bool:
     Fonte única de verdade: True se o tensor fica CRU em Q4_K na VRAM (roteado
     ao gemv_q4k). Precisa casar exatamente com o roteamento do executor.
 
-    Cobertos: ffn_gate/ffn_up (uniformemente Q4_K) e os ffn_down que são Q4_K
-    (o down_proj é misto Q4_K/Q6_K neste GGUF). attn_* seguem FP16 por ora.
+    Cobertos: ffn_gate/ffn_up/ffn_down (Q4_K) e, desde esta sessão, também
+    attn_q/attn_k/attn_output quando vierem em Q4_K (mesma mudança já feita
+    pro Granite: usuário pediu reduzir VRAM depois de medir que o Granite cru
+    ficou MAIS RÁPIDO, não mais lento -- ler menos bytes da VRAM compensou a
+    perda da fusão QKV). Fusão QKV desativada automaticamente quando esses
+    pesos estão crus (ver checagem em fallback_executor.py/
+    hip_graph_executor.py contra RAW_Q4K_WEIGHTS/RAW_Q6K_WEIGHTS/
+    RAW_Q8_0_WEIGHTS) -- sem isso o kernel fundido leria os pesos como
+    `__half*` puro e produziria NaN.
     """
     if tensor_info.get('dtype') != GGML_TYPE_Q4_K:
         return False
     return (name.endswith("ffn_gate.weight")
             or name.endswith("ffn_up.weight")
-            or name.endswith("ffn_down.weight"))
+            or name.endswith("ffn_down.weight")
+            or name.endswith("attn_q.weight")
+            or name.endswith("attn_k.weight")
+            or name.endswith("attn_output.weight"))
 
 
 def is_raw_q6k_weight(name: str, tensor_info: dict) -> bool:
@@ -33,15 +43,16 @@ def is_raw_q6k_weight(name: str, tensor_info: dict) -> bool:
     True se o tensor fica CRU em Q6_K na VRAM (roteado ao gemv_q6k / embedding
     lookup dequantizado).
 
-    Cobertos: ffn_down (Q6_K, K=8960) e token_embd (Fase D.1 — tied embeddings:
+    Cobertos: ffn_down (Q6_K, K=8960), token_embd (Fase D.1 — tied embeddings:
     o mesmo tensor serve de peso do lm_head via gemv_q6k E do embedding lookup
     via embedding_lookup_q6k, dequantizado sob demanda em ambos os casos; sem
-    isso o lm_head continuaria pagando ~277 MB de leitura extra por token).
-    attn_v (também Q6_K) fica FP16 por ora.
-    """
+    isso o lm_head continuaria pagando ~277 MB de leitura extra por token) e,
+    desde esta sessão, attn_v quando vier em Q6_K (mesmo motivo de
+    is_raw_q4k_weight acima -- ver comentário lá)."""
     if tensor_info.get('dtype') != GGML_TYPE_Q6_K:
         return False
-    return name.endswith("ffn_down.weight") or name == "token_embd.weight"
+    return (name.endswith("ffn_down.weight") or name == "token_embd.weight"
+            or name.endswith("attn_v.weight"))
 
 
 class ActivationArena:

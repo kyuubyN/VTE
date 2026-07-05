@@ -135,6 +135,14 @@ class HIPGraphExecutor:
             NodeType.SWIGLU: "swiglu",
             NodeType.ADD: "add",
             "mega_kernel": "fused_rmsnorm_matmul_rope",
+            # Gated DeltaNet (Qwen3.5 "linear_attention") -- isolado, não
+            # afeta nenhuma entrada acima.
+            NodeType.CAUSAL_CONV1D: "causal_conv1d",
+            NodeType.LINEAR_ATTENTION: "gated_delta_recurrent",
+            NodeType.RMSNORM_GATED: "rmsnorm_gated",
+            # Qwen3.5 full_attention: q_norm/k_norm + gate sigmoide pré-o_proj.
+            NodeType.PER_HEAD_RMSNORM: "per_head_rmsnorm",
+            NodeType.SIGMOID_GATE_MUL: "sigmoid_gate_mul",
         }
         from vte.core.fallback_executor import _is_vectorized_matmul, _is_q4k_matmul, _is_q6k_matmul, _is_q8_0_matmul
         if _is_q4k_matmul(node):
@@ -175,6 +183,63 @@ class HIPGraphExecutor:
         except Exception as e:
             logger.warning(f"Kernel {template} não compilado: {e}. Nó ignorado na captura.")
             return None
+
+    def _build_fused_gdn_proj_launch(self, layer_idx: int):
+        """Qwen3.5 Gated DeltaNet: monta o lançamento fundido de
+        qkv_proj+z_proj+a_proj+b_proj (ver fused_gdn_proj.hip.template e a
+        versão irmã em fallback_executor.py::_dispatch_fused_gdn_proj).
+        Tensores de saída já vêm pré-alocados (endereço fixo) por
+        model.py::_allocate_activation_buffers -- não precisa alocação
+        preguiçosa aqui, ao contrário do FallbackExecutor."""
+        arch = self.hip.get_gpu_architecture()
+        cache_key = "fused_gdn_proj"
+        if cache_key not in self._kernel_cache:
+            hsaco_path = self.codegen.compile_kernel(template_name=cache_key, arch=arch)
+            module, function = self.hip.load_kernel(hsaco_path, f"{cache_key}_kernel")
+            self._kernel_cache[cache_key] = (module, function)
+        fn = self._kernel_cache[cache_key][1]
+
+        input_ptr = self.arg_builder._resolve_tensor_ptr(
+            f"blk.{layer_idx}.attn_norm.output", self.tensor_mapping, {}
+        )
+        weight_qkv_ptr = self.arg_builder._resolve_tensor_ptr(
+            f"blk.{layer_idx}.attn_qkv.weight", self.tensor_mapping, {}
+        )
+        weight_z_ptr = self.arg_builder._resolve_tensor_ptr(
+            f"blk.{layer_idx}.attn_gate.weight", self.tensor_mapping, {}
+        )
+        weight_a_ptr = self.arg_builder._resolve_tensor_ptr(
+            f"blk.{layer_idx}.ssm_alpha.weight", self.tensor_mapping, {}
+        )
+        weight_b_ptr = self.arg_builder._resolve_tensor_ptr(
+            f"blk.{layer_idx}.ssm_beta.weight", self.tensor_mapping, {}
+        )
+        output_qkv_ptr = self.arg_builder._resolve_tensor_ptr(f"blk.{layer_idx}.qkv_proj.output", self.tensor_mapping, {})
+        output_z_ptr = self.arg_builder._resolve_tensor_ptr(f"blk.{layer_idx}.z_proj.output", self.tensor_mapping, {})
+        output_a_ptr = self.arg_builder._resolve_tensor_ptr(f"blk.{layer_idx}.a_proj.output", self.tensor_mapping, {})
+        output_b_ptr = self.arg_builder._resolve_tensor_ptr(f"blk.{layer_idx}.b_proj.output", self.tensor_mapping, {})
+
+        num_heads = self.metadata.get('linear_attn.num_heads', 16)
+        conv_dim = self.metadata.get('linear_attn.conv_dim', 6144)
+        value_dim = self.metadata.get('linear_attn.value_dim', 2048)
+        hidden_size = self.metadata.get('embedding_length', 2048)
+        args = [
+            ctypes.c_void_p(input_ptr),
+            ctypes.c_void_p(weight_qkv_ptr),
+            ctypes.c_void_p(weight_z_ptr),
+            ctypes.c_void_p(weight_a_ptr),
+            ctypes.c_void_p(weight_b_ptr),
+            ctypes.c_void_p(output_qkv_ptr),
+            ctypes.c_void_p(output_z_ptr),
+            ctypes.c_void_p(output_a_ptr),
+            ctypes.c_void_p(output_b_ptr),
+            ctypes.c_int(hidden_size),
+            ctypes.c_int(conv_dim),
+            ctypes.c_int(value_dim),
+            ctypes.c_int(num_heads),
+        ]
+        total_rows = conv_dim + value_dim + 2 * num_heads
+        return fn, args, (total_rows, 1, 1), (64, 1, 1), 0
 
     def _capture_embedding_lookup(self, seq_len: int):
         """
@@ -296,6 +361,51 @@ class HIPGraphExecutor:
             grid_x = max(1, (total_elements + block_size - 1) // block_size)
             return (grid_x, 1, 1), (block_size, 1, 1), 0
 
+        if node.op_type == NodeType.CAUSAL_CONV1D:
+            # 1 thread por canal, sem __syncthreads/LDS -- block=64 (1
+            # wavefront RDNA exato, zero lane mascarado) em vez do
+            # block_size genérico de 256, o que quadruplica o número de
+            # blocos (24->96) sem mudar o total de threads/trabalho --
+            # espalha por todos os 32 CUs da RX 7600 (cópia irmã em
+            # fallback_executor.py::_calculate_launch_dims).
+            conv_dim = self.metadata.get('linear_attn.conv_dim', 6144)
+            conv1d_block = 64
+            grid_x = max(1, (conv_dim + conv1d_block - 1) // conv1d_block)
+            return (grid_x, 1, 1), (conv1d_block, 1, 1), 0
+
+        if node.op_type == NodeType.LINEAR_ATTENTION:
+            # 1 bloco por head, head_v_dim threads/bloco -- thread l é dona
+            # da coluna l do estado (ver gated_delta_recurrent.hip.template).
+            num_heads = self.metadata.get('linear_attn.num_heads', 16)
+            head_v_dim = self.metadata.get('linear_attn.head_v_dim', 128)
+            return (num_heads, batch, 1), (head_v_dim, 1, 1), 0
+
+        if node.op_type == NodeType.RMSNORM_GATED:
+            # 1 linha (blockIdx.x) por HEAD, não por token -- confirmado no
+            # código real (core_attn_out/z são reshaped pra (-1, head_v_dim)
+            # antes do norm). grid.x = num_heads * batch.
+            num_heads = self.metadata.get('linear_attn.num_heads', 16)
+            head_v_dim = self.metadata.get('linear_attn.head_v_dim', 128)
+            return (num_heads * batch, 1, 1), (head_v_dim, 1, 1), 0
+
+        if node.op_type == NodeType.PER_HEAD_RMSNORM:
+            # 1 bloco por head, head_dim threads/bloco -- q_norm usa
+            # num_q_heads, k_norm usa num_kv_heads (distinguidos pelo nome
+            # do nó, ver kernel_arg_builder.py::_build_per_head_rmsnorm_args).
+            head_dim = self.metadata.get('attention.key_length', 128)
+            if node.name.endswith('.q_norm'):
+                num_heads = self.metadata.get('attention.head_count', 12)
+            else:
+                num_heads = self.metadata.get('attention.head_count_kv', 2)
+            return (num_heads, 1, 1), (head_dim, 1, 1), head_dim * 4
+
+        if node.op_type == NodeType.SIGMOID_GATE_MUL:
+            head_dim = self.metadata.get('attention.key_length', 128)
+            num_heads = self.metadata.get('attention.head_count', 12)
+            total = num_heads * head_dim
+            grid_x = max(1, (total + block_size - 1) // block_size)
+            return (grid_x, 1, 1), (block_size, 1, 1), 0
+
         return (1, 1, 1), (block_size, 1, 1), 0
 
     def _capture_lm_head(self):
@@ -384,7 +494,41 @@ class HIPGraphExecutor:
                 if seq_len == 1 and node.name in fused_skip_names:
                     continue
 
-                if seq_len == 1 and node.op_type == NodeType.RMSNORM and node.name.endswith('.attn_norm'):
+                # A fusão QKV+RoPE assume pesos Q/K/V separados
+                # (attn_q/attn_k/attn_v.weight) -- verdade pro Qwen2.5/
+                # Granite e pras camadas full_attention do Qwen3.5, mas
+                # FALSO pras camadas linear_attention (Gated DeltaNet), que
+                # também têm um nó "attn_norm" só que seguido de
+                # attn_qkv.weight fundido (formato diferente). Sem esta
+                # checagem, a fusão disparava por nome em toda camada,
+                # resolvia os pesos inexistentes pra ponteiro nulo
+                # (_resolve_ptr silencioso) e pulava o RMSNorm real da
+                # camada -- causa raiz do "!!!!!!!!" repetido na geração.
+                #
+                # rope_type==2 identifica as camadas full_attention do
+                # Qwen3.5, que têm q_norm/k_norm + gate sigmoide (ver
+                # qwen3_5_compute.py) que o kernel fundido não sabe
+                # calcular -- desativado especificamente pra elas.
+                #
+                # attn_q.weight em RAW_Q4K/Q6K/Q8_0_WEIGHTS: o kernel fundido
+                # lê os pesos como `__half*` puro, sem dequant embutido --
+                # roteá-los crus (Granite/Qwen2.5, decisão desta sessão pra
+                # reduzir VRAM) produziria valores errados/NaN se a fusão
+                # tentasse usá-los.
+                from vte.core.fallback_executor import (
+                    RAW_Q4K_WEIGHTS as _RAW_Q4K_WEIGHTS,
+                    RAW_Q6K_WEIGHTS as _RAW_Q6K_WEIGHTS,
+                    RAW_Q8_0_WEIGHTS as _RAW_Q8_0_WEIGHTS,
+                )
+                _attn_q_name = (f"blk.{node.name.split('.')[1]}.attn_q.weight"
+                                if node.op_type == NodeType.RMSNORM and node.name.endswith('.attn_norm')
+                                else None)
+                if (seq_len == 1 and _attn_q_name is not None
+                        and _attn_q_name in self.tensor_mapping
+                        and _attn_q_name not in _RAW_Q4K_WEIGHTS
+                        and _attn_q_name not in _RAW_Q6K_WEIGHTS
+                        and _attn_q_name not in _RAW_Q8_0_WEIGHTS
+                        and self.metadata.get('rope_type') != 2):
                     layer_idx = int(node.name.split('.')[1])
                     try:
                         launches = self._fused_qkv.build_launches(
@@ -404,6 +548,32 @@ class HIPGraphExecutor:
                             f"Fusão QKV falhou na captura (camada {layer_idx}): {e}. "
                             f"Usando kernels separados para esta camada."
                         )
+
+                # Fusão qkv_proj+z_proj+a_proj+b_proj (Qwen3.5 Gated
+                # DeltaNet): as 4 partem da MESMA entrada (attn_norm.
+                # output) -- funde num único lançamento em vez de 4 (ver
+                # fused_gdn_proj.hip.template). 3 kernels a menos POR
+                # CAMADA (18 camadas = 54 nós a menos no grafo, ~15% do
+                # total) -- fusões de 1 kernel não mudavam o tok/s de
+                # forma mensurável nesta sessão; esta é grande o bastante
+                # pra ter chance real de aparecer na medição.
+                if seq_len == 1 and node.op_type == NodeType.MATMUL and node.name.endswith('.qkv_proj'):
+                    layer_idx = int(node.name.split('.')[1])
+                    if f"blk.{layer_idx}.ssm_beta.weight" in self.tensor_mapping:
+                        try:
+                            fn, args, grid, block, shared = self._build_fused_gdn_proj_launch(layer_idx)
+                            self.hip.launch_kernel_recorded(fn, args, grid, block, shared)
+                            nodes_recorded += 1
+                            fused_skip_names.update({
+                                f"blk.{layer_idx}.z_proj", f"blk.{layer_idx}.a_proj",
+                                f"blk.{layer_idx}.b_proj",
+                            })
+                            continue
+                        except Exception as e:
+                            logger.warning(
+                                f"Fusão GDN falhou na captura (camada {layer_idx}): {e}. "
+                                f"Usando kernels separados para esta camada."
+                            )
 
                 # Split-KV (Flash-Decoding): opt-in via VTE_ENABLE_ATTN_SPLITKV
                 # -- substitui o único flash_attention_kernel (12 blocos, laço

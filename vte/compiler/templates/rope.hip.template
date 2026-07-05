@@ -24,8 +24,16 @@ extern "C" __global__ void rope_kernel(
     int num_kv_heads,
     int head_dim,
     const int* __restrict__ kv_cache_offset_ptr,  // agora array de `batch` ints
-    int rope_type   // 0 = NEOX/split-half (Qwen2); 1 = NORM/intercalado
-                     // (Granite) -- ver split_k_qkv_pass2.hip.template.
+    int rope_type,  // 0 = NEOX/split-half (Qwen2); 1 = NORM/intercalado
+                    // (Granite); 2 = NEOX parcial (Qwen3.5 -- ver abaixo).
+    int rotary_dim  // canais realmente rotacionados (rope_type==2 apenas;
+                    // ignorado nos outros dois tipos, que sempre giram
+                    // head_dim inteiro). Qwen3.5: 64 de um head_dim=256
+                    // (partial_rotary_factor=0.25, confirmado no código-
+                    // fonte real do HF, modeling_qwen3_5.py) -- os canais
+                    // de rotary_dim até head_dim-1 passam sem rotação
+                    // nenhuma. cos_cache/sin_cache têm stride rotary_dim
+                    // por posição neste modo (não head_dim).
 ) {
     int batch_idx = blockIdx.y;
 
@@ -55,6 +63,21 @@ extern "C" __global__ void rope_kernel(
                 float s = __half2float(sin_cache[absolute_pos * head_dim + i]);
                 q_b[idx] = __float2half(x0 * c - x1 * s);
                 q_b[idx + 1] = __float2half(x0 * s + x1 * c);
+            }
+        } else if (rope_type == 2) {
+            // NEOX split-half, mas só dentro dos primeiros `rotary_dim`
+            // canais -- de rotary_dim até head_dim-1 fica intocado (nem
+            // lido nem escrito aqui). half_rot = rotary_dim/2: canal j
+            // (j < half_rot) pareia com j+half_rot, exatamente como o
+            // rope_type==0, só que restrito a essa janela menor.
+            int half_rot = rotary_dim / 2;
+            if (head_offset < half_rot) {
+                float q1 = __half2float(q_b[idx]);
+                float q2 = __half2float(q_b[idx + half_rot]);
+                float cos_val = __half2float(cos_cache[absolute_pos * rotary_dim + head_offset]);
+                float sin_val = __half2float(sin_cache[absolute_pos * rotary_dim + head_offset]);
+                q_b[idx] = __float2half(q1 * cos_val - q2 * sin_val);
+                q_b[idx + half_rot] = __float2half(q1 * sin_val + q2 * cos_val);
             }
         } else if (head_offset < half_dim) {
             float q1 = __half2float(q_b[idx]);
@@ -89,6 +112,16 @@ extern "C" __global__ void rope_kernel(
                 float s = __half2float(sin_cache[absolute_pos * head_dim + i]);
                 k_b[idx] = __float2half(x0 * c - x1 * s);
                 k_b[idx + 1] = __float2half(x0 * s + x1 * c);
+            }
+        } else if (rope_type == 2) {
+            int half_rot = rotary_dim / 2;
+            if (head_offset < half_rot) {
+                float k1 = __half2float(k_b[idx]);
+                float k2 = __half2float(k_b[idx + half_rot]);
+                float cos_val = __half2float(cos_cache[absolute_pos * rotary_dim + head_offset]);
+                float sin_val = __half2float(sin_cache[absolute_pos * rotary_dim + head_offset]);
+                k_b[idx] = __float2half(k1 * cos_val - k2 * sin_val);
+                k_b[idx + half_rot] = __float2half(k1 * sin_val + k2 * cos_val);
             }
         } else if (head_offset < half_dim) {
             float k1 = __half2float(k_b[idx]);

@@ -26,10 +26,30 @@ class GGUFWeightLoader:
     existia entre pesos quantizados/F32 e kernels que assumiam FP16 puro.
     """
 
-    def __init__(self, gguf_path: str | Path, parser, tensor_mapping: dict):
+    def __init__(self, gguf_path: str | Path, parser, tensor_mapping: dict,
+                 raw_q4k: set | None = None, raw_q6k: set | None = None, raw_q8_0: set | None = None):
+        """
+        `raw_q4k`/`raw_q6k`/`raw_q8_0`: conjuntos de nomes de tensor JÁ
+        decididos como "cru na VRAM" (mesmos conjuntos que model.py registra
+        no executor via register_raw_*_weights). Quando None, cai no
+        comportamento antigo (chama is_raw_*_weight por tensor) -- mantido só
+        por compatibilidade, nenhum chamador atual depende disso.
+
+        Passar os conjuntos já prontos evita um bug real encontrado nesta
+        sessão: chamar `qwen_mapper.is_raw_q6k_weight` (restrito a
+        ffn_down/token_embd, pensado pro GGUF misto do Qwen2.5) direto aqui
+        ignorava a união feita em model.py para o Qwen3.5 (onde TODA matriz
+        grande é Q6_K, não só ffn_down/token_embd). Resultado: attn_qkv.weight
+        era alocado CRU (~10MB) pelo mapper mas o loader dequantizava pra FP16
+        (~25MB) e despejava esse tanto a mais no mesmo slot -- overflow real,
+        sobrescrevendo tensores vizinhos na VRAM.
+        """
         self.path = Path(gguf_path)
         self.parser = parser
         self.tensor_mapping = tensor_mapping
+        self.raw_q4k = raw_q4k
+        self.raw_q6k = raw_q6k
+        self.raw_q8_0 = raw_q8_0
 
     def load_all(self, hip_runtime) -> tuple[int, int]:
         """Mapeia o arquivo GGUF via mmap e copia cada tensor para seu ponteiro VRAM."""
@@ -64,8 +84,22 @@ class GGUFWeightLoader:
 
                     # Etapa C: pesos roteados ao gemv_q4k/gemv_q6k/gemv_q8_0
                     # ficam CRUS na VRAM (desquantização in-kernel). O resto
-                    # vai FP16.
-                    if is_raw_q4k_weight(name, t_info) or is_raw_q6k_weight(name, t_info) or is_raw_q8_0_weight(name, t_info):
+                    # vai FP16. Usa os conjuntos já unificados (se fornecidos)
+                    # em vez de rechamar is_raw_*_weight isoladamente -- ver
+                    # docstring do __init__.
+                    if self.raw_q4k is not None or self.raw_q6k is not None or self.raw_q8_0 is not None:
+                        is_raw = (
+                            (self.raw_q4k is not None and name in self.raw_q4k)
+                            or (self.raw_q6k is not None and name in self.raw_q6k)
+                            or (self.raw_q8_0 is not None and name in self.raw_q8_0)
+                        )
+                    else:
+                        is_raw = (
+                            is_raw_q4k_weight(name, t_info)
+                            or is_raw_q6k_weight(name, t_info)
+                            or is_raw_q8_0_weight(name, t_info)
+                        )
+                    if is_raw:
                         upload_bytes = bytes(raw_bytes)
                     else:
                         upload_bytes = to_fp16_bytes(raw_bytes, t_info['dtype'], n_elements)

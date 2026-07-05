@@ -16,8 +16,11 @@ class UIMsgShutdown:
 
 @dataclass
 class MotorMsgToken:
-
     text: str
+    # "answer" (padrão, retrocompatível) | "thinking" -- separa o
+    # raciocínio (dentro de <think>...</think>) da resposta final. Ver
+    # vte/core/thinking_scanner.py.
+    section: str = "answer"
 
 @dataclass
 class MotorMsgDone:

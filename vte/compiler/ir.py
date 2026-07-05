@@ -17,6 +17,26 @@ class NodeType(str, Enum):
     INPUT = "input"
     OUTPUT = "output"
     EMBEDDING = "embedding"
+    # Gated DeltaNet (Qwen3.5 "linear_attention" layers) -- recorrência
+    # linear com estado persistente, ver vte/compiler/qwen3_5_mapper.py e
+    # docs internas do plano em andamento. Isolado das arquiteturas
+    # existentes: nenhum node type acima é afetado por esta adição.
+    CAUSAL_CONV1D = "causal_conv1d"
+    LINEAR_ATTENTION = "linear_attention"
+    # RMSNorm + gate multiplicativo (Qwen3_5RMSNormGated:
+    # norm(x)*weight*silu(gate)) -- kernel isolado, não estende o RMSNORM
+    # comum usado por Qwen2.5/Granite.
+    RMSNORM_GATED = "rmsnorm_gated"
+    # Qwen3.5 full_attention: RMSNorm aplicado por-HEAD (não na linha
+    # inteira, ao contrário do RMSNORM comum) -- q_norm/k_norm reais do
+    # Qwen3.5Attention (modeling_qwen3_5.py), aplicados a Q/K logo após
+    # q_proj/k_proj e ANTES do RoPE. Isolado do RMSNORM comum.
+    PER_HEAD_RMSNORM = "per_head_rmsnorm"
+    # Qwen3.5 full_attention: gate sigmoide multiplicando a saída da
+    # atenção antes do o_proj (attn_output = attn_out * sigmoid(gate),
+    # onde `gate` vem da segunda metade do q_proj, mesmo padrão de split
+    # intercalado por-head que o mixed_qkv do Gated DeltaNet usa).
+    SIGMOID_GATE_MUL = "sigmoid_gate_mul"
 
 @dataclass
 class QuantizationInfo:

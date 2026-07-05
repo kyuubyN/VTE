@@ -37,6 +37,20 @@ SUPPORTED_ARCHITECTURES = {
         "size_max_key": "GRANITE_4_1_3B_SIZE_MAX",
         "hash_config_key": "GRANITE_4_1_3B_EXPECTED_HASH",
     },
+    "qwen35": {
+        # 24 camadas no total (6 full_attention + 18 linear_attention/Gated
+        # DeltaNet) -- block_count no GGUF conta TODAS, não só as de
+        # atenção completa (confirmado via gguf.GGUFReader real).
+        "block_count": 24,
+        # Contexto nativo real é 262144 (config.json:
+        # max_position_embeddings) -- maior que o do Granite, teto de
+        # sanidade generoso o bastante sem virar cheque em branco.
+        "max_context_length": 300_000,
+        "expected_filename": "Qwen3.5-2B-Q6_K.gguf",
+        "size_min_key": "QWEN35_2B_SIZE_MIN",
+        "size_max_key": "QWEN35_2B_SIZE_MAX",
+        "hash_config_key": "QWEN35_2B_EXPECTED_HASH",
+    },
 }
 
 

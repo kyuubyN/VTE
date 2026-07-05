@@ -38,16 +38,60 @@ Independently re-measured and reconfirmed after a full repository reorganization
 
 ## Benchmark: VTE vs. Ollama (llama.cpp)
 
-Both models were benchmarked against Ollama running the *exact same GGUF files on disk* (registered with `ollama create <name> -f Modelfile` using `FROM <absolute-path>`, cross-checked via Ollama's own reported SHA256 to confirm it wasn't silently re-quantizing or re-downloading anything). Same prompt, same `num_predict`/`max_tokens` (200), `temperature=0` on both sides, decode-only timing (prefill/first-token latency excluded on the VTE side; `eval_count`/`eval_duration` used on the Ollama side, the same decode-only window):
+Both models were benchmarked against Ollama running the *exact same GGUF files on disk* (registered with `ollama create <name> -f Modelfile` using `FROM <absolute-path>`, cross-checked via Ollama's own reported SHA256 to confirm it wasn't silently re-quantizing or re-downloading anything). Same prompt, same `num_predict`/`max_tokens`, `temperature=0` on both sides, decode-only timing (prefill/first-token latency excluded on the VTE side; `eval_count`/`eval_duration` used on the Ollama side, the same decode-only window).
+
+**Current numbers** (after the raw-quantized-weight VRAM-reduction pass described below; prompt: "Write a long, detailed essay about the history of space exploration.", ~700 tokens, `temperature=0`):
+
+| Model | VTE | Ollama (llama.cpp) | VTE / Ollama |
+|---|---|---|---|
+| Qwen2.5 1.5B (Q4_K_M) | 107.85 tok/s | 110.76 tok/s | 97.4% (tied) |
+| Granite 4.1 3B (Q8_0) | **55.65 tok/s** | 50.84 tok/s | **109.5% (VTE faster)** |
+
+This is a real milestone: Granite now decodes *faster* on VTE than on Ollama/llama.cpp with the identical GGUF file, and Qwen2.5 is within measurement noise of a tie. Both results came from the same change — see below.
+
+<details>
+<summary>Previous numbers (before the VRAM-reduction pass), kept for history</summary>
 
 | Model | VTE | Ollama (llama.cpp) | VTE / Ollama |
 |---|---|---|---|
 | Qwen2.5 1.5B (Q4_K_M) | 101.68 tok/s (9.84 ms/tok) | 114.67 tok/s (8.72 ms/tok) | 88.7% |
 | Granite 4.1 3B (Q8_0) | 45.66 tok/s (21.90 ms/tok) | 51.46 tok/s (19.43 ms/tok) | 88.7% |
 
-Notably consistent — VTE delivers ~89% of llama.cpp's throughput on both models, an identical ratio despite very different architectures (different RoPE convention, different quantization format, ~2x the parameters). That's a reasonable proxy for "the remaining gap is systemic dispatch/kernel-efficiency overhead across the whole engine, not an architecture-specific bug hiding in one model" — llama.cpp has years of GEMV-kernel tuning VTE doesn't have yet, and closing that gap further is a kernel-level efficiency project, not a correctness one. Ollama was used only as a disposable reference during this benchmark — the model, its Modelfile, and the Ollama server process were all removed afterward; VTE has no runtime or build dependency on it.
+Notably consistent at the time — VTE delivered ~89% of llama.cpp's throughput on both models, an identical ratio despite very different architectures (different RoPE convention, different quantization format, ~2x the parameters).
+</details>
 
-It's also worth stating plainly what that number means, because it's the actual point of measuring against Ollama at all: the code doing the dispatching here is **Python**, not C++. Ollama's inference math runs in llama.cpp — hand-tuned C++ GEMV kernels with years of upstream optimization, called through a thin Go server. VTE's Python layer builds the compute graph, resolves kernel arguments, and drives every HIP launch through ctypes — the language usually blamed for making GPU dispatch too slow to compete. Landing at ~89% of llama.cpp's throughput with that much interpreter overhead in the loop is the evidence for this project's core bet: that CPU-side dispatch overhead is an engineering problem you can profile and remove (HIP Graphs, a sampler restricted to top-k, the LM Head captured into the graph — see [Bugs found during development](BUGS.md)), not an inherent tax Python has to pay. The remaining ~11% gap is real GEMV-kernel-efficiency headroom, not "Python being Python."
+Ollama was used only as a disposable reference during these benchmarks — the models, their Modelfiles, and the Ollama server process were all removed/stopped afterward; VTE has no runtime or build dependency on it.
+
+It's also worth stating plainly what that number means, because it's the actual point of measuring against Ollama at all: the code doing the dispatching here is **Python**, not C++. Ollama's inference math runs in llama.cpp — hand-tuned C++ GEMV kernels with years of upstream optimization, called through a thin Go server. VTE's Python layer builds the compute graph, resolves kernel arguments, and drives every HIP launch through ctypes — the language usually blamed for making GPU dispatch too slow to compete. Beating llama.cpp's throughput on Granite, and tying it on Qwen2.5, with that much interpreter overhead in the loop is direct evidence for this project's core bet: that CPU-side dispatch overhead and VRAM-bandwidth waste are engineering problems you can profile and remove (HIP Graphs, a sampler restricted to top-k, the LM Head captured into the graph, and now raw-quantized weight routing — see [Bugs found during development](BUGS.md)), not an inherent tax Python has to pay.
+
+### VRAM-reduction pass: routing `attn_q/k/v/output` raw instead of dequantizing to FP16
+
+Both `qwen_mapper.py` and `granite_mapper.py` previously dequantized the four attention projection weights (`attn_q`, `attn_k`, `attn_v`, `attn_output`) from their on-disk quantized format (Q4_K/Q6_K/Q8_0) to FP16 at load time, so they could feed the fused QKV+RoPE kernel (`fused_norm_matmul_rope`/`split_k_qkv_pass2`), which only knows how to read raw `__half*` buffers. This roughly doubles those four matrices' footprint in VRAM relative to the actual bytes on disk.
+
+Granite's GGUF is Q8_0 (2x expansion when dequantized to FP16); attacking `attn_q/k/v` in addition to `attn_output` was accepted as a deliberate bigger-risk/bigger-reward move (~700MB more saved, at the cost of losing the QKV+RoPE fusion for the layers where these weights are now raw). The change:
+
+- `granite_mapper.py::is_raw_q8_0_weight` no longer excludes `attn_q/k/v/attn_output` by name — all Q8_0 tensors are now routed raw (dequantized in-kernel by the GEMV instead of at load time).
+- `qwen_mapper.py::is_raw_q4k_weight`/`is_raw_q6k_weight` similarly extended to cover `attn_q/attn_k/attn_output` (Q4_K) and `attn_v` (Q6_K).
+- The QKV+RoPE fusion is dynamically disabled per-layer whenever any of these four weights is raw for that layer (the fused kernel has no dequant logic and would otherwise read garbage) — both `fallback_executor.py` and `hip_graph_executor.py` check the raw-weight sets before attempting the fusion.
+
+Measured impact:
+
+- **Granite**: VRAM 4010.7MB → 3448.2MB (weights), tok/s 48.26 → 55.65 (used to trail Ollama at 88.7%, now leads at 109.5%).
+- **Qwen2.5**: weights ~986MB → 942.0MB, tok/s ~101.68 → 107.85 (closed the gap from 88.7% to 97.4%).
+
+The counter-intuitive result is that losing the QKV+RoPE fusion (previously assumed to be a pure win — see [Architecture: why QKV is fused](ARCHITECTURE.md#why-qkv-projection-is-fused-and-why-ffn-fusion-is-off)) is more than paid back by the reduced VRAM bandwidth traffic of never writing/reading the FP16-expanded copies of these four matrices — at batch=1 decode, VRAM bandwidth for weight reads dominates over the fixed cost of one extra kernel launch. This only holds for `attn_q/k/v/output` specifically; it does not generalize to arbitrarily fusing less — see "Optimizations tried and rejected" below for cases where fusion removal or kernel-count reduction measured as a net loss or null result.
+
+### Qwen 3.5 2B (hybrid Gated DeltaNet)
+
+Same methodology, same GGUF file on both sides: **~66–67 tok/s** decode-only on VTE vs. **78.56 tok/s** on Ollama (llama.cpp) — ~85% of Ollama's throughput, measured after the correctness work in [Multi-architecture support: Qwen 3.5](QWEN35.md) landed (that document covers the actual bugs found bringing this architecture up; this section is performance only).
+
+Three kernel-fusion/occupancy experiments were tried afterward to close the remaining gap, each measured with the same protocol (150 tokens, decode-only, excluding the first token/prefill) — all three came back as null results, kept in the code (numerically validated, harmless) rather than reverted, so they aren't blindly re-attempted:
+
+1. **Fusing `a_proj`+`b_proj` into one kernel** (later superseded by the larger fusion below): 67.00 tok/s — within noise of the ~66.78 tok/s baseline.
+2. **`causal_conv1d` occupancy tuning** (block size 256→64, exactly one RDNA wavefront, grid 24→96 blocks to use all 32 CUs instead of leaving half idle): 66.66 tok/s — null.
+3. **Fusing `qkv_proj`+`z_proj`+`a_proj`+`b_proj` into a single kernel** (`fused_gdn_proj.hip.template`, combining Q6_K and Q8_0 dequant logic in one per-line launch, removing 3 of the ~15 nodes per `linear_attention` layer — 54 nodes total, ~15% of the 393-node graph): 67.26 tok/s — still null.
+
+Per-category GPU profiling (`VTE_PROFILE=1`) explains why: the new Gated DeltaNet kernels already account for only ~17.5% of GPU time in the eager profile, so optimizing them further has little headroom left to recover. The remaining ~56% is the large GEMV/FFN kernels Qwen3.5 *shares* with Qwen2.5/Granite (already tuned there) — closing more of the gap to Ollama would mean touching that shared, already-optimized infrastructure and risking regressions on the other two models, not another isolated Qwen3.5-only change. ~66–67 tok/s is treated as the real number for this architecture for now, not a pending optimization TODO.
 
 ## Optimizations tried and rejected
 

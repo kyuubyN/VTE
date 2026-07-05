@@ -12,6 +12,7 @@ from vte.core.ipc import (
 )
 from vte.core.model import VTEModel
 from vte.core.gpu_monitor import GPUMonitor
+from vte.core.thinking_scanner import ThinkingSectionScanner
 from vte.bridge.logger import get_logger
 
 logger = get_logger("VTE.Motor")
@@ -57,6 +58,10 @@ class InferenceEngine:
         self.token_buffer = ""
         self.last_flush_time = 0.0
         self.flush_interval = 0.050
+        # Recriado a cada generate() (linha abaixo) -- separa texto
+        # "thinking" (dentro de <think>...</think>) do resto, sobre o
+        # stream decodificado. Ver vte/core/thinking_scanner.py.
+        self._thinking_scanner = ThinkingSectionScanner()
 
         # Métricas reais de throughput (Fase UI): atualizadas token a token
         # dentro de generate(), lidas pela thread de telemetria. EMA em vez
@@ -223,7 +228,14 @@ class InferenceEngine:
 
         now = time.perf_counter()
         if force or (now - self.last_flush_time >= self.flush_interval):
-            self._send(MotorMsgToken(self.token_buffer))
+            chunks = self._thinking_scanner.feed(self.token_buffer)
+            if force:
+                # Fim da geração: libera qualquer cauda retida esperando
+                # uma tag <think>/</think> completar -- sem isto o último
+                # pedacinho de texto (ex.: até 6 chars) nunca seria enviado.
+                chunks += self._thinking_scanner.flush()
+            for chunk in chunks:
+                self._send(MotorMsgToken(text=chunk.text, section=chunk.section))
             self.token_buffer = ""
             self.last_flush_time = now
             snapshot = self._tps_snapshot_msg()
@@ -239,6 +251,10 @@ class InferenceEngine:
         self.last_ms_per_token = 0.0
         last_token_time = None
         cancelled = False
+        # Estado novo por geração -- uma geração cancelada no meio de um
+        # bloco <think> não pode deixar a próxima já nascendo "dentro do
+        # pensamento".
+        self._thinking_scanner = ThinkingSectionScanner()
 
         try:
             # A UI é um chat: formata a mensagem no chat template do modelo
@@ -247,7 +263,12 @@ class InferenceEngine:
             # formato certo do seu próprio modelo) antes de gerar. Sem isto
             # o modelo faz completion de texto cru em vez de responder como
             # assistente.
-            chat_prompt = self.model.tokenizer.apply_chat_template(prompt)
+            # enable_thinking=True: sem efeito nos tokenizers atuais (nem
+            # Qwen2.5 nem Granite têm um bloco <think> condicional a essa
+            # flag no chat template deles) -- fixo em True só para deixar o
+            # hook pronto para um modelo que de fato o use (ver
+            # ThinkingSectionScanner e apply_chat_template em tokenizer.py).
+            chat_prompt = self.model.tokenizer.apply_chat_template(prompt, enable_thinking=True)
             generator = self.model.generate(chat_prompt, max_tokens=max_tokens)
 
             for word in generator:

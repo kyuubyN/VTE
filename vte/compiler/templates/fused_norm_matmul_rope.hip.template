@@ -45,8 +45,11 @@ extern "C" __global__ void fused_norm_matmul_rope_kernel(
     float eps,
     const int* __restrict__ kv_cache_offset_ptr,
     int apply_rope,
-    int rope_type   // 0 = NEOX/split-half (Qwen2); 1 = NORM/intercalado
-                     // (Granite) -- ver split_k_qkv_pass2.hip.template.
+    int rope_type,  // 0 = NEOX/split-half (Qwen2); 1 = NORM/intercalado
+                     // (Granite); 2 = NEOX parcial (Qwen3.5) -- ver
+                     // split_k_qkv_pass2.hip.template.
+    int rotary_dim  // canais rotacionados quando rope_type==2 (ignorado nos
+                    // outros dois tipos) -- ver split_k_qkv_pass2.hip.template.
 ) {
     __shared__ __align__(16) __half x_sh[FUSED_MAX_HIDDEN];  // 16B aligned p/ uint4
     __shared__ float red[256];
@@ -155,6 +158,23 @@ extern "C" __global__ void fused_norm_matmul_rope_kernel(
                     float x0 = raw_out[local - 1];
                     float x1 = raw_out[local];
                     output[n] = __float2half(x0 * s + x1 * c);
+                }
+            } else if (rope_type == 2) {
+                int half_rot = rotary_dim / 2;
+                if (local < half_rot) {
+                    float v1 = raw_out[local];
+                    float v2 = raw_out[local + half_rot];
+                    float c = __half2float(cos_cache[pos * rotary_dim + local]);
+                    float s = __half2float(sin_cache[pos * rotary_dim + local]);
+                    output[n] = __float2half(v1 * c - v2 * s);
+                } else if (local < rotary_dim) {
+                    float v1 = raw_out[local - half_rot];
+                    float v2 = raw_out[local];
+                    float c = __half2float(cos_cache[pos * rotary_dim + (local - half_rot)]);
+                    float s = __half2float(sin_cache[pos * rotary_dim + (local - half_rot)]);
+                    output[n] = __float2half(v1 * s + v2 * c);
+                } else {
+                    output[n] = __float2half(raw_out[local]);
                 }
             } else {
                 int half = head_dim / 2;

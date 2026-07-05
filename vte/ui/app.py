@@ -299,6 +299,16 @@ class VTEApp:
         self.pipe_conn: Connection = None
         self.current_reply: ft.Text = None
         self.typing_indicator: ft.ProgressRing = None
+        # Seção de "pensamento" (dentro de <think>...</think>, ver
+        # vte/core/thinking_scanner.py) do turno EM ANDAMENTO -- refeitos a
+        # cada _handle_submit(), igual current_reply/typing_indicator.
+        # Continuam None/invisíveis para uma conversa comum (Qwen2.5/
+        # Granite hoje): só ganham conteúdo/visibilidade se um
+        # MotorMsgToken com section="thinking" realmente chegar.
+        self.current_thinking: ft.Text = None
+        self.thinking_label: ft.Text = None
+        self.thinking_toggle_btn: ft.IconButton = None
+        self.thinking_body: ft.Container = None
         self.log_lines = []
         # Estado "lógico" (não a string exibida) por trás de peças de UI
         # dependentes de idioma, pra poder re-renderizar tudo no idioma novo
@@ -865,7 +875,7 @@ class VTEApp:
             self.page.update()
 
         elif isinstance(msg, MotorMsgToken):
-            self._append_token(msg.text)
+            self._append_token(msg.text, msg.section)
 
         elif isinstance(msg, MotorMsgDone):
             self._end_generation()
@@ -916,9 +926,43 @@ class VTEApp:
         # estar vazio (primeiro token real).
         self.typing_indicator = ft.ProgressRing(width=14, height=14, stroke_width=2, color=self.palette.accent_green)
         self.current_reply = ft.Text("", color=self.palette.accent_green, selectable=True)
+
+        # Bloco de "pensamento", recolhível -- só fica visível se o modelo
+        # atual realmente emitir um MotorMsgToken(section="thinking")
+        # (_append_token cuida disso). Toggle usa closures (não `self.*`)
+        # para que o botão de UMA bolha antiga continue expandindo/
+        # recolhendo só a SI MESMA depois que uma bolha nova for criada por
+        # cima (self.thinking_body etc. só rastreiam o turno em andamento).
+        self.current_thinking = ft.Text("", size=12, italic=True, selectable=True)
+        thinking_body = ft.Container(
+            content=self.current_thinking,
+            padding=ft.Padding(left=4, top=2, right=0, bottom=4),
+        )
+        self.thinking_label = ft.Text("🧠 Pensando...", size=11, weight=ft.FontWeight.BOLD, visible=False)
+        self.thinking_toggle_btn = ft.IconButton(
+            icon=ft.Icons.EXPAND_LESS, icon_size=16, visible=False,
+            tooltip="Mostrar/ocultar raciocínio",
+        )
+        thinking_state = {"expanded": True}
+
+        def _toggle_thinking(e, _body=thinking_body, _btn=self.thinking_toggle_btn, _state=thinking_state):
+            _state["expanded"] = not _state["expanded"]
+            _body.visible = _state["expanded"]
+            _btn.icon = ft.Icons.EXPAND_LESS if _state["expanded"] else ft.Icons.EXPAND_MORE
+            _body.update()
+            _btn.update()
+
+        self.thinking_toggle_btn.on_click = _toggle_thinking
+        self.thinking_body = thinking_body
+
+        thinking_header = ft.Row([self.thinking_toggle_btn, self.thinking_label], spacing=2, tight=True)
+        thinking_section = ft.Column([thinking_header, self.thinking_body], spacing=0, tight=True)
         reply_row = ft.Row([self.typing_indicator, self.current_reply], spacing=8, tight=True)
+        reply_content = ft.Column([thinking_section, reply_row], spacing=6, tight=True)
+
         self.chat_list.controls.append(self._make_bubble(
-            reply_row, is_user=False, text_controls=[self.current_reply, self.typing_indicator]
+            reply_content, is_user=False,
+            text_controls=[self.current_reply, self.typing_indicator, self.current_thinking, self.thinking_label]
         ))
         self.page.update()
         try:
@@ -995,14 +1039,33 @@ class VTEApp:
             except (BrokenPipeError, OSError, EOFError):
                 self._end_generation()
 
-    def _append_token(self, token: str):
-        if self.current_reply:
-            if self.typing_indicator and self.typing_indicator.visible:
-                self.typing_indicator.visible = False
-                self.typing_indicator.update()
-            self.current_reply.value += token
-            self._fit_bubble_text(self.current_reply)
-            self.current_reply.update()
+    def _append_token(self, token: str, section: str = "answer"):
+        # Primeiro token de QUALQUER seção esconde o spinner de "digitando"
+        # -- ele existe só para cobrir o prefill, antes do modelo ter
+        # produzido qualquer coisa (pensamento ou resposta).
+        if self.typing_indicator and self.typing_indicator.visible:
+            self.typing_indicator.visible = False
+            self.typing_indicator.update()
+
+        if section == "thinking":
+            if not self.current_thinking:
+                return
+            if self.thinking_label and not self.thinking_label.visible:
+                # 1o token "thinking" desta geração: revela o cabeçalho
+                # recolhível -- para um modelo que nunca usa <think>
+                # (Qwen2.5/Granite hoje, sem prompt instruído), isto nunca
+                # dispara e a bolha fica idêntica à de antes desta mudança.
+                self.thinking_label.visible = True
+                self.thinking_toggle_btn.visible = True
+                self.thinking_label.update()
+                self.thinking_toggle_btn.update()
+            self.current_thinking.value += token
+            self.current_thinking.update()
+        else:
+            if self.current_reply:
+                self.current_reply.value += token
+                self._fit_bubble_text(self.current_reply)
+                self.current_reply.update()
 
     def _end_generation(self):
         self.input_field.disabled = False
@@ -1016,6 +1079,10 @@ class VTEApp:
             self.typing_indicator.visible = False
         self.current_reply = None
         self.typing_indicator = None
+        self.current_thinking = None
+        self.thinking_label = None
+        self.thinking_toggle_btn = None
+        self.thinking_body = None
         self.page.update()
 
     # ------------------------------------------------------------------
