@@ -688,6 +688,14 @@ class Qwen3_5Tokenizer:
         """Decodifica IDs de token de volta para texto UTF-8."""
         return self.decode_bytes(token_ids).decode("utf-8", errors="replace")
 
+    DEFAULT_SYSTEM_PROMPT = (
+        "You are Qwen, created by Alibaba Cloud. You are a helpful assistant. "
+        "Always reply in the same language the user's message is written in "
+        "(e.g. reply in Portuguese to a Portuguese message, in Spanish to a "
+        "Spanish message) -- never switch to English unless the user wrote in "
+        "English."
+    )
+
     def apply_chat_template(self, user_message: str, system: str = None, enable_thinking: bool = False) -> str:
         """Renderiza o Jinja2 real embutido em `tokenizer.chat_template` do
         GGUF -- mesmo mecanismo do GraniteTokenizer, mas o template do
@@ -702,9 +710,8 @@ class Qwen3_5Tokenizer:
                 "Chat template do Qwen3.5 não carregado do GGUF (tokenizer.chat_template ausente)."
             )
 
-        messages = [{"role": "user", "content": user_message}]
-        if system is not None:
-            messages.insert(0, {"role": "system", "content": system})
+        system = system if system is not None else self.DEFAULT_SYSTEM_PROMPT
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user_message}]
 
         env = Environment(trim_blocks=True, lstrip_blocks=True)
         env.filters["tojson"] = json.dumps

@@ -933,12 +933,13 @@ class VTEApp:
         # para que o botão de UMA bolha antiga continue expandindo/
         # recolhendo só a SI MESMA depois que uma bolha nova for criada por
         # cima (self.thinking_body etc. só rastreiam o turno em andamento).
-        self.current_thinking = ft.Text("", size=12, italic=True, selectable=True)
+        self.current_thinking = ft.Text("", size=12, italic=True, selectable=True, color=None)
         thinking_body = ft.Container(
             content=self.current_thinking,
-            padding=ft.Padding(left=4, top=2, right=0, bottom=4),
+            padding=ft.Padding(left=8, top=2, right=0, bottom=4),
+            expand=True,
         )
-        self.thinking_label = ft.Text("🧠 Pensando...", size=11, weight=ft.FontWeight.BOLD, visible=False)
+        self.thinking_label = ft.Text("Raciocínio", size=11, weight=ft.FontWeight.BOLD, visible=False)
         self.thinking_toggle_btn = ft.IconButton(
             icon=ft.Icons.EXPAND_LESS, icon_size=16, visible=False,
             tooltip="Mostrar/ocultar raciocínio",

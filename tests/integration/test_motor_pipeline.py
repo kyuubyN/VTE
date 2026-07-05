@@ -19,7 +19,7 @@ def test_inference_pipeline_structural():
     class MockTokenizer:
         # O motor formata a mensagem no chat template antes de gerar; o mock
         # só precisa devolver algo (passthrough basta para o teste estrutural).
-        def apply_chat_template(self, user_message, system=None):
+        def apply_chat_template(self, user_message, system=None, enable_thinking=False):
             return user_message
 
     class MockModel:

@@ -46,6 +46,7 @@ Both models were benchmarked against Ollama running the *exact same GGUF files o
 |---|---|---|---|
 | Qwen2.5 1.5B (Q4_K_M) | 107.85 tok/s | 110.76 tok/s | 97.4% (tied) |
 | Granite 4.1 3B (Q8_0) | **55.65 tok/s** | 50.84 tok/s | **109.5% (VTE faster)** |
+| Qwen3.5 2B (Q6_K) | 69.00 tok/s | 77.00 tok/s | 89.6% |
 
 This is a real milestone: Granite now decodes *faster* on VTE than on Ollama/llama.cpp with the identical GGUF file, and Qwen2.5 is within measurement noise of a tie. Both results came from the same change — see below.
 
@@ -83,7 +84,7 @@ The counter-intuitive result is that losing the QKV+RoPE fusion (previously assu
 
 ### Qwen 3.5 2B (hybrid Gated DeltaNet)
 
-Same methodology, same GGUF file on both sides: **~66–67 tok/s** decode-only on VTE vs. **78.56 tok/s** on Ollama (llama.cpp) — ~85% of Ollama's throughput, measured after the correctness work in [Multi-architecture support: Qwen 3.5](QWEN35.md) landed (that document covers the actual bugs found bringing this architecture up; this section is performance only).
+Same methodology, same GGUF file on both sides: **~69 tok/s** decode-only on VTE vs. **77 tok/s** on Ollama (llama.cpp) — ~89.6% of Ollama's throughput, measured after the correctness work in [Multi-architecture support: Qwen 3.5](QWEN35.md) landed (that document covers the actual bugs found bringing this architecture up; this section is performance only).
 
 Three kernel-fusion/occupancy experiments were tried afterward to close the remaining gap, each measured with the same protocol (150 tokens, decode-only, excluding the first token/prefill) — all three came back as null results, kept in the code (numerically validated, harmless) rather than reverted, so they aren't blindly re-attempted:
 
@@ -91,7 +92,7 @@ Three kernel-fusion/occupancy experiments were tried afterward to close the rema
 2. **`causal_conv1d` occupancy tuning** (block size 256→64, exactly one RDNA wavefront, grid 24→96 blocks to use all 32 CUs instead of leaving half idle): 66.66 tok/s — null.
 3. **Fusing `qkv_proj`+`z_proj`+`a_proj`+`b_proj` into a single kernel** (`fused_gdn_proj.hip.template`, combining Q6_K and Q8_0 dequant logic in one per-line launch, removing 3 of the ~15 nodes per `linear_attention` layer — 54 nodes total, ~15% of the 393-node graph): 67.26 tok/s — still null.
 
-Per-category GPU profiling (`VTE_PROFILE=1`) explains why: the new Gated DeltaNet kernels already account for only ~17.5% of GPU time in the eager profile, so optimizing them further has little headroom left to recover. The remaining ~56% is the large GEMV/FFN kernels Qwen3.5 *shares* with Qwen2.5/Granite (already tuned there) — closing more of the gap to Ollama would mean touching that shared, already-optimized infrastructure and risking regressions on the other two models, not another isolated Qwen3.5-only change. ~66–67 tok/s is treated as the real number for this architecture for now, not a pending optimization TODO.
+Per-category GPU profiling (`VTE_PROFILE=1`) explains why: the new Gated DeltaNet kernels already account for only ~17.5% of GPU time in the eager profile, so optimizing them further has little headroom left to recover. The remaining ~56% is the large GEMV/FFN kernels Qwen3.5 *shares* with Qwen2.5/Granite (already tuned there) — closing more of the gap to Ollama would mean touching that shared, already-optimized infrastructure and risking regressions on the other two models, not another isolated Qwen3.5-only change. ~69 tok/s is treated as the real number for this architecture for now, not a pending optimization TODO.
 
 ## Optimizations tried and rejected
 

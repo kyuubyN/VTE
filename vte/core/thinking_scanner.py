@@ -39,9 +39,9 @@ class ThinkingSectionScanner:
     completar). flush() força a saída de qualquer texto retido -- chamar
     no fim da geração para não perder o resto do buffer."""
 
-    def __init__(self):
-        self._in_thinking = False
-        self._pending = ""  # cauda retida (pode ser início de tag parcial)
+    def __init__(self, start_in_thinking: bool = False):
+        self._in_thinking = start_in_thinking
+        self._pending = ""
 
     def feed(self, chunk: str) -> list:
         text = self._pending + chunk

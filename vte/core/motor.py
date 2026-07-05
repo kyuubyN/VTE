@@ -269,6 +269,8 @@ class InferenceEngine:
             # hook pronto para um modelo que de fato o use (ver
             # ThinkingSectionScanner e apply_chat_template em tokenizer.py).
             chat_prompt = self.model.tokenizer.apply_chat_template(prompt, enable_thinking=True)
+            if chat_prompt.strip().endswith("<think>"):
+                self._thinking_scanner = ThinkingSectionScanner(start_in_thinking=True)
             generator = self.model.generate(chat_prompt, max_tokens=max_tokens)
 
             for word in generator:
