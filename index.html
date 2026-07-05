@@ -289,13 +289,25 @@
           <i class="on"></i><i></i><i></i><i></i><i></i>
         </div>
 
-        <div class="gpu-info">
+        <div class="gpu-info" id="gpu-info-card">
           <div class="gpu-swap" id="gpu-swap">
             <div class="gpu-step" id="gpu-step">01 / 05 · RX 7600</div>
             <h3 id="gpu-title">RDNA3 · gfx1102 · 8 GB</h3>
             <p id="gpu-desc">A placa "gamer" onde tudo foi construído e medido. 32 Compute Units, 8 GB de GDDR6, dividida com o resto do desktop.</p>
           </div>
         </div>
+
+        <!-- Seta conectora do card ao componente ativo -->
+        <svg id="gpu-connector" style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible;opacity:0;transition:opacity 0.4s ease" aria-hidden="true">
+          <defs>
+            <marker id="arr" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L6,3 z" fill="#32f08c" opacity="0.85"/>
+            </marker>
+          </defs>
+          <path id="connector-line" fill="none" stroke="#32f08c" stroke-width="1.5" stroke-dasharray="4 3" opacity="0.7" marker-end="url(#arr)"/>
+          <circle id="connector-dot" r="4" fill="#32f08c" opacity="0.9"/>
+          <circle id="connector-pulse" r="4" fill="none" stroke="#32f08c" stroke-width="1.5" opacity="0"/>
+        </svg>
 
         <div class="gpu-hint" id="gpu-hint">
           <span class="down">↓</span> 

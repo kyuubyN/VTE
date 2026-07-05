@@ -27,28 +27,28 @@
       desc: "A placa de consumidor onde tudo foi construído e medido. 32 Compute Units, 8 GB de GDDR6, dividida com o resto do desktop. Role para ver cada peça com que o VTE conversa.",
     },
     {
+      key: "sensors",
+      step: "02 / 05 · ADL (Sensores)",
+      title: "ADL · duty-cycle",
+      desc: "A temperatura real vem da ADL (atiadlxx.dll). Um limitador de duty-cycle segura a utilização perto de 95% pra não travar o resto do desktop durante gerações longas.",
+    },
+    {
       key: "die",
-      step: "02 / 05 · GPU die",
+      step: "03 / 05 · Chipset / Die",
       title: "Navi 33 · 32 Compute Units",
       desc: "Onde os kernels HIP gerados e compilados em runtime realmente rodam. O VTE preenche os 32 CUs com fusão Split-K em vez de deixar a maioria ociosa.",
     },
     {
       key: "vram",
-      step: "03 / 05 · VRAM",
+      step: "04 / 05 · VRAM",
       title: "8 GB GDDR6",
       desc: "O SlabAllocator faz um único hipMalloc gigante e sub-aloca tudo — pesos, KV cache, arena de ativação — dentro dele, sem fragmentação durante a geração.",
     },
     {
       key: "pcie",
-      step: "04 / 05 · PCIe",
+      step: "05 / 05 · BAR (PCIe)",
       title: "Barramento host ↔ device",
       desc: "Uploads de pesos são fatiados em blocos ≤16 MB. Um hipMemcpy gigante de uma vez dispararia o TDR do WDDM — o VTE dá janelas ao driver entre as transferências.",
-    },
-    {
-      key: "sensors",
-      step: "05 / 05 · Sensores & cooler",
-      title: "ADL · duty-cycle",
-      desc: "A temperatura real vem da ADL (atiadlxx.dll). Um limitador de duty-cycle segura a utilização perto de 95% pra não travar o resto do desktop durante gerações longas.",
     },
   ];
 
@@ -65,7 +65,7 @@
   // usa isso pra recuar a câmera em telas mais estreitas, preservando a mesma largura
   // visível em vez da mesma distância.
   var BASE_HALF_WIDTH = BASE_DIST * Math.tan((camera.fov * Math.PI) / 360) * 1.6;
-  camera.position.set(0, 2.2, BASE_DIST);
+  camera.position.set(0, 0.4, BASE_DIST);
   // A câmera nunca teve um lookAt(): sem ele, olha reto no eixo -Z (nível,
   // não inclinada pra baixo), então com a câmera em y=2.2 e a placa toda
   // perto de y=0, a placa inteira cai na metade DE BAIXO do frame -- é por
@@ -81,8 +81,8 @@
   // um deslocamento proporcional à distância vezes tan(TILT_UP_RAD)),
   // mantendo o mesmo deslocamento ANGULAR -- e portanto a mesma posição
   // relativa na tela -- em qualquer aspect ratio. Ver resize().
-  var BOARD_CENTER_Y = 0.55;
-  var TILT_UP_RAD = (10 * Math.PI) / 180;
+  var BOARD_CENTER_Y = -0.4; // GPU mais centrada/baixa na tela
+  var TILT_UP_RAD = (2 * Math.PI) / 180;
   function aimCamera(dist) {
     camera.lookAt(0, BOARD_CENTER_Y - dist * Math.tan(TILT_UP_RAD), 0);
   }
@@ -92,6 +92,7 @@
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 
   var card = new THREE.Group();
+  card.position.y = -0.7; // desloca o grupo todo para baixo
   scene.add(card);
 
   // Materiais reutilizáveis
@@ -142,20 +143,48 @@
   tg.setAttribute("position", new THREE.Float32BufferAttribute(tpts, 3));
   pcb.add(new THREE.LineSegments(tg, traceMat));
 
-  // ---- GPU die (centro) + grade de 32 CUs ----
-  var dieGeo = new THREE.BoxGeometry(1.2, 0.2, 1.2);
-  var die = new THREE.Mesh(dieGeo, mat(0x0a0b0c, { metal: 0.9, rough: 0.3 }));
-  addPart(die, new V(-0.4, 0.18, 0), new V(0, 1, 0), "die");
-  die.add(edgesOf(dieGeo, GREEN, 0.5));
-  // mini grade 8x4 de CUs no topo do die
+  // ---- GPU die (Navi 33 package) ----
+  var die = new THREE.Group();
+  
+  // 1. Substrato prata (base)
+  var pkgBaseGeo = new THREE.BoxGeometry(1.8, 0.04, 1.8);
+  var pkgBase = new THREE.Mesh(pkgBaseGeo, mat(0x9fa4a9, { metal: 0.4, rough: 0.6 }));
+  pkgBase.position.y = 0.02;
+  die.add(pkgBase);
+
+  // 2. Interposer verde escuro
+  var interposerGeo = new THREE.BoxGeometry(1.2, 0.02, 1.2);
+  var interposer = new THREE.Mesh(interposerGeo, mat(0x0f2a1a, { metal: 0.2, rough: 0.8 }));
+  interposer.position.y = 0.05;
+  die.add(interposer);
+
+  // 3. Silicon die (cristal central girado 45 graus)
+  var siliconGeo = new THREE.BoxGeometry(0.75, 0.04, 0.75);
+  var siliconMat = mat(0x3a4b5c, { metal: 0.9, rough: 0.15 });
+  // Passamos emissive para o material do silicon caso a lógica de destaque precise interagir,
+  // mas o brilho principal virá dos CUs.
+  siliconMat.emissive.setHex(0x000000); 
+  var silicon = new THREE.Mesh(siliconGeo, siliconMat);
+  silicon.position.y = 0.08;
+  silicon.rotation.y = Math.PI / 4; // rotaciona 45 graus (forma de diamante)
+  die.add(silicon);
+
+  // Adicionamos a borda verde do cristal para destaque
+  silicon.add(edgesOf(siliconGeo, GREEN, 0.4));
+
+  // O grupo "die" inteiro deve ficar grudado na PCB ao explodir
+  addPart(die, new V(-0.4, 0.07, 0), new V(0, 0, 0), "die");
+
+  // mini grade 8x4 de CUs no topo do cristal de silício
   var cuCells = [];
-  var cuGeo = new THREE.BoxGeometry(0.1, 0.04, 0.1);
+  var cuGeo = new THREE.BoxGeometry(0.06, 0.02, 0.06);
   for (var r = 0; r < 4; r++) {
     for (var c = 0; c < 8; c++) {
-      var cu = new THREE.Mesh(cuGeo, mat(0x0d1a14, { emissive: GREEN, ei: 0.1 }));
-      cu.position.set(-0.5 + c * 0.14, 0.13, -0.28 + r * 0.14);
+      var cu = new THREE.Mesh(cuGeo, mat(0x112218, { emissive: GREEN, ei: 0.1 }));
+      // As coordenadas são relativas ao silicon (que já está girado 45 graus)
+      cu.position.set(-0.28 + c * 0.08, 0.025, -0.12 + r * 0.08);
       cu.userData.phase = Math.random() * Math.PI * 2;
-      die.add(cu);
+      silicon.add(cu);
       cuCells.push(cu);
     }
   }
@@ -182,9 +211,9 @@
   var pcieGeo = new THREE.BoxGeometry(3.2, 0.1, 0.5);
   var pcie = new THREE.Mesh(pcieGeo, mat(0x1a2f22, { emissive: GREEN, ei: 0.15, metal: 0.85, rough: 0.35 }));
   addPart(pcie, new V(-0.8, -0.02, 1.65), new V(0, -0.6, 1), "pcie", 0.15);
-  // "dentes" dos contatos
+  // "dentes" dos contatos (z=0.52 para evitar z-fighting com o conector z=0.5)
   for (var t = 0; t < 14; t++) {
-    var tooth = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.12, 0.5), mat(0x244a35, { emissive: GREEN, ei: 0.25 }));
+    var tooth = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.12, 0.52), mat(0x244a35, { emissive: GREEN, ei: 0.25 }));
     tooth.position.set(-1.45 + t * 0.22, 0.02, 0);
     pcie.add(tooth);
   }
@@ -206,13 +235,30 @@
   var fanPos = [new V(-1.7, 0.28, 0), new V(1.7, 0.28, 0)];
   for (var f = 0; f < 2; f++) {
     var fan = new THREE.Mesh(fanGeo, mat(0x0d0f11, { metal: 0.5 }));
-    // pás
-    for (var b = 0; b < 7; b++) {
-      var blade = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.03, 0.16), mat(0x141a17, { emissive: DEEP, ei: 0.2 }));
-      blade.position.y = 0.06;
-      blade.rotation.y = (b / 7) * Math.PI * 2;
-      blade.position.x = Math.cos(blade.rotation.y) * 0.45;
-      blade.position.z = Math.sin(blade.rotation.y) * 0.45;
+    // pás (curvas e varridas)
+    var bladeCount = 9;
+    var S = 0.95; // Escala para caber no cilindro de raio 1.1
+    for (var b = 0; b < bladeCount; b++) {
+      var angle = (b / bladeCount) * Math.PI * 2;
+      
+      var bs = new THREE.Shape();
+      bs.moveTo(0, 0.15 * S);
+      // Borda de ataque
+      bs.bezierCurveTo(0.15 * S, 0.40 * S, 0.50 * S, 0.46 * S, 0.62 * S, 0.72 * S);
+      // Ponta externa arredondada (limitada ao raio)
+      bs.bezierCurveTo(0.66 * S, 0.95 * S, 0.56 * S, 1.05 * S, 0.44 * S, 1.05 * S);
+      // Borda de fuga
+      bs.bezierCurveTo(0.28 * S, 0.92 * S, 0.05 * S, 0.65 * S, 0, 0.15 * S);
+      
+      var bladeGeo = new THREE.ExtrudeGeometry(bs, {
+        depth: 0.025, bevelEnabled: true,
+        bevelThickness: 0.005, bevelSize: 0.004, bevelSegments: 1
+      });
+      bladeGeo.rotateX(-Math.PI / 2);
+      
+      var blade = new THREE.Mesh(bladeGeo, mat(0x141a17, { emissive: DEEP, ei: 0.2 }));
+      blade.rotation.y = angle;
+      blade.position.y = 0.03;
       fan.add(blade);
     }
     fan.add(edgesOf(new THREE.CylinderGeometry(1.1, 1.1, 0.12, 28), GREEN, 0.3));
@@ -231,6 +277,15 @@
   var key = new THREE.PointLight(GREEN, 1.5, 30); key.position.set(4, 6, 5); scene.add(key);
   var rim = new THREE.PointLight(DIM, 0.7, 30); rim.position.set(-5, 3, -3); scene.add(rim);
   var fill = new THREE.PointLight(DEEP, 0.6, 30); fill.position.set(0, -4, 4); scene.add(fill);
+
+  // Targets para a seta SVG
+  var connectorTargets = {
+    "board": pcb,
+    "die": die,
+    "vram": vramMeshes[0],
+    "pcie": pcie,
+    "sensors": fanMeshes[0]
+  };
 
   // ---- Estado de scroll ----
   var progress = 0;      // 0..1 ao longo da seção
@@ -255,6 +310,66 @@
     if (hint) hint.style.opacity = progress > 0.04 ? "0" : "1";
   }
   window.addEventListener("scroll", onScroll, { passive: true });
+
+  // ---- Seta conectora (projeta componente ativo para coords de tela) ----
+  var connectorSvg   = document.getElementById("gpu-connector");
+  var connectorLine  = document.getElementById("connector-line");
+  var connectorDot   = document.getElementById("connector-dot");
+  var connectorPulse = document.getElementById("connector-pulse");
+  var infoCard       = document.getElementById("gpu-info-card");
+  var tempV = new THREE.Vector3();
+  var cachedCanvasRect = null;
+  var cachedCardRect   = null;
+  function refreshRects() {
+    cachedCanvasRect = renderer.domElement.getBoundingClientRect();
+    if (infoCard) cachedCardRect = infoCard.getBoundingClientRect();
+  }
+  window.addEventListener("resize",  refreshRects, { passive: true });
+  window.addEventListener("scroll",  refreshRects, { passive: true });
+
+
+
+  function updateConnector(t) {
+    if (!connectorSvg || !infoCard || activeStep === 0 || !active) {
+      if (connectorSvg) connectorSvg.style.opacity = "0";
+      return;
+    }
+    if (!cachedCanvasRect || !cachedCardRect) refreshRects();
+
+    // pick the part to point at based on active step key
+    var key = STEPS[activeStep].key;
+    var target = connectorTargets[key];
+    if (!target) { connectorSvg.style.opacity = "0"; return; }
+
+    target.getWorldPosition(tempV);
+    tempV.project(camera);
+    var cw = renderer.domElement.clientWidth;
+    var ch = renderer.domElement.clientHeight;
+    var toX = (tempV.x *  0.5 + 0.5) * cw;
+    var toY = (tempV.y * -0.5 + 0.5) * ch;
+
+    var isMobile = cw <= 720;
+    var fromX, fromY;
+    if (!isMobile) {
+      fromX = cachedCardRect.left - 15 - cachedCanvasRect.left;
+      fromY = cachedCardRect.top + cachedCardRect.height / 2 - cachedCanvasRect.top;
+    } else {
+      fromX = cachedCardRect.left + cachedCardRect.width / 2 - cachedCanvasRect.left;
+      fromY = cachedCardRect.top  - cachedCanvasRect.top;
+    }
+
+    var midX = (fromX + toX) / 2;
+    var pathData = "M" + fromX + "," + fromY + " Q" + midX + "," + fromY + " " + toX + "," + toY;
+    connectorLine.setAttribute("d", pathData);
+    connectorDot.setAttribute("cx", toX);
+    connectorDot.setAttribute("cy", toY);
+    connectorPulse.setAttribute("cx", toX);
+    connectorPulse.setAttribute("cy", toY);
+    var pulse = (t * 2) % 1;
+    connectorPulse.setAttribute("r",  5 + pulse * 10);
+    connectorPulse.setAttribute("stroke-opacity", (1 - pulse).toFixed(2));
+    connectorSvg.style.opacity = "1";
+  }
 
   // ---- Info card swap ----
   var swap = document.getElementById("gpu-swap");
@@ -304,15 +419,17 @@
     var t = now / 1000;
     var explode = easeInOut(progress);
 
-    // gira e inclina conforme desmonta
+    // gira conforme desmonta; mantém rotation.x fixo para a GPU não subir
     card.rotation.y = -0.5 + progress * 1.6 + Math.sin(t * 0.15) * 0.05;
-    card.rotation.x = 0.25 + progress * 0.15;
+    card.rotation.x = 0.25;
+    // compensa a subida causada pela explosão dos vetores com Y positivo
+    card.position.y = -0.7 - explode * 0.35;
 
     // move cada peça: home + dir * explode * distância
     for (var i = 0; i < parts.length; i++) {
       var p = parts[i];
       var d = p.userData;
-      var dist = 2.6;
+      var dist = 1.8;
       tmp.copy(d.dir).multiplyScalar(explode * dist);
       p.position.copy(d.home).add(tmp);
 
@@ -336,6 +453,7 @@
     // fans girando
     for (var ff = 0; ff < fanMeshes.length; ff++) fanMeshes[ff].rotation.y += 0.04;
 
+    updateConnector(t);
     renderer.render(scene, camera);
   }
 
