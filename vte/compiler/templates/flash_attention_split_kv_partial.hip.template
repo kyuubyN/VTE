@@ -26,7 +26,7 @@
 // imediatamente, gravando um estado neutro (m=-inf, l=0) que o passo de
 // redução ignora corretamente.
 
-#define SPLIT_KV_CHUNK_SIZE 32
+#define SPLIT_KV_CHUNK_SIZE {{ split_kv_chunk_size }}
 
 extern "C" __global__ void flash_attention_split_kv_partial_kernel(
     const __half* __restrict__ q,          // [batch, num_q_heads, head_dim]

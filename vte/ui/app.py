@@ -36,6 +36,17 @@ from vte.core.model import VTEModel
 from vte.ui.theme import get_palette, Palette
 
 CONTEXT_LENGTH_OPTIONS = [512, 1024, 2048, 4096, 8192]
+# Teto de tokens por resposta, independente do context_length escolhido.
+# Ver comentário em _handle_submit sobre por que isto existe: usar
+# context_length diretamente como max_tokens permite que "oi" dispare uma
+# geração de até 8192 tokens, e greedy decode (temperature=0, padrão do
+# Qwen3.5) degenera em loop de repetição bem antes disso -- confirmado via
+# scripts/diagnostics/diag_qwen35_long_gen.py (a mesma geração vira
+# "enhancing enhancing enhancing..." repetido a partir do token ~1500-2000,
+# independente do context_length configurado). Para os três primeiros
+# valores do dropdown (512/1024/2048) o comportamento não muda em nada
+# (min() é sempre o context_length); só 4096/8192 ficam limitados.
+MAX_SINGLE_RESPONSE_TOKENS = 2048
 MAX_LOG_LINES = 500
 
 # Suporte a idioma da interface (só chrome da UI -- rótulos, tooltips,
@@ -927,39 +938,66 @@ class VTEApp:
         self.typing_indicator = ft.ProgressRing(width=14, height=14, stroke_width=2, color=self.palette.accent_green)
         self.current_reply = ft.Text("", color=self.palette.accent_green, selectable=True)
 
-        # Bloco de "pensamento", recolhível -- só fica visível se o modelo
-        # atual realmente emitir um MotorMsgToken(section="thinking")
-        # (_append_token cuida disso). Toggle usa closures (não `self.*`)
-        # para que o botão de UMA bolha antiga continue expandindo/
-        # recolhendo só a SI MESMA depois que uma bolha nova for criada por
-        # cima (self.thinking_body etc. só rastreiam o turno em andamento).
-        self.current_thinking = ft.Text("", size=12, italic=True, selectable=True, color=None)
-        thinking_body = ft.Container(
-            content=self.current_thinking,
-            padding=ft.Padding(left=8, top=2, right=0, bottom=4),
-            expand=True,
-        )
-        self.thinking_label = ft.Text("Raciocínio", size=11, weight=ft.FontWeight.BOLD, visible=False)
-        self.thinking_toggle_btn = ft.IconButton(
-            icon=ft.Icons.EXPAND_LESS, icon_size=16, visible=False,
-            tooltip="Mostrar/ocultar raciocínio",
-        )
-        thinking_state = {"expanded": True}
+        # Accordion de "pensamento" -- só existe de verdade (é renderizado)
+        # para modelos que o próprio VTEModel declara suportar thinking mode
+        # (VTEModel.SUPPORTS_THINKING, hoje só Qwen3.5: é o tokenizer dele
+        # que emite <think>/</think> como texto literal). Para os demais
+        # modelos, current_thinking/thinking_label/thinking_toggle_btn ficam
+        # None -- _append_token já ignora section="thinking" nesse caso, e
+        # nenhum vestígio do accordion aparece na bolha.
+        self._supports_thinking = self.current_model_name in VTEModel.SUPPORTS_THINKING
+        self._thinking_seen_this_turn = False
+        if self._supports_thinking:
+            # Toggle usa closures (não `self.*`) para que o botão de UMA
+            # bolha antiga continue expandindo/recolhendo só a SI MESMA
+            # depois que uma bolha nova for criada por cima (self.thinking_body
+            # etc. só rastreiam o turno em andamento).
+            self.current_thinking = ft.Text(
+                "", size=12, italic=True, selectable=True, color=self.palette.text_muted
+            )
+            thinking_body = ft.Container(
+                content=self.current_thinking,
+                padding=ft.Padding(left=8, top=2, right=0, bottom=4),
+                expand=True,
+            )
+            self.thinking_label = ft.Text("Raciocínio", size=11, weight=ft.FontWeight.BOLD, visible=False)
+            self.thinking_toggle_btn = ft.IconButton(
+                icon=ft.Icons.EXPAND_LESS, icon_size=16, visible=False,
+                tooltip="Mostrar/ocultar raciocínio",
+            )
+            thinking_state = {"expanded": True}
 
-        def _toggle_thinking(e, _body=thinking_body, _btn=self.thinking_toggle_btn, _state=thinking_state):
-            _state["expanded"] = not _state["expanded"]
-            _body.visible = _state["expanded"]
-            _btn.icon = ft.Icons.EXPAND_LESS if _state["expanded"] else ft.Icons.EXPAND_MORE
-            _body.update()
-            _btn.update()
+            def _toggle_thinking(e, _body=thinking_body, _btn=self.thinking_toggle_btn, _state=thinking_state):
+                _state["expanded"] = not _state["expanded"]
+                _body.visible = _state["expanded"]
+                _btn.icon = ft.Icons.EXPAND_LESS if _state["expanded"] else ft.Icons.EXPAND_MORE
+                _body.update()
+                _btn.update()
 
-        self.thinking_toggle_btn.on_click = _toggle_thinking
-        self.thinking_body = thinking_body
+            self.thinking_toggle_btn.on_click = _toggle_thinking
+            self._collapse_thinking = lambda: _toggle_thinking(None) if thinking_state["expanded"] else None
+            self.thinking_body = thinking_body
 
-        thinking_header = ft.Row([self.thinking_toggle_btn, self.thinking_label], spacing=2, tight=True)
-        thinking_section = ft.Column([thinking_header, self.thinking_body], spacing=0, tight=True)
+            # Cabeçalho inteiro clicável (não só o ícone) -- área de toque
+            # maior, comportamento de accordion mais óbvio.
+            thinking_header = ft.Container(
+                content=ft.Row([self.thinking_toggle_btn, self.thinking_label], spacing=2, tight=True),
+                on_click=_toggle_thinking,
+                ink=True,
+            )
+            thinking_section = ft.Column([thinking_header, self.thinking_body], spacing=0, tight=True)
+        else:
+            self.current_thinking = None
+            self.thinking_label = None
+            self.thinking_toggle_btn = None
+            self.thinking_body = None
+            self._collapse_thinking = None
+            thinking_section = None
+
         reply_row = ft.Row([self.typing_indicator, self.current_reply], spacing=8, tight=True)
-        reply_content = ft.Column([thinking_section, reply_row], spacing=6, tight=True)
+        reply_content = ft.Column(
+            [c for c in (thinking_section, reply_row) if c is not None], spacing=6, tight=True
+        )
 
         self.chat_list.controls.append(self._make_bubble(
             reply_content, is_user=False,
@@ -973,12 +1011,19 @@ class VTEApp:
             # uma palavra) e o dropdown de context size não tinha nenhum
             # efeito visível no tamanho da resposta (o teto real era esse
             # 512 escondido, não o context_length escolhido). Usar
-            # current_context_length aqui faz o dropdown governar de
-            # verdade o teto de geração -- o loop em VTEModel.generate() já
-            # para sozinho em current_seq_len >= context_length de qualquer
-            # forma, então isto só remove o teto artificial menor que
-            # mascarava esse comportamento.
-            self.pipe_conn.send(UIMsgPrompt(text=prompt, max_tokens=self.current_context_length))
+            # current_context_length aqui fez o dropdown passar a governar
+            # o teto de geração -- mas trocou um problema por outro: para
+            # context_length=8192, "oi" passou a poder disparar uma geração
+            # de até 8192 tokens, e greedy decode (padrão do Qwen3.5) degenera
+            # em loop de repetição bem antes disso (reportado como "o modelo
+            # fala coisas aleatórias com contexto grande" -- na real é o
+            # MESMO loop de repetição documentado em docs/QWEN35.md,
+            # só que a UI deixava a geração correr tokens o bastante para
+            # o usuário chegar nele). MAX_SINGLE_RESPONSE_TOKENS limita o
+            # teto por resposta sem tocar no context_length (que continua
+            # dimensionando o KV cache normalmente).
+            max_tokens = min(self.current_context_length, MAX_SINGLE_RESPONSE_TOKENS)
+            self.pipe_conn.send(UIMsgPrompt(text=prompt, max_tokens=max_tokens))
         except (BrokenPipeError, OSError, EOFError):
             # O motor pode ter caído/estar trocando bem entre o guard acima e
             # o send em si (janela pequena, mas real -- é exatamente o que
@@ -1053,16 +1098,24 @@ class VTEApp:
                 return
             if self.thinking_label and not self.thinking_label.visible:
                 # 1o token "thinking" desta geração: revela o cabeçalho
-                # recolhível -- para um modelo que nunca usa <think>
-                # (Qwen2.5/Granite hoje, sem prompt instruído), isto nunca
-                # dispara e a bolha fica idêntica à de antes desta mudança.
+                # recolhível -- para um modelo sem SUPPORTS_THINKING (Qwen2.5/
+                # Granite hoje), current_thinking já é None e isto nunca roda.
                 self.thinking_label.visible = True
                 self.thinking_toggle_btn.visible = True
                 self.thinking_label.update()
                 self.thinking_toggle_btn.update()
+            self._thinking_seen_this_turn = True
             self.current_thinking.value += token
             self.current_thinking.update()
         else:
+            # 1o token de "answer" depois de ter havido "thinking" nesta
+            # geração: recolhe o accordion automaticamente -- o usuário via
+            # o raciocínio acontecer ao vivo, mas a resposta final é o que
+            # importa assim que ela começa a chegar. Só dispara uma vez por
+            # turno (thinking_seen_this_turn é resetado por _handle_submit).
+            if self._thinking_seen_this_turn and self._collapse_thinking:
+                self._collapse_thinking()
+                self._thinking_seen_this_turn = False
             if self.current_reply:
                 self.current_reply.value += token
                 self._fit_bubble_text(self.current_reply)
@@ -1084,6 +1137,8 @@ class VTEApp:
         self.thinking_label = None
         self.thinking_toggle_btn = None
         self.thinking_body = None
+        self._collapse_thinking = None
+        self._thinking_seen_this_turn = False
         self.page.update()
 
     # ------------------------------------------------------------------

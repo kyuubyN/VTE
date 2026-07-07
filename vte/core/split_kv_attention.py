@@ -30,7 +30,23 @@ import math
 import ctypes
 from vte.bridge.memory import MemoryRegion
 
+# Baseline histórico: 32 posições por chunk, calibrado na RX 7600 (32 CUs).
+# Compute dinamicamente via _chunk_size_for_cus() abaixo -- reproduz 32
+# exatamente quando num_cus=32 (nenhuma regressão na GPU de referência),
+# escala inversamente com o nº de CUs reais em qualquer outra RDNA2/RDNA3.
 SPLIT_KV_CHUNK_SIZE = 32
+
+
+def _chunk_size_for_cus(num_cus: int) -> int:
+    """Menos CUs -> chunks maiores (menos blocos, menos overhead de reduce
+    por bloco majoritariamente ocioso); mais CUs -> chunks menores (mais
+    blocos, para de fato ocupar as CUs extras). 1024/32=32 -- reproduz o
+    baseline exatamente em num_cus=32. Faixa [8,64] evita chunks grandes
+    demais (perde paralelismo em GPUs pequenas) ou pequenos demais (LDS/
+    overhead do passo de redução cresce com max_chunks)."""
+    if num_cus <= 0:
+        return SPLIT_KV_CHUNK_SIZE
+    return max(8, min(64, round(1024 / num_cus)))
 
 
 class SplitKVAttentionDispatcher:
@@ -41,7 +57,9 @@ class SplitKVAttentionDispatcher:
         self.allocator = allocator
         self.batch_size = batch_size
         self.context_length = context_length
-        self.max_chunks = max(1, math.ceil(context_length / SPLIT_KV_CHUNK_SIZE))
+        num_cus = hip.get_num_cus() if hip is not None and hasattr(hip, 'get_num_cus') else 32
+        self.chunk_size = _chunk_size_for_cus(num_cus)
+        self.max_chunks = max(1, math.ceil(context_length / self.chunk_size))
         self._kernel_cache = {}
         self._scratch = None
         # Default ON (opt-out via VTE_DISABLE_ATTN_SPLITKV), mesma convenção
@@ -87,7 +105,10 @@ class SplitKVAttentionDispatcher:
             _, fn = self.hip.load_kernel(hsaco, 'kv_cache_append_kernel')
             self._kernel_cache['append'] = fn
 
-            hsaco = self.codegen.compile_kernel(template_name='flash_attention_split_kv_partial', arch=arch)
+            hsaco = self.codegen.compile_kernel(
+                template_name='flash_attention_split_kv_partial', arch=arch,
+                split_kv_chunk_size=self.chunk_size,
+            )
             _, fn = self.hip.load_kernel(hsaco, 'flash_attention_split_kv_partial_kernel')
             self._kernel_cache['partial'] = fn
 
@@ -111,11 +132,28 @@ class SplitKVAttentionDispatcher:
 
         return self._kernel_cache['append'], self._kernel_cache['partial'], self._kernel_cache['reduce']
 
-    def build_launches(self, layer_idx: int, tensor_mapping: dict, kv_offset_ptr: int, batch: int = 1):
+    def build_launches(self, layer_idx: int, tensor_mapping: dict, kv_offset_ptr: int, batch: int = 1,
+                        q_name: str = None, k_name: str = None, v_name: str = None):
         """Retorna a lista de (kernel_fn, args, grid, block, shared_mem) para
         os 3 lançamentos do Split-KV desta camada -- mesma assinatura de
         retorno de FusedQKVDispatcher.build_launches, para plugar no mesmo
-        laço de captura em hip_graph_executor.py."""
+        laço de captura em hip_graph_executor.py.
+
+        Bug real encontrado (Qwen3.5): antes, os nomes dos tensores de Q/K/V
+        eram reconstruídos aqui por CONVENÇÃO fixa (f'blk.{layer_idx}.q_proj.output'
+        etc.), que é exatamente onde RoPE escreve in-place PRO QWEN2.5/GRANITE
+        (sem passo de norma por-head) -- mas o Qwen3.5 tem q_norm/k_norm
+        (RMSNorm por-head) ENTRE a projeção e o RoPE, e RoPE escreve em
+        `q_norm.output`/`k_norm.output`, não em `q_proj.output`/`k_proj.output`.
+        Usar a convenção fixa lia Q bruto (largura dupla, sem norma, sem RoPE)
+        e K bruto (sem norma, sem RoPE) -- confirmado via round-trip real: o
+        K armazenado no KV cache divergia do k_norm.output ao vivo em TODAS as
+        posições (diff ~4-6), enquanto V batia bit-exato (V não tem passo de
+        norma no Qwen3.5, então v_proj.output já era o buffer certo por
+        coincidência). Corrigido aceitando os nomes REAIS do nó do grafo
+        (node.input_tensors, já corretos por arquitetura em qwen_compute.py/
+        qwen3_5_compute.py) em vez de reconstruí-los aqui -- default None
+        preserva a convenção antiga quando não fornecido (Qwen2.5/Granite)."""
         append_fn, partial_fn, reduce_fn = self._get_kernels()
 
         num_q_heads = self.metadata.get('attention.head_count', 12)
@@ -129,11 +167,13 @@ class SplitKVAttentionDispatcher:
         scale = attention_scale if attention_scale else 1.0 / (head_dim ** 0.5)
 
         node_name = f"blk.{layer_idx}.attention"
-        # input_tensors: [q_pos_rope, k_proj_atual, v_proj_atual] -- mesma
-        # ordem de KernelArgBuilder._build_attention_args.
-        q_ptr = self._resolve_ptr(tensor_mapping, f'blk.{layer_idx}.q_proj.output')
-        k_proj_ptr = self._resolve_ptr(tensor_mapping, f'blk.{layer_idx}.k_proj.output')
-        v_proj_ptr = self._resolve_ptr(tensor_mapping, f'blk.{layer_idx}.v_proj.output')
+        # input_tensors: [q_pos_rope, k_pos_rope_ou_proj, v_proj_atual] --
+        # nomes reais do nó do grafo quando fornecidos (ver docstring acima),
+        # senão a convenção antiga (Qwen2.5/Granite: RoPE in-place em
+        # q_proj.output/k_proj.output, sem passo de norma por-head).
+        q_ptr = self._resolve_ptr(tensor_mapping, q_name or f'blk.{layer_idx}.q_proj.output')
+        k_proj_ptr = self._resolve_ptr(tensor_mapping, k_name or f'blk.{layer_idx}.k_proj.output')
+        v_proj_ptr = self._resolve_ptr(tensor_mapping, v_name or f'blk.{layer_idx}.v_proj.output')
         output_ptr = self._resolve_ptr(tensor_mapping, f'blk.{layer_idx}.attention.output')
         k_cache_ptr, v_cache_ptr = self._resolve_kv_cache_ptrs(layer_idx, tensor_mapping)
         kv_batch_stride = int(tensor_mapping.get('kv_batch_stride_elements', 0))

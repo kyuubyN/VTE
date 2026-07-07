@@ -94,6 +94,18 @@ Three kernel-fusion/occupancy experiments were tried afterward to close the rema
 
 Per-category GPU profiling (`VTE_PROFILE=1`) explains why: the new Gated DeltaNet kernels already account for only ~17.5% of GPU time in the eager profile, so optimizing them further has little headroom left to recover. The remaining ~56% is the large GEMV/FFN kernels Qwen3.5 *shares* with Qwen2.5/Granite (already tuned there) — closing more of the gap to Ollama would mean touching that shared, already-optimized infrastructure and risking regressions on the other two models, not another isolated Qwen3.5-only change. ~69 tok/s is treated as the real number for this architecture for now, not a pending optimization TODO.
 
+## Portability: dynamic Compute-Unit detection (RDNA2/RDNA3, not just the RX 7600)
+
+Several grid-sizing formulas throughout this project were tuned empirically for the RX 7600's 32 CUs specifically (the only card this was developed and measured on) — comments like "espalha por todos os 32 CUs da RX 7600" litter the codebase for a reason. `HIPRuntime.get_num_cus()` (new) reads the real CU count of whatever GPU is active at runtime, so those formulas scale to any RDNA2/RDNA3 card instead of silently under- or over-subscribing a different one:
+
+- **`vte/core/split_kv_attention.py::_chunk_size_for_cus(num_cus)`**: the Split-KV attention chunk size (fixed `32` before) is now `clamp(round(1024 / num_cus), 8, 64)` — reproduces `32` exactly at `num_cus=32` (zero regression on the reference card, verified byte-for-byte identical output), and scales inversely (more CUs → smaller chunks → more parallel blocks; fewer CUs → larger chunks → less reduce-kernel overhead per mostly-idle block) elsewhere.
+- **`causal_conv1d`'s grid** (Qwen3.5 Gated DeltaNet) was *already* hardware-agnostic despite its comment implying otherwise — its block count derives from `conv_dim / 64` (a model-width constant, not a GPU-count constant), so it already produces enough blocks (96, for Qwen3.5) to reasonably occupy any RDNA2/RDNA3 card without needing `num_cus` as an input. Comment corrected; no logic change.
+- **QKV Two-Pass Split-K's factor of 32** (`vte/core/fused_qkv_dispatch.py`, `split_k_qkv_pass1/pass2.hip.template`) was *not* made dynamic in this pass — the constant is baked into pointer arithmetic in two kernel templates (not a single `#define`, unlike the Split-KV case) and has a real correctness constraint (`hidden_size` must divide evenly by the split factor) that would need verifying against every supported model's `hidden_size` before any change. Deferred as a deliberate scope decision, not an oversight — the Split-KV fix addresses the same underlying problem (a kernel calibrated only for 32 CUs) with much lower risk.
+
+**A real bug found along the way, worth calling out separately from the CU work itself**: `HIPRuntime`'s hand-maintained `hipDeviceProp_t` struct was silently returning garbage (`38911`) for `multi_processor_count` — see the writeup in [Bugs found during development](BUGS.md) for the full investigation (a struct-layout mismatch with the installed driver, and a genuine RDNA quirk where `hipDeviceGetAttribute`'s multiprocessor-count attribute reports WGPs, not raw CUs — `*2` corrects it). `get_num_cus()` uses the fixed, corrected path.
+
+`VTE_NUM_CUS` env var overrides the detected count for testing (e.g. simulating a different card's CU count on the same physical GPU) without needing the actual hardware.
+
 ## Optimizations tried and rejected
 
 Kept disabled rather than removed, so they don't get re-implemented blindly:

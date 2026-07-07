@@ -162,6 +162,10 @@ class HIPRuntime:
         self._in_cleanup_mode: bool = False
         self._prevent_host_copies: bool = True
         self._vram_total: int = 0
+        # 32 = fallback pré-detecção (mesmo valor da RX 7600, referência
+        # histórica de calibração) -- initialize() sobrescreve com o valor
+        # REAL da GPU antes de qualquer kernel ser dimensionado.
+        self._num_cus: int = 32
         self._stream: ctypes.c_void_p = ctypes.c_void_p(0)
         self.watchdog = None
         self.gpu_utilization_guard = None
@@ -209,6 +213,8 @@ class HIPRuntime:
         self._lib.hipSetDevice.restype = ctypes.c_int
         self._lib.hipGetDeviceProperties.argtypes = [ctypes.POINTER(hipDeviceProp_t), ctypes.c_int]
         self._lib.hipGetDeviceProperties.restype = ctypes.c_int
+        self._lib.hipDeviceGetAttribute.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
+        self._lib.hipDeviceGetAttribute.restype = ctypes.c_int
         self._lib.hipMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
         self._lib.hipMalloc.restype = ctypes.c_int
         self._lib.hipFree.argtypes = [ctypes.c_void_p]
@@ -311,13 +317,36 @@ class HIPRuntime:
         try:
             props = self.get_device_properties(0)
             self._vram_total = props["total_global_mem"]
+            # Número real de Compute Units da GPU (lido uma vez aqui, não
+            # re-consultado em hot path) -- usado para dimensionar grids
+            # (Split-KV, QKV Two-Pass Split-K, causal_conv1d) de forma
+            # proporcional a QUALQUER RDNA2/RDNA3, não só aos 32 CUs fixos
+            # da RX 7600 em que os fatores originais foram calibrados. Ver
+            # docs/PERFORMANCE.md para a fórmula de cada um.
+            #
+            # NÃO lido de props["multi_processor_count"] (hipDeviceProp_t):
+            # investigação real (2026-07) achou esse campo retornando lixo
+            # (38911 na RX 7600, que tem 32 CUs de verdade) -- a struct
+            # hipDeviceProp_t inteira é grande, mantida à mão neste arquivo,
+            # e nunca foi validada de fato contra o ABI real do
+            # amdhip64_6.dll instalado (tools/validate_structs.py só roda a
+            # checagem se `hip-python` estiver instalado, o que não está
+            # neste ambiente -- a validação sempre foi um no-op silencioso).
+            # Trocado por hipDeviceGetAttribute(hipDeviceAttributeMultiprocessorCount),
+            # uma API estável de valor único, sem depender do layout da
+            # struct gigante. Confirmado também um quirk real e documentado
+            # do RDNA: essa API retorna a contagem de WGPs (Work Group
+            # Processors), não de CUs -- RDNA agrupa 2 CUs por WGP. Medido
+            # na RX 7600 (32 CUs reais, RDNA3/gfx1102): a API retornou 16,
+            # exatamente a metade -- por isso o *2 abaixo.
+            self._num_cus = self._get_multiprocessor_count_raw(0) * 2
             arch = self.get_gpu_architecture()
-            
+
             err = self._lib.hipStreamCreate(ctypes.byref(self._stream))
             if err != 0:
                 logger.warning(f"Falha ao criar stream assincrona ({err}). Usando default.")
-            
-            logger.info(f"HIP Inicializado. GPU: {props['name']} | Arch: {arch} | VRAM: {self._vram_total / 1024**2:.1f} MB")
+
+            logger.info(f"HIP Inicializado. GPU: {props['name']} | Arch: {arch} | CUs: {self._num_cus} | VRAM: {self._vram_total / 1024**2:.1f} MB")
             self._initialized = True
 
             from .watchdog import KernelWatchdog
@@ -332,6 +361,21 @@ class HIPRuntime:
         except Exception as e:
             logger.error(f"Falha ao ler propriedades da GPU: {e}")
             return False
+
+    def _get_multiprocessor_count_raw(self, device_id: int = 0) -> int:
+        """hipDeviceGetAttribute(hipDeviceAttributeMultiprocessorCount) --
+        63 é o índice real desse enum no header do ROCm 6.4 instalado
+        (contado programaticamente a partir de hip_runtime_api.h; é um enum
+        C de valores implícitos, não uma constante documentada em nenhum
+        lugar estável o bastante para outra forma de obter esse número sem
+        depender do header em si). Em RDNA isto retorna WGPs, não CUs --
+        quem chama (initialize()) faz a correção *2."""
+        value = ctypes.c_int(-1)
+        HIP_ATTR_MULTIPROCESSOR_COUNT = 63
+        err = self._lib.hipDeviceGetAttribute(ctypes.byref(value), HIP_ATTR_MULTIPROCESSOR_COUNT, device_id)
+        if err != 0:
+            raise HIPSafetyError(f"hipDeviceGetAttribute(multiprocessorCount) falhou: código {err}")
+        return value.value
 
     def get_device_properties(self, device_id: int = 0) -> HIPDeviceProperties:
         """Lê propriedades da GPU usando struct validada."""
@@ -349,6 +393,17 @@ class HIPRuntime:
             "multi_processor_count": props.multiProcessorCount,
             "compute_capability": f"{props.major}.{props.minor}",
         }
+
+    def get_num_cus(self) -> int:
+        """Nº de Compute Units da GPU ativa, lido em initialize() (não
+        re-consulta hipGetDeviceProperties aqui -- hot path). Override via
+        VTE_NUM_CUS para testar o dimensionamento de grid com uma contagem
+        diferente na mesma GPU física (ex.: simular uma RX 6800/7900 XTX na
+        RX 7600), sem precisar do hardware real."""
+        override = os.environ.get('VTE_NUM_CUS')
+        if override:
+            return int(override)
+        return self._num_cus
 
     def get_gpu_architecture(self) -> str:
         """Detecta arquitetura da GPU dinamicamente."""

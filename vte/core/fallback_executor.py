@@ -290,11 +290,14 @@ class FallbackExecutor:
         out_ptr_val = output_ptr.ptr if hasattr(output_ptr, 'ptr') else output_ptr
         token_ids_val = token_ids_ptr.ptr if hasattr(token_ids_ptr, 'ptr') else token_ids_ptr
 
-        # Tied embeddings cruas exigem dequant no lookup, não leitura FP16
-        # direta: Q6_K no Qwen (Fase D.1), Q8_0 no Granite (Fase 1) -- o
-        # mesmo tensor token_embd.weight serve de peso do lm_head E de
-        # embedding, então tem que casar com o formato em que ficou cru.
-        if 'token_embd.weight' in RAW_Q6K_WEIGHTS:
+        # token_embd.weight cru exige dequant no lookup, não leitura FP16
+        # direta: Q6_K no Qwen 1.5B (Fase D.1, tied), Q8_0 no Granite (Fase
+        # 1, tied), Q4_K no Qwen 7B (token_embd separado do lm_head, ~1GB de
+        # VRAM economizado ficando cru -- ver embedding_lookup_q4k.template).
+        # Casa com o formato em que o tensor ficou cru na VRAM.
+        if 'token_embd.weight' in RAW_Q4K_WEIGHTS:
+            template = "embedding_lookup_q4k"
+        elif 'token_embd.weight' in RAW_Q6K_WEIGHTS:
             template = "embedding_lookup_q6k"
         elif 'token_embd.weight' in RAW_Q8_0_WEIGHTS:
             template = "embedding_lookup_q8_0"
@@ -444,11 +447,23 @@ class FallbackExecutor:
         # nem existem no grafo, e incluí-los aqui incondicionalmente faria
         # o "blk.N.attn_norm" real ser pulado no loop principal mesmo com a
         # tentativa de fusão desativada acima -- mesmo bug, caminho diferente.
+        # Bug real encontrado ao adicionar o Qwen2.5 0.5B (draft model): esta
+        # checagem só olhava attn_q.weight, mas o GGUF do 0.5B mistura
+        # dtypes POR CAMADA -- metade das camadas tem attn_v.weight em Q8_0
+        # (roteado cru por is_raw_q8_0_weight, que não tem restrição de nome)
+        # enquanto attn_q/k/output continuam FP16 na MESMA camada. A fusão
+        # disparava mesmo assim (só via attn_q livre), e o kernel fundido lia
+        # attn_v cru como `__half*` puro -- V corrompido, causa raiz do
+        # "!!!!!!!!" repetido na geração do draft (mesmo sintoma documentado
+        # pro bug de fusão do Qwen3.5 em docs/QWEN35.md, causa diferente).
+        # Checar as 4 matrizes (Q/K/V/O), não só Q.
         _attn_q_name = f"blk.{layer_idx}.attn_q.weight"
+        _attn_k_name = f"blk.{layer_idx}.attn_k.weight"
+        _attn_v_name = f"blk.{layer_idx}.attn_v.weight"
+        _attn_o_name = f"blk.{layer_idx}.attn_output.weight"
+        _raw_sets = (RAW_Q4K_WEIGHTS, RAW_Q6K_WEIGHTS, RAW_Q8_0_WEIGHTS)
         _qkv_fusable = (_attn_q_name in self.tensor_mapping
-                        and _attn_q_name not in RAW_Q4K_WEIGHTS
-                        and _attn_q_name not in RAW_Q6K_WEIGHTS
-                        and _attn_q_name not in RAW_Q8_0_WEIGHTS
+                        and not any(n in s for n in (_attn_q_name, _attn_k_name, _attn_v_name, _attn_o_name) for s in _raw_sets)
                         and self.metadata.get('rope_type') != 2)
         qkv_fused_names = {
             f"blk.{layer_idx}.attn_norm", f"blk.{layer_idx}.q_proj",

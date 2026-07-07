@@ -223,16 +223,13 @@ class InferenceEngine:
         e não _build_metrics_msg() -- essa thread (loop principal de
         generate()) não pode tocar o GPUMonitor/WMI da thread de
         telemetria, ver docstring de _build_metrics_msg."""
-        if not self.token_buffer:
+        if not self.token_buffer and not force:
             return
 
         now = time.perf_counter()
         if force or (now - self.last_flush_time >= self.flush_interval):
             chunks = self._thinking_scanner.feed(self.token_buffer)
             if force:
-                # Fim da geração: libera qualquer cauda retida esperando
-                # uma tag <think>/</think> completar -- sem isto o último
-                # pedacinho de texto (ex.: até 6 chars) nunca seria enviado.
                 chunks += self._thinking_scanner.flush()
             for chunk in chunks:
                 self._send(MotorMsgToken(text=chunk.text, section=chunk.section))

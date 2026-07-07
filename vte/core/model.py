@@ -14,6 +14,7 @@ from ..core.hip_graph_executor import HIPGraphExecutor
 from ..core.fallback_executor import FallbackExecutor
 from ..compiler.qwen_mapper import QwenTensorMapper, ActivationArena
 from ..bridge.memory import MemoryBlock, SlabAllocator, MemoryRegion
+from ..bridge.errors import HIPSafetyError
 from vte.core.vram_profiler import VRAMProfiler
 from ..compiler.gguf_parser import GGUFParser
 from ..compiler.weight_loader import GGUFWeightLoader
@@ -48,8 +49,31 @@ class VTEModel:
         "qwen2.5:1.5b-q4_k_m": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
         "granite-4.1:3b-q8_0": "granite-4.1-3b-Q8_0.gguf",
         "qwen3.5:2b-q6_k": "Qwen3.5-2B-Q6_K.gguf",
+        # Mesma arquitetura "qwen2" (_load_qwen2_metadata já lê hidden_size/
+        # n_layers/n_heads do metadata do GGUF, nada hardcoded pro 1.5B) --
+        # registrar o 7B é literalmente só esta linha. VRAM: ~4.3GB de pesos
+        # Q4_K_M cru + KV/arena, cabe nos 8GB da RX 7600 (ver
+        # docs/PERFORMANCE.md). O checkpoint OOM preventivo em
+        # qwen_mapper.py::map_and_allocate_tensors já usa a VRAM REAL da
+        # GPU (hip_runtime.py::initialize, hipGetDeviceProperties) -- numa
+        # GPU maior (ex. RX 7900 XTX, 24GB) a mesma checagem aceita
+        # naturalmente, sem código novo.
+        "qwen2.5:7b-q4_k_m": "Qwen2.5-7B-Instruct.Q4_K_M.gguf",
+        # Draft model do speculative decoding (Fase 5) -- fica em
+        # Model/Classifier/ (subpasta dedicada), não em Model/ raiz.
+        # `from_pretrained` resolve isso sem mudança: Path("Model") /
+        # "Classifier/Qwen2.5-...gguf" já produz o caminho relativo certo,
+        # e o whitelist de nome no sanitizer usa Path.name (só o
+        # basename), então a subpasta não interfere na validação.
+        "qwen2.5:0.5b-q4_k_m-draft": "Classifier/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
     }
-    
+
+    # Modelos cujo tokenizer emite <think>/</think> como texto literal (ver
+    # Qwen3_5Tokenizer._LITERAL_SPECIAL_TOKENS em compiler/tokenizer.py) --
+    # única fonte de verdade sobre "thinking mode" para quem consome
+    # VTEModel (hoje só a UI Flet), evita duplicar essa lista em app.py.
+    SUPPORTS_THINKING = frozenset({"qwen3.5:2b-q6_k"})
+
     DEFAULT_CONTEXT_LENGTH = 2048
 
     def __init__(self, gguf_path: str, use_hip_graph: bool = True, enable_fusion: bool = True, context_length: int = None, idle_timeout: int = 5, auto_unload: bool = True, max_batch_size: int = 1):
@@ -696,6 +720,22 @@ class VTEModel:
 
         input_tokens = self.tokenizer.encode(prompt)
         current_seq_len = len(input_tokens)
+
+        # Guarda que faltava: o loop de decode (mais abaixo) já para sozinho
+        # em current_seq_len >= self._context_length antes de processar
+        # qualquer token GERADO, mas o PREFILL nunca teve a mesma checagem --
+        # um prompt cujo tamanho já tokenizado excede o KV cache/RoPE cache
+        # alocados (dimensionados para self._context_length em
+        # calculate_memory_requirements) escreveria em kv_offset além do
+        # buffer, corrompendo a Activation Arena silenciosamente. Falha
+        # cedo e com mensagem clara em vez de deixar o kernel escrever fora
+        # dos limites.
+        if current_seq_len >= self._context_length:
+            raise HIPSafetyError(
+                f"Prompt tem {current_seq_len} tokens, mas o contexto está "
+                f"configurado para {self._context_length}. Reduza o prompt ou "
+                f"aumente o context_length antes de gerar."
+            )
 
         # Prefill processa o prompt (posições 0..N-1). Ao final, output_norm.output
         # contém o hidden state da ÚLTIMA posição do prompt — é dele que sai a

@@ -151,11 +151,8 @@ class QwenTokenizer:
         self.eos_token_id = self.special_tokens.get("<|im_end|>", self.eos_token_id)
 
         bos_id = metadata.get("tokenizer.ggml.bos_token_id")
-        eos_id = metadata.get("tokenizer.ggml.eos_token_id")
         if bos_id is not None:
             self.bos_token_id = bos_id
-        if eos_id is not None:
-            self.eos_token_id = eos_id
 
         for rank, merge_line in enumerate(merges):
             parts = merge_line.split(" ")
@@ -511,7 +508,11 @@ class GraniteTokenizer:
     @property
     def stop_token_ids(self) -> set:
         """Tokens que encerram a geração (fim de turno do assistente)."""
-        return {i for i in {self.eos_token_id} if i is not None}
+        ids = {self.eos_token_id}
+        eor = self.special_tokens.get("<|end_of_role|>")
+        if eor is not None:
+            ids.add(eor)
+        return {i for i in ids if i is not None}
 
 
 class Qwen3_5Tokenizer:

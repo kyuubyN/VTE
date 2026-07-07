@@ -8,6 +8,27 @@ from vte.bridge.logger import get_logger
 
 logger = get_logger(__name__)
 
+
+def format_oom_error(model_label: str, total_required: int, allocator: SlabAllocator, context_length: int) -> str:
+    """Mensagem de OOM preventivo compartilhada pelos 3 mappers (Qwen2.5/
+    Granite/Qwen3.5) -- fonte única, mesma checagem `total_required >
+    free_bytes` de antes, só com informação de produto (nome do modelo,
+    VRAM real da GPU do usuário, sugestão de reduzir context_length) em vez
+    de só os dois números crus. A VRAM total já vem de hipGetDeviceProperties
+    (real, não um valor fixo assumido) -- numa GPU maior (ex. RX 7900 XTX,
+    24GB) a mesma checagem aceita modelos maiores automaticamente."""
+    stats = allocator.get_stats()
+    total_vram_gb = stats['total_bytes'] / (1024 ** 3)
+    free_vram_gb = stats['free_bytes'] / (1024 ** 3)
+    required_gb = total_required / (1024 ** 3)
+    return (
+        f"OOM Preventivo: '{model_label}' precisa de {required_gb:.2f}GB "
+        f"(context_length={context_length}), mas esta GPU só tem "
+        f"{free_vram_gb:.2f}GB livres de {total_vram_gb:.2f}GB totais. "
+        f"Tente reduzir o context_length ou usar um modelo/quantização menor."
+    )
+
+
 # IDs de tipo GGML relevantes.
 GGML_TYPE_Q4_K = 12
 GGML_TYPE_Q6_K = 14
@@ -35,7 +56,13 @@ def is_raw_q4k_weight(name: str, tensor_info: dict) -> bool:
             or name.endswith("ffn_down.weight")
             or name.endswith("attn_q.weight")
             or name.endswith("attn_k.weight")
-            or name.endswith("attn_output.weight"))
+            or name.endswith("attn_output.weight")
+            # Qwen2.5 7B: token_embd em Q4_K (no 1.5B é Q6_K). Cru economiza
+            # ~730MB de VRAM; o embedding lookup dequantiza a linha do token
+            # sob demanda via embedding_lookup_q4k. Diferente do 1.5B, aqui
+            # token_embd NÃO é tied ao lm_head (output.weight é um tensor
+            # Q6_K separado), então este kernel é seu único consumidor.
+            or name == "token_embd.weight")
 
 
 def is_raw_q6k_weight(name: str, tensor_info: dict) -> bool:
@@ -46,12 +73,19 @@ def is_raw_q6k_weight(name: str, tensor_info: dict) -> bool:
     Cobertos: ffn_down (Q6_K, K=8960), token_embd (Fase D.1 — tied embeddings:
     o mesmo tensor serve de peso do lm_head via gemv_q6k E do embedding lookup
     via embedding_lookup_q6k, dequantizado sob demanda em ambos os casos; sem
-    isso o lm_head continuaria pagando ~277 MB de leitura extra por token) e,
-    desde esta sessão, attn_v quando vier em Q6_K (mesmo motivo de
-    is_raw_q4k_weight acima -- ver comentário lá)."""
+    isso o lm_head continuaria pagando ~277 MB de leitura extra por token),
+    attn_v quando vier em Q6_K (mesmo motivo de is_raw_q4k_weight acima -- ver
+    comentário lá) e, desde o suporte ao Qwen2.5 7B, `output.weight` quando
+    vier em Q6_K separado (NÃO tied). No 1.5B o output é tied ao token_embd
+    (mesma referência, uma cópia só, pulada no loop de alocação por
+    is_tied=True), então esta linha não o afeta; mas o 7B tem `output.weight`
+    como tensor Q6_K próprio (~1GB dequantizado a FP16) -- roteá-lo cru
+    economiza ~590MB de VRAM e o lm_head já sabe lê-lo via gemv_q6k (mesmo
+    caminho da tied embedding, só que apontando para output.weight)."""
     if tensor_info.get('dtype') != GGML_TYPE_Q6_K:
         return False
     return (name.endswith("ffn_down.weight") or name == "token_embd.weight"
+            or name == "output.weight"
             or name.endswith("attn_v.weight"))
 
 
@@ -127,13 +161,27 @@ class QwenTensorMapper:
         weights_total = sum(self._calculate_fp16_size(t, n) for n, t in self.parser.tensors.items())
 
         layers = self.metadata.get("block_count", 28)
-        kv_heads = 2
-        head_dim = 128
+        # Bug real encontrado ao adicionar suporte ao Qwen2.5 7B: estes 3
+        # valores estavam hardcoded para o 1.5B (kv_heads=2, head_dim=128,
+        # ffn=8960) em vez de lidos do metadata real do GGUF -- o 7B tem
+        # kv_heads=4 e ffn=18944, então o KV Cache Pool e a Activation
+        # Arena eram alocados com METADE do tamanho realmente necessário
+        # (`map_and_allocate_tensors`, mais abaixo neste mesmo arquivo, já
+        # lia esses valores corretamente do metadata -- só esta função
+        # de cálculo de orçamento estava desatualizada). O resultado prático
+        # foi um overflow real e silencioso: o KV cache escrito durante o
+        # decode (dimensionado certo pelo mapper) invadia a Activation
+        # Arena alocada logo depois (dimensionada errado, pequena demais),
+        # corrompendo ativações -- a causa raiz do texto sem sentido gerado
+        # pelo 7B ("pérdida strugg Rencontre..."), não um problema de
+        # quantização ou do modelo em si.
+        kv_heads = self.metadata.get("attention.head_count_kv", 2)
+        head_dim = self.metadata.get("attention.key_length", 128)
         kv_pool_size = layers * 2 * kv_heads * head_dim * 2 * context_length * batch_size
 
         rope_size = context_length * head_dim * 2
 
-        ffn_intermediate_size = 8960
+        ffn_intermediate_size = self.metadata.get("feed_forward_length", 8960)
         arena_size = int((context_length * ffn_intermediate_size * 2) * 1.2) * batch_size
 
         buffers_size = 20 * 1024 * 1024
@@ -179,13 +227,10 @@ class QwenTensorMapper:
         reqs = self.calculate_memory_requirements(context_length, batch_size)
         total_required = reqs['total']
         free_vram = allocator.get_stats()['free_bytes']
-        
+
         if total_required > free_vram:
-             raise HIPSafetyError(
-                f"OOM Preventivo: Modelo requer {total_required / (1024**3):.2f}GB, "
-                f"mas o Slab tem apenas {free_vram / (1024**3):.2f}GB livres."
-            )
-            
+            raise HIPSafetyError(format_oom_error("Qwen2.5", total_required, allocator, context_length))
+
         tensor_mapping = {}
         for name, t_info in self.parser.tensors.items():
             if t_info.get('is_tied', False):

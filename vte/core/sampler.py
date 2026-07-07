@@ -10,6 +10,30 @@ def stable_softmax(logits: np.ndarray) -> np.ndarray:
     exp_logits = np.exp(logits_shifted)
     return exp_logits / np.sum(exp_logits)
 
+# Penalidade de repetição por FREQUÊNCIA, não só presença -- achado real
+# (2026-07, geração longa no Qwen3.5): o desconto multiplicativo fixo (uma
+# vez por token único, não importa quantas vezes ele já repetiu) nunca
+# escala o suficiente pra quebrar um ciclo persistente. Medido sem nenhum
+# repetition_penalty numa história longa: o modelo entra num ciclo curto de
+# ~8 tokens ("Okay, I need to write. *\n" repetindo) por volta do token
+# ~500-600 -- e o GAP entre o token campeão e o segundo colocado NÃO
+# explode perto do colapso (fica entre 1-6 logits do início ao fim,
+# refutando a hipótese de "confiança numérica explodindo"/saturação do
+# estado). É um ciclo de baixa margem: cada um dos ~8 tokens do ciclo
+# continua com confiança só moderada, então um desconto que ESCALA com
+# quantas vezes o token já saiu deveria bastar pra quebrá-lo -- e basta,
+# ver diag_qwen35_logit_confidence.py / diag_qwen35_repetition_fix.py.
+#
+# Janela deslizante (não a geração inteira): uma palavra comum ("o", "de")
+# usada 50x ao longo de uma história de 1000 tokens é normal, não um loop --
+# só READ RECENTE importa pra detectar um ciclo de verdade. Expoente com teto
+# (REPETITION_COUNT_CAP): sem isso, uma palavra genuinamente repetida muitas
+# vezes na janela vira um fator absurdo (ex. 1.3^50) em vez de só "penalizado
+# o bastante pra perder pra qualquer alternativa plausível".
+REPETITION_WINDOW = 512
+REPETITION_COUNT_CAP = 10
+
+
 class Sampler:
     """Estrategias de sampling em CPU via Numpy.
 
@@ -40,13 +64,23 @@ class Sampler:
         """
         logits = logits.copy()
 
-        # 1. Repetition penalty (vetorizado -- sem loop Python por token)
+        # 1. Repetition penalty por FREQUÊNCIA (vetorizado -- sem loop Python
+        # por token), escalando com quantas vezes o token apareceu na janela
+        # recente -- não um desconto fixo de presença/ausência (ver
+        # REPETITION_WINDOW/REPETITION_COUNT_CAP acima para o porquê). Com
+        # count=1 (token visto uma única vez, o caso comum), o expoente é 1
+        # e o resultado é IDÊNTICO ao desconto fixo de antes -- só escala de
+        # verdade quando um token realmente repete muito na janela recente.
         if generated_tokens and repetition_penalty != 1.0:
-            token_ids = np.fromiter(set(generated_tokens), dtype=np.int64)
-            token_ids = token_ids[token_ids < len(logits)]
-            if token_ids.size > 0:
-                vals = logits[token_ids]
-                logits[token_ids] = np.where(vals > 0, vals / repetition_penalty, vals * repetition_penalty)
+            window = generated_tokens[-REPETITION_WINDOW:]
+            token_ids_arr = np.asarray(window, dtype=np.int64)
+            token_ids_arr = token_ids_arr[token_ids_arr < len(logits)]
+            if token_ids_arr.size > 0:
+                unique_ids, counts = np.unique(token_ids_arr, return_counts=True)
+                counts = np.minimum(counts, REPETITION_COUNT_CAP).astype(np.float64)
+                vals = logits[unique_ids]
+                eff_penalty = repetition_penalty ** counts
+                logits[unique_ids] = np.where(vals > 0, vals / eff_penalty, vals * eff_penalty)
 
         # Se a temperature for 0, é um argmax (greedy decode) deterministico
         if temperature <= 0.0:

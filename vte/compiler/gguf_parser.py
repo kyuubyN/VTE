@@ -97,6 +97,7 @@ class GGUFParser:
         
         if dtype == 0: return elements * 4
         elif dtype == 1: return elements * 2
+        elif dtype == 6: return (elements // 32) * 22 # Q5_0 (32 elem/22 bytes: fp16 d + 4 qh + 16 qs)
         elif dtype == 8: return (elements // 32) * 34 # Q8_0 (32 elem/34 bytes: fp16 d + 32 int8)
         elif dtype == 12: return (elements // 256) * 144 # Q4_K
         elif dtype == 13: return (elements // 256) * 176 # Q5_K

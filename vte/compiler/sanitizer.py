@@ -16,40 +16,77 @@ logger = get_logger(__name__)
 # documentação de terceiros -- ver plano em curious-roaming-quasar.md.
 SUPPORTED_ARCHITECTURES = {
     "qwen2": {
-        "block_count": 28,
+        # block_count DIFERE por variante dentro da mesma arquitetura
+        # "qwen2" -- descoberto ao adicionar o Qwen2.5 0.5B (draft model
+        # pro speculative decoding): 24 camadas, contra 28 no 1.5B/7B (que
+        # coincidem entre si, mas não generalizam pra toda a família). Por
+        # isso block_count mora dentro de cada variante, não no nível da
+        # arquitetura -- `_validate_metadata_consistency` resolve a variante
+        # pelo nome do arquivo PRIMEIRO, só then valida o block_count contra
+        # a variante certa.
         "max_context_length": 100_000,
-        "expected_filename": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
-        # Nomes de atributos em vte/config.py (não valores literais): lidos
-        # dinamicamente em validate() para permanecerem configuráveis/
-        # monkeypatcháveis em um único lugar, mesmo padrão do hash abaixo.
-        "size_min_key": "ALLOWED_MODEL_SIZE_MIN",
-        "size_max_key": "ALLOWED_MODEL_SIZE_MAX",
-        "hash_config_key": "QWEN2_5_EXPECTED_HASH",
+        "variants": [
+            {
+                "expected_filename": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+                "block_count": 28,
+                "size_min_key": "ALLOWED_MODEL_SIZE_MIN",
+                "size_max_key": "ALLOWED_MODEL_SIZE_MAX",
+                "hash_config_key": "QWEN2_5_EXPECTED_HASH",
+            },
+            {
+                "expected_filename": "Qwen2.5-7B-Instruct.Q4_K_M.gguf",
+                "block_count": 28,
+                "size_min_key": "QWEN2_5_7B_SIZE_MIN",
+                "size_max_key": "QWEN2_5_7B_SIZE_MAX",
+                "hash_config_key": "QWEN2_5_7B_EXPECTED_HASH",
+            },
+            {
+                # Draft model do speculative decoding (Fase 5) -- fica em
+                # Model/Classifier/ (subpasta dedicada, separa o "gerador
+                # automático" do resto), mas o whitelist de nome de arquivo
+                # aqui só olha o basename (`Path.name`), então funciona sem
+                # nenhuma mudança na resolução de caminho.
+                "expected_filename": "Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
+                "block_count": 24,
+                "size_min_key": "QWEN2_5_0_5B_SIZE_MIN",
+                "size_max_key": "QWEN2_5_0_5B_SIZE_MAX",
+                "hash_config_key": "QWEN2_5_0_5B_EXPECTED_HASH",
+            },
+        ],
     },
     "granite": {
-        "block_count": 40,
         # Contexto nativo do Granite 4.1 é 131072 (bem maior que os 32768 do
         # Qwen2.5) -- o teto de sanidade precisa acomodar isso sem virar um
         # cheque em branco.
         "max_context_length": 200_000,
-        "expected_filename": "granite-4.1-3b-Q8_0.gguf",
-        "size_min_key": "GRANITE_4_1_3B_SIZE_MIN",
-        "size_max_key": "GRANITE_4_1_3B_SIZE_MAX",
-        "hash_config_key": "GRANITE_4_1_3B_EXPECTED_HASH",
+        "variants": [
+            {
+                "expected_filename": "granite-4.1-3b-Q8_0.gguf",
+                "block_count": 40,
+                "size_min_key": "GRANITE_4_1_3B_SIZE_MIN",
+                "size_max_key": "GRANITE_4_1_3B_SIZE_MAX",
+                "hash_config_key": "GRANITE_4_1_3B_EXPECTED_HASH",
+            },
+        ],
     },
     "qwen35": {
-        # 24 camadas no total (6 full_attention + 18 linear_attention/Gated
-        # DeltaNet) -- block_count no GGUF conta TODAS, não só as de
-        # atenção completa (confirmado via gguf.GGUFReader real).
-        "block_count": 24,
         # Contexto nativo real é 262144 (config.json:
         # max_position_embeddings) -- maior que o do Granite, teto de
         # sanidade generoso o bastante sem virar cheque em branco.
         "max_context_length": 300_000,
-        "expected_filename": "Qwen3.5-2B-Q6_K.gguf",
-        "size_min_key": "QWEN35_2B_SIZE_MIN",
-        "size_max_key": "QWEN35_2B_SIZE_MAX",
-        "hash_config_key": "QWEN35_2B_EXPECTED_HASH",
+        "variants": [
+            {
+                "expected_filename": "Qwen3.5-2B-Q6_K.gguf",
+                # 24 camadas no total (6 full_attention + 18
+                # linear_attention/Gated DeltaNet) -- block_count no GGUF
+                # conta TODAS, não só as de atenção completa (confirmado
+                # via gguf.GGUFReader real).
+                "block_count": 24,
+                "size_min_key": "QWEN35_2B_SIZE_MIN",
+                "size_max_key": "QWEN35_2B_SIZE_MAX",
+                "hash_config_key": "QWEN35_2B_EXPECTED_HASH",
+            },
+        ],
     },
 }
 
@@ -184,10 +221,15 @@ class GGUFSanitizer:
 
     def _validate_metadata_consistency(self) -> dict:
         """Valida que os metadados são consistentes com o PERFIL da arquitetura
-        detectada (`SUPPORTED_ARCHITECTURES`) e retorna esse perfil, usado em
-        seguida por `validate()` para checar nome de arquivo/tamanho/hash --
-        checagens que antes eram feitas ANTES de saber a arquitetura (só
-        funcionava porque só existia uma arquitetura possível)."""
+        detectada (`SUPPORTED_ARCHITECTURES`) e retorna a VARIANTE (tamanho de
+        modelo) resolvida por nome de arquivo, usada em seguida por
+        `validate()` para checar tamanho/hash -- checagens que antes eram
+        feitas ANTES de saber a arquitetura (só funcionava porque só existia
+        uma arquitetura possível).
+
+        block_count é validado contra a VARIANTE, não a arquitetura: achado
+        real ao adicionar o Qwen2.5 0.5B (draft model) -- tem 24 camadas,
+        diferente do 1.5B/7B (28, que só coincidem entre si por acaso)."""
         profile = SUPPORTED_ARCHITECTURES.get(self.header.architecture)
         if profile is None:
             supported = ", ".join(SUPPORTED_ARCHITECTURES.keys())
@@ -199,13 +241,17 @@ class GGUFSanitizer:
         if self.header.context_length > profile["max_context_length"]:
             raise HIPSafetyError(f"context_length suspeito: {self.header.context_length}")
 
-        if self.header.block_count != profile["block_count"]:
+        variant = next((v for v in profile["variants"] if v["expected_filename"] == self.path.name), None)
+        if variant is None:
+            raise HIPSafetyError("Nome do modelo incorreto")
+
+        if self.header.block_count != variant["block_count"]:
             raise HIPSafetyError(
-                f"Block count inválido para '{self.header.architecture}'. "
-                f"Esperado: {profile['block_count']}, Recebido: {self.header.block_count}"
+                f"Block count inválido para '{self.path.name}'. "
+                f"Esperado: {variant['block_count']}, Recebido: {self.header.block_count}"
             )
 
-        return profile
+        return variant
 
     def validate(self) -> bool:
         logger.info(f"Validando modelo: {self.path}")
@@ -217,8 +263,15 @@ class GGUFSanitizer:
         # do conteúdo -- rejeita arquivos com nome desconhecido/malformado
         # sem precisar interpretar bytes não confiáveis primeiro (mesma
         # postura de segurança do gate original de nome único, agora
-        # parametrizada por todas as arquiteturas suportadas).
-        known_filenames = {p["expected_filename"] for p in SUPPORTED_ARCHITECTURES.values()}
+        # parametrizada por todas as variantes de todas as arquiteturas
+        # suportadas -- cada arquitetura pode ter mais de um tamanho de
+        # modelo, ex. Qwen2.5 1.5B/7B, mesmo block_count, arquivos
+        # diferentes).
+        known_filenames = {
+            v["expected_filename"]
+            for profile in SUPPORTED_ARCHITECTURES.values()
+            for v in profile["variants"]
+        }
         if self.path.name not in known_filenames:
             raise HIPSafetyError("Nome do modelo incorreto")
 
@@ -243,25 +296,22 @@ class GGUFSanitizer:
                 self.header = GGUFHeader(magic, version, tensor_count, kv_count)
 
                 self._parse_kv_pairs(f, kv_count)
-                profile = self._validate_metadata_consistency()
+                variant = self._validate_metadata_consistency()
 
         except struct.error as e:
             raise HIPSafetyError(f"Erro de struct lendo GGUF: {e}")
 
-        # Checagens que dependem de já saber a arquitetura (nome de arquivo,
-        # tamanho, hash) -- feitas DEPOIS do parse, usando o perfil resolvido
-        # em `_validate_metadata_consistency`.
-        if self.path.name != profile["expected_filename"]:
-            raise HIPSafetyError("Nome do modelo incorreto")
-
+        # Checagens que dependem de já saber a arquitetura/variante (tamanho,
+        # hash) -- feitas DEPOIS do parse, usando a variante já resolvida por
+        # nome de arquivo em `_validate_metadata_consistency`.
         import vte.config as config
         size = self.path.stat().st_size
-        size_min = getattr(config, profile["size_min_key"])
-        size_max = getattr(config, profile["size_max_key"])
+        size_min = getattr(config, variant["size_min_key"])
+        size_max = getattr(config, variant["size_max_key"])
         if size < size_min or size > size_max:
              raise HIPSafetyError(f"Tamanho fora do esperado: {size} bytes")
 
-        self._validate_or_generate_hash(profile)
+        self._validate_or_generate_hash(variant)
 
         logger.info("Validação do modelo concluída com sucesso.")
         return True

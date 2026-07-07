@@ -256,8 +256,10 @@ class HIPGraphExecutor:
         "congelado" em todo replay, ignorando o token realmente processado.
         """
         arch = self.hip.get_gpu_architecture()
-        from vte.core.fallback_executor import RAW_Q6K_WEIGHTS, RAW_Q8_0_WEIGHTS
-        if 'token_embd.weight' in RAW_Q6K_WEIGHTS:
+        from vte.core.fallback_executor import RAW_Q4K_WEIGHTS, RAW_Q6K_WEIGHTS, RAW_Q8_0_WEIGHTS
+        if 'token_embd.weight' in RAW_Q4K_WEIGHTS:
+            template = "embedding_lookup_q4k"
+        elif 'token_embd.weight' in RAW_Q6K_WEIGHTS:
             template = "embedding_lookup_q6k"
         elif 'token_embd.weight' in RAW_Q8_0_WEIGHTS:
             template = "embedding_lookup_q8_0"
@@ -365,8 +367,12 @@ class HIPGraphExecutor:
             # 1 thread por canal, sem __syncthreads/LDS -- block=64 (1
             # wavefront RDNA exato, zero lane mascarado) em vez do
             # block_size genérico de 256, o que quadruplica o número de
-            # blocos (24->96) sem mudar o total de threads/trabalho --
-            # espalha por todos os 32 CUs da RX 7600 (cópia irmã em
+            # blocos (24->96) sem mudar o total de threads/trabalho. Já é
+            # hardware-agnóstico por natureza: grid_x deriva de conv_dim
+            # (largura do MODELO, não da GPU), então já escala sozinho para
+            # QUALQUER contagem de CUs -- 96 blocos ocupa bem tanto uma GPU
+            # de 32 CUs (RX 7600, 3 blocos/CU) quanto uma maior (ver
+            # docs/PERFORMANCE.md, cópia irmã em
             # fallback_executor.py::_calculate_launch_dims).
             conv_dim = self.metadata.get('linear_attn.conv_dim', 6144)
             conv1d_block = 64
@@ -520,14 +526,21 @@ class HIPGraphExecutor:
                     RAW_Q6K_WEIGHTS as _RAW_Q6K_WEIGHTS,
                     RAW_Q8_0_WEIGHTS as _RAW_Q8_0_WEIGHTS,
                 )
-                _attn_q_name = (f"blk.{node.name.split('.')[1]}.attn_q.weight"
-                                if node.op_type == NodeType.RMSNORM and node.name.endswith('.attn_norm')
-                                else None)
+                # Checa as 4 matrizes (Q/K/V/O), não só Q -- ver comentário
+                # completo na cópia irmã em fallback_executor.py (bug real
+                # achado com o Qwen2.5 0.5B: dtype mistura por camada, attn_v
+                # cru em Q8_0 enquanto attn_q segue FP16 na mesma camada).
+                _layer_idx_str = node.name.split('.')[1] if (node.op_type == NodeType.RMSNORM and node.name.endswith('.attn_norm')) else None
+                _attn_q_name = f"blk.{_layer_idx_str}.attn_q.weight" if _layer_idx_str is not None else None
+                _raw_sets = (_RAW_Q4K_WEIGHTS, _RAW_Q6K_WEIGHTS, _RAW_Q8_0_WEIGHTS)
+                _any_qkvo_raw = _attn_q_name is not None and any(
+                    f"blk.{_layer_idx_str}.{suffix}" in s
+                    for suffix in ("attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight")
+                    for s in _raw_sets
+                )
                 if (seq_len == 1 and _attn_q_name is not None
                         and _attn_q_name in self.tensor_mapping
-                        and _attn_q_name not in _RAW_Q4K_WEIGHTS
-                        and _attn_q_name not in _RAW_Q6K_WEIGHTS
-                        and _attn_q_name not in _RAW_Q8_0_WEIGHTS
+                        and not _any_qkvo_raw
                         and self.metadata.get('rope_type') != 2):
                     layer_idx = int(node.name.split('.')[1])
                     try:
@@ -583,8 +596,17 @@ class HIPGraphExecutor:
                 if seq_len == 1 and self._split_kv.enabled and node.op_type == NodeType.ATTENTION:
                     layer_idx = int(node.name.split('.')[1])
                     try:
+                        # node.input_tensors = [q, k, v] com os nomes REAIS
+                        # que o RoPE modificou in-place -- q_proj.output/
+                        # k_proj.output pro Qwen2.5/Granite, mas q_norm.output/
+                        # k_norm.output pro Qwen3.5 (tem passo de RMSNorm
+                        # por-head entre a projeção e o RoPE). Passar explícito
+                        # em vez de deixar o dispatcher reconstruir por
+                        # convenção fixa -- ver docstring de build_launches.
                         launches = self._split_kv.build_launches(
-                            layer_idx, self.tensor_mapping, self.staging_kv_offset.ptr
+                            layer_idx, self.tensor_mapping, self.staging_kv_offset.ptr,
+                            q_name=node.input_tensors[0], k_name=node.input_tensors[1],
+                            v_name=node.input_tensors[2],
                         )
                         for fn, args, grid, block, shared_mem in launches:
                             self.hip.launch_kernel_recorded(fn, args, grid, block, shared_mem)

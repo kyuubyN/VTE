@@ -3,7 +3,7 @@ from typing import Dict
 from vte.core.model_config import ModelConfig
 from vte.bridge.memory import SlabAllocator, MemoryRegion
 from vte.bridge.errors import HIPSafetyError
-from vte.compiler.qwen_mapper import ActivationArena  # genérico (bump-pointer arena), não específico do Qwen
+from vte.compiler.qwen_mapper import ActivationArena, format_oom_error  # genéricos, não específicos do Qwen
 from vte.bridge.logger import get_logger
 
 logger = get_logger(__name__)
@@ -189,10 +189,7 @@ class Qwen3_5TensorMapper:
         free_vram = allocator.get_stats()['free_bytes']
 
         if total_required > free_vram:
-            raise HIPSafetyError(
-                f"OOM Preventivo: Modelo requer {total_required/(1024**3):.2f}GB, "
-                f"mas o Slab tem apenas {free_vram/(1024**3):.2f}GB livres."
-            )
+            raise HIPSafetyError(format_oom_error("Qwen3.5", total_required, allocator, context_length))
 
         tensor_mapping = {}
         for name, t_info in self.parser.tensors.items():

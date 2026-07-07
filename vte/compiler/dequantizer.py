@@ -70,6 +70,62 @@ def dequantize_q4_k(raw: bytes, n_elements: int) -> np.ndarray:
     return out.reshape(-1)[:n_elements]
 
 
+def dequantize_q5_k(raw: bytes, n_elements: int) -> np.ndarray:
+    """
+    Dequantiza um tensor Q5_K (llama.cpp super-block format) para float32.
+
+    Achado ao testar um segundo GGUF do Qwen3.5 (mesmo modelo, conversor
+    diferente -- Unsloth em vez de Bartowski): esse arquivo usa Q5_K pra
+    attn_qkv/ssm_out das camadas linear_attention (36 tensores), tipo que
+    nenhum dos GGUFs anteriores usava. Mesma mecânica de scale/min do Q4_K
+    (reaproveita `_q4k_scale_min`), mais um 5º bit ("qh") por peso.
+
+    Layout do bloco (176 bytes / 256 elementos):
+        d:      fp16 (2 bytes)  - escala super-block dos "scales"
+        dmin:   fp16 (2 bytes)  - escala super-block dos "mins"
+        scales: 12 bytes        - 8 pares (scale, min) de 6 bits, IDÊNTICO ao Q4_K
+        qh:     32 bytes        - 5º bit (mais significativo) de cada peso,
+                 um bit por peso, REUTILIZADO pelos 4 grupos de 64 (o bit
+                 testado desloca 2 posições a cada grupo -- u1/u2 abaixo)
+        qs:     128 bytes       - nibbles baixos/altos, igual ao Q4_K
+
+    w = d*sc*(nibble + (16 se o bit qh estiver setado, senão 0)) - dmin*mn,
+    mesmo agrupamento de 64 elementos (4 grupos) e mesma extração de
+    scale/min do Q4_K (`get_scale_min_k4` no llama.cpp).
+    """
+    n_blocks = n_elements // QK_K
+    block_bytes = 2 + 2 + 12 + 32 + 128
+    blocks = np.frombuffer(raw, dtype=np.uint8, count=n_blocks * block_bytes).reshape(n_blocks, block_bytes)
+
+    d = blocks[:, 0:2].copy().view(np.float16).astype(np.float32)[:, 0]
+    dmin = blocks[:, 2:4].copy().view(np.float16).astype(np.float32)[:, 0]
+    scales = blocks[:, 4:16].astype(np.int32)
+    qh = blocks[:, 16:48]
+    qs = blocks[:, 48:176]
+
+    out = np.empty((n_blocks, QK_K), dtype=np.float32)
+
+    for mblk in range(4):
+        sc0, mn0 = _q4k_scale_min(scales, 2 * mblk + 0)
+        sc1, mn1 = _q4k_scale_min(scales, 2 * mblk + 1)
+        d1 = d * sc0; m1 = dmin * mn0
+        d2 = d * sc1; m2 = dmin * mn1
+
+        u1 = np.uint8(1 << (2 * mblk))
+        u2 = np.uint8(2 << (2 * mblk))
+        qh_bit1 = np.where((qh & u1) != 0, 16.0, 0.0).astype(np.float32)
+        qh_bit2 = np.where((qh & u2) != 0, 16.0, 0.0).astype(np.float32)
+
+        q = qs[:, 32 * mblk:32 * mblk + 32]
+        lo = (q & 0x0F).astype(np.float32)
+        hi = (q >> 4).astype(np.float32)
+
+        out[:, 64 * mblk:64 * mblk + 32] = d1[:, None] * (lo + qh_bit1) - m1[:, None]
+        out[:, 64 * mblk + 32:64 * mblk + 64] = d2[:, None] * (hi + qh_bit2) - m2[:, None]
+
+    return out.reshape(-1)[:n_elements]
+
+
 def dequantize_q6_k(raw: bytes, n_elements: int) -> np.ndarray:
     """
     Dequantiza um tensor Q6_K (llama.cpp super-block format) para float32.
@@ -140,6 +196,54 @@ def dequantize_q8_0(raw: bytes, n_elements: int) -> np.ndarray:
     return out.reshape(-1)[:n_elements]
 
 
+def dequantize_q5_0(raw: bytes, n_elements: int) -> np.ndarray:
+    """
+    Dequantiza um tensor Q5_0 (llama.cpp block format) para float32.
+
+    Achado ao adicionar o Qwen2.5 0.5B (draft model do speculative decoding,
+    Fase 5): esse GGUF mistura Q5_0 (132 de 290 tensores) além de F32/Q8_0/
+    Q6_K/Q4_K -- tipo nunca antes visto nos outros 3 modelos já suportados,
+    então nem o cálculo de tamanho (gguf_parser.py) nem o dequant existiam
+    pra ele. Sem isso, o parser calculava o tamanho do tensor como se fosse
+    FP16 (fallback genérico) -- 2.9x maior que o real (22 bytes/32 elementos
+    em vez de ~1.4 bytes/elemento), estourando o offset calculado dos
+    tensores seguintes e disparando a barreira de segurança de "tensor além
+    do arquivo" (`_validate_tensor_bounds`).
+
+    Layout do bloco (22 bytes / 32 elementos), confirmado contra
+    gguf.GGUFReader real:
+        d:  fp16 (2 bytes)  - escala do bloco
+        qh: uint32 (4 bytes) - 5º bit (mais significativo) de cada um dos
+            32 pesos, um bit por peso
+        qs: 16 bytes         - 32 nibbles de 4 bits (2 por byte)
+
+    w[j]      = ((qs[j] & 0x0F) | (bit(qh, j)      << 4)) - 16,  d escalado
+    w[j+16]   = ((qs[j] >> 4)   | (bit(qh, j + 16) << 4)) - 16,  d escalado
+    para j em 0..15 -- mesma extração de bit alto (`qh`) e remontagem de
+    nibble baixo/alto do llama.cpp (`dequantize_row_q5_0`).
+    """
+    QK5_0 = 32
+    n_blocks = n_elements // QK5_0
+    block_bytes = 2 + 4 + 16
+    blocks = np.frombuffer(raw, dtype=np.uint8, count=n_blocks * block_bytes).reshape(n_blocks, block_bytes)
+
+    d = blocks[:, 0:2].copy().view(np.float16).astype(np.float32)[:, 0]
+    qh = blocks[:, 2:6].copy().view(np.uint32)[:, 0]
+    qs = blocks[:, 6:22]
+
+    j = np.arange(16)
+    xh_0 = ((qh[:, None] >> (j[None, :] + 0)) << 4).astype(np.uint32) & 0x10
+    xh_1 = ((qh[:, None] >> (j[None, :] + 12))).astype(np.uint32) & 0x10
+
+    x0 = ((qs & 0x0F).astype(np.int32) | xh_0.astype(np.int32)) - 16
+    x1 = ((qs >> 4).astype(np.int32) | xh_1.astype(np.int32)) - 16
+
+    out = np.empty((n_blocks, QK5_0), dtype=np.float32)
+    out[:, 0:16] = x0 * d[:, None]
+    out[:, 16:32] = x1 * d[:, None]
+    return out.reshape(-1)[:n_elements]
+
+
 def to_fp16_bytes(raw: bytes, dtype: int, n_elements: int) -> bytes:
     """Converte os bytes crus de um tensor GGUF (qualquer dtype suportado) para FP16 contíguo."""
     if dtype == 0:  # F32
@@ -155,5 +259,11 @@ def to_fp16_bytes(raw: bytes, dtype: int, n_elements: int) -> bytes:
         return arr.astype(np.float16).tobytes()
     if dtype == 14:  # Q6_K
         arr = dequantize_q6_k(raw, n_elements)
+        return arr.astype(np.float16).tobytes()
+    if dtype == 6:  # Q5_0
+        arr = dequantize_q5_0(raw, n_elements)
+        return arr.astype(np.float16).tobytes()
+    if dtype == 13:  # Q5_K
+        arr = dequantize_q5_k(raw, n_elements)
         return arr.astype(np.float16).tobytes()
     raise ValueError(f"Dtype GGUF não suportado para dequantização: {dtype}")

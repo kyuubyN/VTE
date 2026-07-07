@@ -35,6 +35,15 @@ GRANITE_4_1_3B_SIZE_MAX = 4 * 1024 * 1024 * 1024
 # modelos (não um cheque em branco, mas não colado no byte exato).
 QWEN35_2B_SIZE_MIN = 1 * 1024 * 1024 * 1024
 QWEN35_2B_SIZE_MAX = 2 * 1024 * 1024 * 1024
+# Arquivo real medido nesta sessão: 4683074208 bytes (~4.36GB).
+QWEN2_5_7B_EXPECTED_HASH = "sha256:PLACEHOLDER"
+QWEN2_5_7B_SIZE_MIN = 4 * 1024 * 1024 * 1024
+QWEN2_5_7B_SIZE_MAX = 5 * 1024 * 1024 * 1024
+# Draft model do speculative decoding (Fase 5). Arquivo real medido nesta
+# sessão: 397808192 bytes (~0.37GB).
+QWEN2_5_0_5B_EXPECTED_HASH = "sha256:PLACEHOLDER"
+QWEN2_5_0_5B_SIZE_MIN = 300 * 1024 * 1024
+QWEN2_5_0_5B_SIZE_MAX = 500 * 1024 * 1024
 
 DEFAULT_GPU_ARCH = "gfx1100"
 GPU_ARCH_MAP = {
