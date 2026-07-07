@@ -90,6 +90,7 @@ class TextGenerator:
         # 3. Fase de Decode: gera token por token
         print("Fase de Decode:")
         generated_text = ""
+        prompt_len = len(input_ids)
         
         for i in range(max_new_tokens):
             if self.kv_cache_pos >= self.max_seq_len:
@@ -102,7 +103,8 @@ class TextGenerator:
                 top_p=top_p,
                 top_k=top_k,
                 repetition_penalty=repetition_penalty,
-                generated_tokens=self.generated_tokens
+                generated_tokens=self.generated_tokens,
+                prompt_len=prompt_len
             )
             
             self.generated_tokens.append(next_token)
@@ -161,7 +163,8 @@ class TextGenerator:
         top_p: float,
         top_k: int,
         repetition_penalty: float,
-        generated_tokens: List[int]
+        generated_tokens: List[int],
+        prompt_len: int
     ) -> int:
         """Gera um único token"""
         last_token = generated_tokens[-1]
@@ -238,7 +241,8 @@ class TextGenerator:
             top_p=top_p,
             top_k=top_k,
             repetition_penalty=repetition_penalty,
-            generated_tokens=generated_tokens
+            generated_tokens=generated_tokens[prompt_len:],
+            ignore_tokens=set(self.tokenizer.special_tokens.values())
         )
         
         if self.debug:

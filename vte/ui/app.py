@@ -1106,6 +1106,7 @@ class VTEApp:
                 self.thinking_toggle_btn.update()
             self._thinking_seen_this_turn = True
             self.current_thinking.value += token
+            self._fit_bubble_text(self.current_thinking)
             self.current_thinking.update()
         else:
             # 1o token de "answer" depois de ter havido "thinking" nesta
@@ -1131,6 +1132,25 @@ class VTEApp:
         # sempre numa bolha vazia sem isto.
         if self.typing_indicator and self.typing_indicator.visible:
             self.typing_indicator.visible = False
+            
+        if self.current_reply and not self.current_reply.value.strip():
+            if self._thinking_seen_this_turn:
+                msg_warning = (
+                    "[O modelo esgotou o limite de tokens da resposta durante o raciocínio. "
+                    "Tente aumentar o tamanho do contexto no seletor acima para dar mais espaço à resposta.]"
+                    if self.lang == "pt" else
+                    "[The model exhausted the response token limit during reasoning. "
+                    "Try increasing the context length in the selector above to allow more space for the answer.]"
+                )
+            else:
+                msg_warning = (
+                    "[Resposta vazia do modelo. Tente enviar a mensagem novamente.]"
+                    if self.lang == "pt" else
+                    "[Empty response from model. Please try sending the message again.]"
+                )
+            self.current_reply.value = msg_warning
+            self.current_reply.update()
+
         self.current_reply = None
         self.typing_indicator = None
         self.current_thinking = None

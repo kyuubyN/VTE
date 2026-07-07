@@ -677,26 +677,14 @@ class VTEModel:
                 self._hip.safe_memset(ctypes.c_void_p(pv), size, tag=key)
 
     def _default_repetition_penalty(self) -> float:
-        """1.1 é o valor calibrado para Qwen2.5/Granite, mas é fraco demais
-        para o Qwen3.5: em greedy decode (`temperature=0`) com textos mais
-        longos, 1.1 deixa o modelo colapsar num loop (`**Cultura:** **Cultura:**...`
-        até só `**` repetido); 1.3 evita o loop e termina naturalmente sem
-        degenerar em ruído de pontuação (1.5 já super-corrige nessa direção).
-        Medido comparando as três diretamente, mesmo prompt/seed."""
-        return 1.3 if self._architecture == "qwen35" else 1.1
+        if getattr(self, '_architecture', None) == "qwen35":
+            return 1.3
+        return 1.1
 
     def _default_temperature(self) -> float:
-        """0.7 é o default global (sampling normal), mas o Qwen3.5 tem mais
-        ruído numérico residual acumulado ao longo de 24 camadas do que
-        Qwen2.5/Granite (ver docs/QWEN35.md) -- pequeno demais pra mudar QUAL
-        token vence (por isso greedy/temperature=0 fica coerente), grande o
-        bastante pra distorcer a cauda da distribuição de onde o sampling
-        estocástico tira variedade. Testado 0.1/0.2/0.3/0.5/0.7: todo valor
-        >0 degenerou (frases corridas sem pontuação, troca de idioma no meio
-        da resposta); só 0.0 ficou consistentemente coerente. Trade-off
-        aceito: respostas do Qwen3.5 ficam determinísticas (mesmo prompt =
-        mesma resposta) até a causa do ruído em si ser reduzida."""
-        return 0.0 if self._architecture == "qwen35" else 0.7
+        if getattr(self, '_architecture', None) == "qwen35":
+            return 0.0
+        return 0.7
 
     def generate(
         self,
@@ -789,6 +777,7 @@ class VTEModel:
         # vte/core/incremental_decoder.py). O decoder segura bytes
         # incompletos entre chamadas de feed() até a sequência completar.
         utf8_decoder = IncrementalUTF8Decoder()
+        prompt_len = len(input_tokens)
 
         for i in range(max_tokens):
             next_token = self.sampler.sample(
@@ -797,7 +786,8 @@ class VTEModel:
                 top_p=top_p,
                 top_k=top_k,
                 repetition_penalty=repetition_penalty,
-                generated_tokens=input_tokens,
+                generated_tokens=input_tokens[prompt_len:],
+                ignore_tokens=set(self.tokenizer.special_tokens.values()),
             )
 
             # Para no fim de turno (<|im_end|>) ou <|endoftext|>. Sem isto o
@@ -939,7 +929,8 @@ class VTEModel:
                 tok = self.sampler.sample(
                     logits=logits_batch[b], temperature=temperature, top_p=top_p,
                     top_k=top_k, repetition_penalty=repetition_penalty,
-                    generated_tokens=tokenized[b],
+                    generated_tokens=tokenized[b][prompt_len:],
+                    ignore_tokens=set(self.tokenizer.special_tokens.values()),
                 )
                 tokenized[b].append(tok)
                 next_tokens.append(tok)

@@ -51,7 +51,7 @@ def test_mapper_oom_preventive(monkeypatch):
 
     class FakeAllocator:
         def get_stats(self):
-            return {'free_bytes': 8 * 1024**3}
+            return {'free_bytes': 8 * 1024**3, 'total_bytes': 16 * 1024**3}
 
     with pytest.raises(HIPSafetyError, match="OOM Preventivo"):
         mapper.map_and_allocate_tensors(FakeAllocator(), hip_runtime=None)

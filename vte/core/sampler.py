@@ -57,7 +57,8 @@ class Sampler:
         top_p: float = 0.9,
         top_k: int = 50,
         repetition_penalty: float = 1.1,
-        generated_tokens: Optional[List[int]] = None
+        generated_tokens: Optional[List[int]] = None,
+        ignore_tokens: Optional[set] = None
     ) -> int:
         """
         Amostra o proximo token da distribuicao de logits.
@@ -75,6 +76,9 @@ class Sampler:
             window = generated_tokens[-REPETITION_WINDOW:]
             token_ids_arr = np.asarray(window, dtype=np.int64)
             token_ids_arr = token_ids_arr[token_ids_arr < len(logits)]
+            if ignore_tokens and token_ids_arr.size > 0:
+                mask = np.isin(token_ids_arr, list(ignore_tokens), invert=True)
+                token_ids_arr = token_ids_arr[mask]
             if token_ids_arr.size > 0:
                 unique_ids, counts = np.unique(token_ids_arr, return_counts=True)
                 counts = np.minimum(counts, REPETITION_COUNT_CAP).astype(np.float64)

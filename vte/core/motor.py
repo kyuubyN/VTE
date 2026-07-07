@@ -260,12 +260,7 @@ class InferenceEngine:
             # formato certo do seu próprio modelo) antes de gerar. Sem isto
             # o modelo faz completion de texto cru em vez de responder como
             # assistente.
-            # enable_thinking=True: sem efeito nos tokenizers atuais (nem
-            # Qwen2.5 nem Granite têm um bloco <think> condicional a essa
-            # flag no chat template deles) -- fixo em True só para deixar o
-            # hook pronto para um modelo que de fato o use (ver
-            # ThinkingSectionScanner e apply_chat_template em tokenizer.py).
-            chat_prompt = self.model.tokenizer.apply_chat_template(prompt, enable_thinking=True)
+            chat_prompt = self.model.tokenizer.apply_chat_template(prompt, enable_thinking=False)
             if chat_prompt.strip().endswith("<think>"):
                 self._thinking_scanner = ThinkingSectionScanner(start_in_thinking=True)
             generator = self.model.generate(chat_prompt, max_tokens=max_tokens)

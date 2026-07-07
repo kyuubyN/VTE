@@ -188,6 +188,7 @@ class QwenTensorMapper:
 
         total = weights_total + kv_pool_size + rope_size + arena_size + buffers_size
         logger.warning(f"DEBUG REQS: weights={weights_total / 1024**2} MB, kv={kv_pool_size / 1024**2} MB, rope={rope_size / 1024**2} MB, arena={arena_size / 1024**2} MB, buffers={buffers_size / 1024**2} MB, total={total / 1024**2} MB (batch_size={batch_size})")
+        from vte.config import VRAM_PADDING_BYTES
         return {
             'weights': weights_total,
             'kv_cache': kv_pool_size,
@@ -195,7 +196,7 @@ class QwenTensorMapper:
             'rope': rope_size,
             'buffers': buffers_size,
             'total': total,
-            'with_margin': int(total * 1.2)
+            'with_margin': int(total + VRAM_PADDING_BYTES)
         }
         
     def _calculate_tensor_size(self, tensor_info: dict) -> int:

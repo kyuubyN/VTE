@@ -170,6 +170,7 @@ class Qwen3_5TensorMapper:
             f"linear_attn_state={linear_attn_state_size/1024**2:.1f} MB ({linear_attn_layers} camadas), "
             f"rope={rope_size/1024**2:.1f} MB, arena={arena_size/1024**2:.1f} MB, total={total/1024**2:.1f} MB"
         )
+        from vte.config import VRAM_PADDING_BYTES
         return {
             'weights': weights_total,
             'kv_cache': kv_pool_size,
@@ -178,7 +179,7 @@ class Qwen3_5TensorMapper:
             'rope': rope_size,
             'buffers': buffers_size,
             'total': total,
-            'with_margin': int(total * 1.2),
+            'with_margin': int(total + VRAM_PADDING_BYTES),
         }
 
     def map_and_allocate_tensors(self, allocator: SlabAllocator, hip_runtime, profiler=None, context_length=2048, batch_size=1) -> Dict[str, int]:
