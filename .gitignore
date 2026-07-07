@@ -24,7 +24,7 @@ Model/*.gguf
 !Model/.gitkeep
 test_output.txt
 *.log
-
+Model/
 # Compilacao e Binarios
 *.hsaco
 *.o
@@ -56,4 +56,6 @@ Desktop.ini
 dist/
 build/
 *.egg-info/
-
+.scripts/
+.scripts/diagnostics/qwen35_reference/
+.scripts/diagnostics/
