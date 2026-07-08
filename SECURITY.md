@@ -1,6 +1,8 @@
-# Security Policy (VTE - Vector & Tensor Engine)
+[← Back to README](README.md)
 
-This document outlines the security model, trust assumptions, and mitigation mechanisms implemented in the **VTE (Vector & Tensor Engine)** to ensure stable execution and hardware safety. 
+# Security Policy
+
+This document outlines the security model, trust assumptions, and mitigation mechanisms implemented in **VTE (Vector Tensor Engine)** to ensure stable execution and hardware safety.
 
 > [!NOTE]
 > **VTE is an open-source, educational project developed for learning, experimentation, and academic coding challenges.** It is designed as a lightweight, from-scratch implementation of an LLM inference motor using AMD's HIP SDK on Windows, and should be treated as a study reference rather than a production-hardened environment.
@@ -9,7 +11,7 @@ This document outlines the security model, trust assumptions, and mitigation mec
 
 ## 1. Threat Model
 
-VTE operates under the assumption of a local execution environment. 
+VTE operates under the assumption of a local execution environment.
 
 ### Untrusted Inputs
 * **`.gguf` files**: The only input to this project that is treated as genuinely **untrusted**. Malicious GGUF files can contain corrupted headers, invalid offsets, or mutated tensors designed to cause buffer overflows, memory leaks, or GPU driver crashes.

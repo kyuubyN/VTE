@@ -4,6 +4,13 @@
 
 Granite 4.1 3B (Q8_0) was added as a deliberate stress test of the codebase's assumptions, all of which had been built and validated against exactly one model. It shares the compiler/IR/executor pipeline with Qwen almost entirely — new code was needed only where the architectures genuinely differ: `granite_mapper.py` (memory plan), `GraniteTokenizer` (vocabulary/chat template), a few extra per-node metadata fields (`rope_type`, `attention_scale`, `residual_scale`) threaded through the existing IR, and a raw-Q8_0 dequant path in the compiler alongside the existing Q4_K/Q6_K one. `SUPPORTED_ARCHITECTURES` (in `sanitizer.py`) and `VTEModel.MODEL_REGISTRY` (in `model.py`) are the two tables that make a new architecture selectable at all — both list Qwen2.5 and Granite side by side, and `model_name=` at `from_pretrained()`/CLI/UI-dropdown time is what picks between them (see [Getting started](USAGE.md)).
 
+On this page:
+
+- [The two headline bugs](#the-two-headline-bugs) — RoPE convention (NEOX vs. NORM) and `residual_scale` scoping
+- [Two smaller findings](#two-smaller-findings)
+- [Getting Granite's throughput up](#getting-granites-throughput-up)
+- [The Flet UI's model-switch race conditions](#the-flet-uis-model-switch-race-conditions)
+
 ## The two headline bugs
 
 Two of the bugs found while bringing Granite up were serious enough to cover in detail here rather than as one-line entries in [Bugs found during development](BUGS.md), because both are the kind of "plausible but wrong" numerical bug that document keeps coming back to — the model ran, produced fluent-looking text, and was still wrong:

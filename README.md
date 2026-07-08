@@ -25,6 +25,16 @@ The reason to build this from scratch was to have full control over every byte m
 
 As of this writing: single-sequence decode holds a **stable ~100 tok/s on Qwen2.5-1.5B**, and batched decode peaks at **~200 tok/s aggregate** at batch size 4 — both climbed from a ~41 tok/s baseline through profiling, not GEMV rewrites. IBM Granite 4.1 3B and Qwen3.5 2B run correctly in VRAM and reach similar throughput ratios vs. llama.cpp/Ollama. Full numbers below.
 
+## Screenshots
+
+<p align="center">
+  <img src="prints/vte-1-idle.png" width="32%" alt="VTE desktop UI — idle state, GPU telemetry dashboard">
+  <img src="prints/vte-2-granite-chat.png" width="32%" alt="VTE desktop UI — chat with Granite 4.1 3B, live tok/s and VRAM breakdown">
+  <img src="prints/vte-3-qwen-chat.png" width="32%" alt="VTE desktop UI — chat with Qwen2.5 1.5B, ~97 tok/s">
+</p>
+
+<p align="center"><sub>Chat panel (left) + live GPU telemetry dashboard (right): temperature, tok/s, VRAM breakdown (weights/KV cache/arena), and model lifecycle — all real numbers read from the GPU, not placeholders (see <a href="docs/LIMITATIONS.md#telemetry-and-desktop-ui">Known limitations</a>).</sub></p>
+
 ## Benchmark: VTE vs. Ollama (llama.cpp)
 
 Same GGUF files on disk for both engines, same prompt, `temperature=0`, decode-only timing (full methodology in [Performance](docs/PERFORMANCE.md)):

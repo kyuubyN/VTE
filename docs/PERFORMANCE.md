@@ -4,6 +4,14 @@
 
 Full stage-by-stage optimization history, batched-decode numbers, and the Ollama/llama.cpp cross-engine comparison. The headline numbers are also summarized on the [main README](../README.md#benchmark-vte-vs-ollama-llamacpp).
 
+On this page:
+
+- [Single-sequence decode (batch=1)](#single-sequence-decode-batch1) — the 18.8 → ~100 tok/s optimization history
+- [Batched decode](#batched-decode)
+- [Benchmark: VTE vs. Ollama (llama.cpp)](#benchmark-vte-vs-ollama-llamacpp) — methodology, per-model write-ups, the VRAM-reduction pass
+- [Portability: dynamic Compute-Unit detection](#portability-dynamic-compute-unit-detection-rdna2rdna3-not-just-the-rx-7600)
+- [Optimizations tried and rejected](#optimizations-tried-and-rejected)
+
 ## Single-sequence decode (batch=1)
 
 | Stage | Throughput (batch=1) | What changed |

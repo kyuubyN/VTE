@@ -4,6 +4,12 @@
 
 How the codebase fits together, why QKV fusion is on but FFN fusion is off, and notes for anyone reviewing this from an AMD/ROCm background.
 
+On this page:
+
+- [How it fits together](#how-it-fits-together) — the four packages (`vte/bridge`, `vte/compiler`, `vte/core`, `vte/ui`), bottom-up
+- [Why QKV projection is fused, and why FFN fusion is off](#why-qkv-projection-is-fused-and-why-ffn-fusion-is-off)
+- [Notes for anyone reviewing this from an AMD/ROCm perspective](#notes-for-anyone-reviewing-this-from-an-amdrocm-perspective)
+
 ## How it fits together
 
 Three packages, roughly bottom-up:
