@@ -47,8 +47,7 @@ class GPUKeepAlive:
     def _compile_and_allocate(self):
         arch = self.hip.get_gpu_architecture()
         codegen = CodegenEngine()
-        hsaco_path = codegen.compile_kernel(template_name="keepalive", arch=arch)
-        _, function = self.hip.load_kernel(hsaco_path, "keepalive_kernel")
+        _, function = codegen.load_kernel_safe(self.hip, "keepalive", arch, "keepalive_kernel")
         self._kernel_fn = function
 
         block = self.allocator.allocate(self._BUFFER_ELEMENTS * 4, "gpu_keepalive_buffer", MemoryRegion.SCRATCH)

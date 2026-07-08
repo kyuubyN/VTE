@@ -101,19 +101,16 @@ class SplitKVAttentionDispatcher:
         if 'append' not in self._kernel_cache:
             arch = self.hip.get_gpu_architecture()
 
-            hsaco = self.codegen.compile_kernel(template_name='kv_cache_append', arch=arch)
-            _, fn = self.hip.load_kernel(hsaco, 'kv_cache_append_kernel')
+            _, fn = self.codegen.load_kernel_safe(self.hip, 'kv_cache_append', arch, 'kv_cache_append_kernel')
             self._kernel_cache['append'] = fn
 
-            hsaco = self.codegen.compile_kernel(
-                template_name='flash_attention_split_kv_partial', arch=arch,
+            _, fn = self.codegen.load_kernel_safe(
+                self.hip, 'flash_attention_split_kv_partial', arch, 'flash_attention_split_kv_partial_kernel',
                 split_kv_chunk_size=self.chunk_size,
             )
-            _, fn = self.hip.load_kernel(hsaco, 'flash_attention_split_kv_partial_kernel')
             self._kernel_cache['partial'] = fn
 
-            hsaco = self.codegen.compile_kernel(template_name='flash_attention_split_kv_reduce', arch=arch)
-            _, fn = self.hip.load_kernel(hsaco, 'flash_attention_split_kv_reduce_kernel')
+            _, fn = self.codegen.load_kernel_safe(self.hip, 'flash_attention_split_kv_reduce', arch, 'flash_attention_split_kv_reduce_kernel')
             self._kernel_cache['reduce'] = fn
 
             num_q_heads = self.metadata.get('attention.head_count', 12)

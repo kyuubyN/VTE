@@ -29,6 +29,7 @@ GEMV_COALESCED_BLOCK = 64
 RAW_Q4K_WEIGHTS: set = set()
 RAW_Q6K_WEIGHTS: set = set()
 RAW_Q8_0_WEIGHTS: set = set()
+RAW_Q5_0_WEIGHTS: set = set()
 
 # Epilogue Fusion do residual: {gemv_node_name: (out_tensor, residual_tensor)}.
 # O GEMV escreve direto na saída do Add e soma residual[row] no epílogo; o nó
@@ -80,6 +81,11 @@ def register_raw_q8_0_weights(names) -> None:
     RAW_Q8_0_WEIGHTS.update(names)
 
 
+def register_raw_q5_0_weights(names) -> None:
+    RAW_Q5_0_WEIGHTS.clear()
+    RAW_Q5_0_WEIGHTS.update(names)
+
+
 def _is_q4k_matmul(node: IRNode) -> bool:
     """True se o peso do MATMUL está cru em Q4_K (roteia para gemv_q4k)."""
     if node.op_type != NodeType.MATMUL:
@@ -102,6 +108,14 @@ def _is_q8_0_matmul(node: IRNode) -> bool:
         return False
     inputs = getattr(node, 'input_tensors', None) or []
     return len(inputs) >= 2 and inputs[1] in RAW_Q8_0_WEIGHTS
+
+
+def _is_q5_0_matmul(node: IRNode) -> bool:
+    """True se o peso do MATMUL está cru em Q5_0 (roteia para gemv_q5_0)."""
+    if node.op_type != NodeType.MATMUL:
+        return False
+    inputs = getattr(node, 'input_tensors', None) or []
+    return len(inputs) >= 2 and inputs[1] in RAW_Q5_0_WEIGHTS
 
 # Nós MATMUL roteados para o kernel GEMV coalescido (Split-K, 1 bloco/neurônio,
 # leitura de peso coalescida entre lanes + redução via __shfl_down).
@@ -308,8 +322,7 @@ class FallbackExecutor:
         cache_key = f"{NodeType.EMBEDDING}_{template}"
         if cache_key not in self._kernel_cache:
             try:
-                hsaco_path = self.codegen.compile_kernel(template, arch=self._arch)
-                module, kernel = self.hip.load_kernel(hsaco_path, f"{template}_kernel")
+                module, kernel = self.codegen.load_kernel_safe(self.hip, template, self._arch, f"{template}_kernel")
                 self._kernel_cache[cache_key] = kernel
             except Exception as e:
                 logger.error(f"Erro compilando {template}: {e}")
@@ -355,8 +368,7 @@ class FallbackExecutor:
         a/b usam Q8_0 crus."""
         cache_key = "fused_gdn_proj"
         if cache_key not in self._kernel_cache:
-            hsaco_path = self.codegen.compile_kernel(template_name=cache_key, arch=self._arch)
-            _, fn = self.hip.load_kernel(hsaco_path, f"{cache_key}_kernel")
+            _, fn = self.codegen.load_kernel_safe(self.hip, cache_key, self._arch, f"{cache_key}_kernel")
             self._kernel_cache[cache_key] = fn
         kernel = self._kernel_cache[cache_key]
 
@@ -461,7 +473,7 @@ class FallbackExecutor:
         _attn_k_name = f"blk.{layer_idx}.attn_k.weight"
         _attn_v_name = f"blk.{layer_idx}.attn_v.weight"
         _attn_o_name = f"blk.{layer_idx}.attn_output.weight"
-        _raw_sets = (RAW_Q4K_WEIGHTS, RAW_Q6K_WEIGHTS, RAW_Q8_0_WEIGHTS)
+        _raw_sets = (RAW_Q4K_WEIGHTS, RAW_Q6K_WEIGHTS, RAW_Q8_0_WEIGHTS, RAW_Q5_0_WEIGHTS)
         _qkv_fusable = (_attn_q_name in self.tensor_mapping
                         and not any(n in s for n in (_attn_q_name, _attn_k_name, _attn_v_name, _attn_o_name) for s in _raw_sets)
                         and self.metadata.get('rope_type') != 2)
@@ -530,18 +542,17 @@ class FallbackExecutor:
             # calcular. Desativado especificamente pra essas camadas -- usa
             # o pipeline próprio (nós separados) em vez do fundido.
             #
-            # attn_q.weight em RAW_Q4K/Q6K/Q8_0_WEIGHTS: o kernel fundido lê
-            # os pesos como `__half*` puro, sem dequant embutido -- roteá-
-            # los crus (Granite/Qwen2.5, decisão desta sessão pra reduzir
-            # VRAM) produziria valores errados/NaN se a fusão tentasse
-            # usá-los. Sem a fusão, o despacho genérico por-nó já roteia
-            # pro gemv_q4k/q6k/q8_0 (que sabem desquantizar) automaticamente.
-            if (seq_len == 1 and node.name == f"blk.{layer_idx}.attn_norm"
-                    and _attn_q_name in self.tensor_mapping
-                    and _attn_q_name not in RAW_Q4K_WEIGHTS
-                    and _attn_q_name not in RAW_Q6K_WEIGHTS
-                    and _attn_q_name not in RAW_Q8_0_WEIGHTS
-                    and self.metadata.get('rope_type') != 2):
+            # Qualquer projeção Q/K/V/O em RAW_Q4K/Q6K/Q8_0/Q5_0_WEIGHTS: o
+            # kernel fundido lê os pesos como `__half*` puro, sem dequant
+            # embutido -- roteá-los crus produziria valores errados/NaN se a
+            # fusão tentasse usá-los. Sem a fusão, o despacho genérico por-nó
+            # já roteia pro gemv_q4k/q6k/q8_0/q5_0 (que sabem desquantizar)
+            # automaticamente. Reusa `_qkv_fusable` (calculado acima, já
+            # confere as 4 projeções + rope_type) em vez de reafirmar aqui só
+            # com attn_q -- antes as duas checagens podiam divergir (esta só
+            # olhava Q; `_qkv_fusable`/`qkv_fused_names" olhava as 4), o que
+            # deixava margem pra disparar a fusão mesmo com K/V/O crus.
+            if (seq_len == 1 and node.name == f"blk.{layer_idx}.attn_norm" and _qkv_fusable):
                 try:
                     prof = getattr(self.hip, '_profiler', None)
                     if prof is not None and prof.enabled:
@@ -767,6 +778,8 @@ class FallbackExecutor:
                 template_name = "gemv_q6k"
             elif _is_q8_0_matmul(node):
                 template_name = "gemv_q8_0"
+            elif _is_q5_0_matmul(node):
+                template_name = "gemv_q5_0"
             elif _is_vectorized_matmul(node):
                 template_name = "gemv_coalesced"
             else:
@@ -776,14 +789,12 @@ class FallbackExecutor:
 
             logger.info(f"Compilando kernel para {node.name} ({template_name})...")
             try:
-                hsaco_path = self.codegen.compile_kernel(
-                    template_name=template_name,
-                    arch=self._arch,
+                module, function = self.codegen.load_kernel_safe(
+                    self.hip, template_name, self._arch, f"{template_name}_kernel",
                     hidden_size=node.shape[-1] if node.shape else 1536,
                     tile_size=256,
                     is_mega_kernel=False
                 )
-                module, function = self.hip.load_kernel(hsaco_path, f"{template_name}_kernel")
                 self._kernel_cache[cache_key] = function
             except Exception as e:
                 logger.error(f"Falha ao compilar {node.name}: {e}")
@@ -803,7 +814,7 @@ class FallbackExecutor:
         if node.op_type == NodeType.MATMUL:
             # gate/up (Q4_K -> gemv_q4k) e down/attn_output (FP16 -> gemv_coalesced)
             # usam a mesma geometria: 1 bloco/neurônio, 64 threads dividindo K.
-            if _is_q4k_matmul(node) or _is_q6k_matmul(node) or _is_q8_0_matmul(node) or _is_vectorized_matmul(node):
+            if _is_q4k_matmul(node) or _is_q6k_matmul(node) or _is_q8_0_matmul(node) or _is_q5_0_matmul(node) or _is_vectorized_matmul(node):
                 return _coalesced_gemv_dims(node, seq_len, batch)
             out_features = node.shape[-1]
             m = batch * seq_len
@@ -909,11 +920,7 @@ class FallbackExecutor:
         import ctypes
         
         # O kernel matmul testou via CodegenEngine direto, mas aqui vamos compilar
-        hsaco_path = self.codegen.compile_kernel(
-            template_name="rope",
-            arch=self._arch
-        )
-        mod, kernel = self.hip.load_kernel(hsaco_path, "rope_kernel")
+        mod, kernel = self.codegen.load_kernel_safe(self.hip, "rope", self._arch, "rope_kernel")
         
         # Monta argumentos passados por valor como ints (similar a MatMul)
         c_seq = ctypes.c_int(seq_len)
@@ -958,11 +965,7 @@ class FallbackExecutor:
         import ctypes
         from vte.compiler.ir import NodeType
         
-        hsaco_path = self.codegen.compile_kernel(
-            template_name="gqa_attention",
-            arch=self._arch
-        )
-        mod, kernel = self.hip.load_kernel(hsaco_path, "gqa_attention_kernel")
+        mod, kernel = self.codegen.load_kernel_safe(self.hip, "gqa_attention", self._arch, "gqa_attention_kernel")
         
         c_seq = ctypes.c_int(seq_len)
         c_q_heads = ctypes.c_int(num_q_heads)
@@ -1005,11 +1008,7 @@ class FallbackExecutor:
         """Executa kernel SwiGLU Elementwise isolado para validação"""
         import ctypes
         
-        hsaco_path = self.codegen.compile_kernel(
-            template_name="swiglu",
-            arch=self._arch
-        )
-        module, function = self.hip.load_kernel(hsaco_path, "swiglu_kernel")
+        module, function = self.codegen.load_kernel_safe(self.hip, "swiglu", self._arch, "swiglu_kernel")
         
         c_elements = ctypes.c_int(total_elements)
         

@@ -59,12 +59,11 @@ class VTEModel:
         # GPU maior (ex. RX 7900 XTX, 24GB) a mesma checagem aceita
         # naturalmente, sem código novo.
         "qwen2.5:7b-q4_k_m": "Qwen2.5-7B-Instruct.Q4_K_M.gguf",
-        # Draft model do speculative decoding (Fase 5) -- fica em
-        # Model/Classifier/ (subpasta dedicada), não em Model/ raiz.
-        # `from_pretrained` resolve isso sem mudança: Path("Model") /
-        # "Classifier/Qwen2.5-...gguf" já produz o caminho relativo certo,
-        # e o whitelist de nome no sanitizer usa Path.name (só o
-        # basename), então a subpasta não interfere na validação.
+        # Qwen2.5 0.5B -- fica em Model/Classifier/ (subpasta dedicada), não
+        # em Model/ raiz. `from_pretrained` resolve isso sem mudança:
+        # Path("Model") / "Classifier/Qwen2.5-...gguf" já produz o caminho
+        # relativo certo, e o whitelist de nome no sanitizer usa Path.name
+        # (só o basename), então a subpasta não interfere na validação.
         "qwen2.5:0.5b-q4_k_m-draft": "Classifier/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
     }
 
@@ -107,6 +106,23 @@ class VTEModel:
         )
     
     @classmethod
+    def discover_models(cls) -> dict:
+        """Escaneia Model/ (recursivo, cobre subpastas como Model/Classifier/)
+        por qualquer `.gguf` e mapeia nome amigável (stem do arquivo) -> Path
+        resolvido. Descoberta dinâmica: basta copiar um arquivo pra Model/
+        pra ele ficar carregável por `from_pretrained(stem)`, sem editar
+        MODEL_REGISTRY nem nenhum código -- a arquitetura (qwen2/granite/
+        qwen35) e o tamanho continuam validados pelo sanitizer no load (ver
+        sanitizer.py::SUPPORTED_ARCHITECTURES), não aqui. Arquivos com o
+        mesmo stem em raízes diferentes: o primeiro encontrado vence."""
+        roots = [p for p in (Path("Model"), _REPO_ROOT / "Model") if p.is_dir()]
+        discovered: dict[str, Path] = {}
+        for root in roots:
+            for gguf_path in sorted(root.rglob("*.gguf")):
+                discovered.setdefault(gguf_path.stem, gguf_path)
+        return discovered
+
+    @classmethod
     def from_pretrained(
         cls,
         model_name: str,
@@ -117,30 +133,36 @@ class VTEModel:
         max_batch_size: int = 1,
         context_length: int = None
     ) -> "VTEModel":
-        if model_name not in cls.MODEL_REGISTRY:
-            available = ", ".join(cls.MODEL_REGISTRY.keys())
-            raise ValueError(
-                f"Modelo '{model_name}' não encontrado.\n"
-                f"Modelos disponíveis: {available}"
-            )
-        
-        filename = cls.MODEL_REGISTRY[model_name]
-        # Tenta primeiro relativo ao diretório de trabalho atual (permite
-        # uma pasta Model/ própria fora do repo, se o usuário quiser rodar
-        # assim), e só depois relativo à raiz do projeto -- que é o que
-        # realmente resolve o caso comum de `vte-ui` ser instalado como
-        # comando e invocado de qualquer lugar.
-        candidates = [Path("Model") / filename, _REPO_ROOT / "Model" / filename]
-        model_path = next((p for p in candidates if p.exists()), None)
+        if model_name in cls.MODEL_REGISTRY:
+            filename = cls.MODEL_REGISTRY[model_name]
+            # Tenta primeiro relativo ao diretório de trabalho atual (permite
+            # uma pasta Model/ própria fora do repo, se o usuário quiser rodar
+            # assim), e só depois relativo à raiz do projeto -- que é o que
+            # realmente resolve o caso comum de `vte-ui` ser instalado como
+            # comando e invocado de qualquer lugar.
+            candidates = [Path("Model") / filename, _REPO_ROOT / "Model" / filename]
+            model_path = next((p for p in candidates if p.exists()), None)
+            if model_path is None:
+                checked = "\n".join(f"  - {p.resolve()}" for p in candidates)
+                raise FileNotFoundError(
+                    f"Arquivo do modelo não encontrado. Caminhos checados:\n{checked}\n"
+                    f"Baixe o modelo e coloque-o na pasta 'Model/' na raiz do projeto "
+                    f"({_REPO_ROOT / 'Model'})."
+                )
+        else:
+            # Não é um nome registrado -- procura por descoberta dinâmica
+            # (qualquer .gguf já presente em Model/, pelo stem do arquivo).
+            discovered = cls.discover_models()
+            model_path = discovered.get(model_name)
+            if model_path is None:
+                available = ", ".join(cls.MODEL_REGISTRY.keys()) or "(nenhum)"
+                found = ", ".join(sorted(discovered.keys())) or "(nenhum .gguf em Model/)"
+                raise ValueError(
+                    f"Modelo '{model_name}' não encontrado.\n"
+                    f"Nomes registrados: {available}\n"
+                    f"Arquivos .gguf encontrados em Model/: {found}"
+                )
 
-        if model_path is None:
-            checked = "\n".join(f"  - {p.resolve()}" for p in candidates)
-            raise FileNotFoundError(
-                f"Arquivo do modelo não encontrado. Caminhos checados:\n{checked}\n"
-                f"Baixe o modelo e coloque-o na pasta 'Model/' na raiz do projeto "
-                f"({_REPO_ROOT / 'Model'})."
-            )
-        
         instance = cls(
             str(model_path),
             use_hip_graph=use_hip_graph,
@@ -345,12 +367,13 @@ class VTEModel:
             # Etapa C: registra os pesos que ficam CRUS em Q4_K/Q6_K/Q8_0 a
             # partir da MESMA função usada pelo loader/mapper, para o executor
             # rotear esses nós ao gemv_* correto. Fonte única de verdade.
-            from vte.compiler.qwen_mapper import is_raw_q4k_weight, is_raw_q6k_weight
+            from vte.compiler.qwen_mapper import is_raw_q4k_weight, is_raw_q6k_weight, is_raw_q5_0_weight
             from vte.compiler.granite_mapper import is_raw_q8_0_weight
-            from vte.core.fallback_executor import register_raw_q4k_weights, register_raw_q6k_weights, register_raw_q8_0_weights
+            from vte.core.fallback_executor import register_raw_q4k_weights, register_raw_q6k_weights, register_raw_q8_0_weights, register_raw_q5_0_weights
             raw_q4k = {n for n, t in self.parser.tensors.items() if is_raw_q4k_weight(n, t)}
             raw_q6k = {n for n, t in self.parser.tensors.items() if is_raw_q6k_weight(n, t)}
             raw_q8_0 = {n for n, t in self.parser.tensors.items() if is_raw_q8_0_weight(n, t)}
+            raw_q5_0 = {n for n, t in self.parser.tensors.items() if is_raw_q5_0_weight(n, t)}
             if architecture == "qwen35":
                 # qwen_mapper.is_raw_q6k_weight (linha acima) é restrito por
                 # NOME (ffn_down/token_embd) -- pensado pro GGUF misto
@@ -364,10 +387,27 @@ class VTEModel:
                 # architecture=="qwen35").
                 from vte.compiler.qwen3_5_mapper import is_raw_q6k_weight as qwen35_is_raw_q6k_weight
                 raw_q6k |= {n for n, t in self.parser.tensors.items() if qwen35_is_raw_q6k_weight(n, t)}
+            # Guardados na instância (não só nos sets globais) porque
+            # RAW_Q4K_WEIGHTS/RAW_Q6K_WEIGHTS/RAW_Q8_0_WEIGHTS/RAW_Q5_0_WEIGHTS
+            # em fallback_executor.py são estado GLOBAL de módulo, não por
+            # modelo -- carregar um SEGUNDO VTEModel no mesmo processo
+            # sobrescreve esses sets com os do modelo mais recentemente
+            # carregado, fazendo o guard de fusão QKV de um modelo já
+            # carregado consultar o registro ERRADO (bug real encontrado e
+            # documentado em docs/BUGS.md: um peso cru sendo lido como FP16
+            # puro pelo kernel fundido, colapso para "!!!!!!!!"). Se dois
+            # modelos precisarem coexistir no mesmo processo de novo no
+            # futuro, chame `_activate_raw_registries()` antes de decodificar
+            # em cada um.
+            self._raw_q4k = raw_q4k
+            self._raw_q6k = raw_q6k
+            self._raw_q8_0 = raw_q8_0
+            self._raw_q5_0 = raw_q5_0
             register_raw_q4k_weights(raw_q4k)
             register_raw_q6k_weights(raw_q6k)
             register_raw_q8_0_weights(raw_q8_0)
-            logger.info(f"Pesos crus in-kernel: Q4_K={len(raw_q4k)} (gemv_q4k), Q6_K={len(raw_q6k)} (gemv_q6k), Q8_0={len(raw_q8_0)} (gemv_q8_0)")
+            register_raw_q5_0_weights(raw_q5_0)
+            logger.info(f"Pesos crus in-kernel: Q4_K={len(raw_q4k)} (gemv_q4k), Q6_K={len(raw_q6k)} (gemv_q6k), Q8_0={len(raw_q8_0)} (gemv_q8_0), Q5_0={len(raw_q5_0)} (gemv_q5_0)")
 
             if architecture == "granite":
                 from vte.compiler.granite_mapper import GraniteTensorMapper
@@ -395,7 +435,7 @@ class VTEModel:
 
             weight_loader = GGUFWeightLoader(
                 self._path, self.parser, self.tensor_mapping,
-                raw_q4k=raw_q4k, raw_q6k=raw_q6k, raw_q8_0=raw_q8_0,
+                raw_q4k=raw_q4k, raw_q6k=raw_q6k, raw_q8_0=raw_q8_0, raw_q5_0=raw_q5_0,
             )
             loaded, total_bytes = weight_loader.load_all(self._hip)
             logger.info(f"Pesos injetados na VRAM: {loaded} tensores ({total_bytes / (1024*1024):.1f} MB)")
@@ -518,6 +558,15 @@ class VTEModel:
         # o cenário que o pulso existia para prevenir.
         self._keepalive_pulse_s = float(os.environ.get("VTE_KEEPALIVE_PULSE_MS", "0.0")) / 1000.0
 
+        # Registra este modelo no monitor de pressão de VRAM (singleton de
+        # processo) -- se a VRAM REAL da GPU (hipMemGetInfo, inclui qualquer
+        # outro programa usando a GPU) passar de 95% de forma sustentada, o
+        # guard descarrega automaticamente o modelo menos usado no momento
+        # (ver vte/bridge/vram_pressure_guard.py) em vez de deixar a próxima
+        # alocação falhar sem aviso.
+        from vte.bridge.vram_pressure_guard import get_vram_pressure_guard
+        get_vram_pressure_guard().register_model(self)
+
         self._is_loaded = True
     
     def _allocate_activation_buffers(self):
@@ -624,13 +673,11 @@ class VTEModel:
         else:
             template = "gemv_coalesced"
         codegen = CodegenEngine()
-        hsaco_path = codegen.compile_kernel(
-            template_name=template,
-            arch=self._hip.get_gpu_architecture(),
+        _, kernel_fn = codegen.load_kernel_safe(
+            self._hip, template, self._hip.get_gpu_architecture(), f"{template}_kernel",
             hidden_size=hidden_size,
             tile_size=256
         )
-        _, kernel_fn = self._hip.load_kernel(hsaco_path, f"{template}_kernel")
 
         return {
             'weight_ptr': weight_ptr,
@@ -685,6 +732,22 @@ class VTEModel:
         if getattr(self, '_architecture', None) == "qwen35":
             return 0.0
         return 0.7
+
+    def _activate_raw_registries(self):
+        """Restaura os sets globais RAW_Q4K/Q6K/Q8_0/Q5_0_WEIGHTS
+        (fallback_executor.py) para refletir ESTE modelo. Esses sets são
+        estado de MÓDULO (não por instância) -- se mais de um VTEModel for
+        carregado no mesmo processo, o registro do último a carregar
+        sobrescreve o dos demais, fazendo o guard de fusão QKV de outros
+        modelos já carregados consultar o registro errado (bug real
+        encontrado e documentado em docs/BUGS.md). Chame isto antes de
+        decodificar sempre que mais de uma instância de VTEModel puder estar
+        coexistindo no processo."""
+        from vte.core.fallback_executor import register_raw_q4k_weights, register_raw_q6k_weights, register_raw_q8_0_weights, register_raw_q5_0_weights
+        register_raw_q4k_weights(self._raw_q4k)
+        register_raw_q6k_weights(self._raw_q6k)
+        register_raw_q8_0_weights(self._raw_q8_0)
+        register_raw_q5_0_weights(self._raw_q5_0)
 
     def generate(
         self,
@@ -953,6 +1016,11 @@ class VTEModel:
         """Descarrega o modelo da VRAM (limpa slabs e libera HIP)."""
         logger.info("Iniciando unload seguro do modelo...")
         self._is_loaded = False
+        try:
+            from vte.bridge.vram_pressure_guard import get_vram_pressure_guard
+            get_vram_pressure_guard().unregister_model(self)
+        except Exception:
+            pass
         self._lifecycle.unload()
         if self._allocator:
             self._allocator.cleanup()

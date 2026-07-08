@@ -140,13 +140,11 @@ class LMHead:
             else:
                 template = "gemv_coalesced"
 
-            hsaco_path = self.model.executor.codegen.compile_kernel(
-                template_name=template,
-                arch=self.hip.get_gpu_architecture(),
+            mod, kernel = self.model.executor.codegen.load_kernel_safe(
+                self.hip, template, self.hip.get_gpu_architecture(), f"{template}_kernel",
                 hidden_size=self.hidden_size,
                 tile_size=256
             )
-            mod, kernel = self.hip.load_kernel(hsaco_path, f"{template}_kernel")
 
         # Args: input, weight, output, batch, seq, in_features, out_features, bias, residual, residual_scale
         # O LM head não tem bias/residual -> ambos nullptr. O slot de
@@ -216,11 +214,10 @@ class LMHead:
         else:
             template = "gemv_coalesced"
 
-        hsaco_path = self.model.executor.codegen.compile_kernel(
-            template_name=template, arch=self.hip.get_gpu_architecture(),
+        mod, kernel = self.model.executor.codegen.load_kernel_safe(
+            self.hip, template, self.hip.get_gpu_architecture(), f"{template}_kernel",
             hidden_size=self.hidden_size, tile_size=256
         )
-        mod, kernel = self.hip.load_kernel(hsaco_path, f"{template}_kernel")
 
         if self._logits_buffer_batch is None or self._logits_buffer_batch_size < batch_size:
             self._logits_buffer_batch = self.allocator.allocate(

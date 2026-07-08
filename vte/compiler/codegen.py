@@ -54,7 +54,11 @@ class CodegenEngine:
         self.templates_dir = Path(__file__).parent / "templates"
         self.logs_dir = Path("logs/Codegen")
         self.cache_dir = Path("cache/kernels")
-        
+        # Binários AOT congelados com o projeto (Fase 2, ver
+        # scripts/build_kernel_cache.py) -- semeia o cache local a partir
+        # daqui antes de precisar do hipcc, ver `compile_kernel()`.
+        self.assets_dir = Path(__file__).parent.parent / "core" / "assets" / "kernels"
+
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -125,35 +129,79 @@ class CodegenEngine:
         
         return env
 
-    def compile_kernel(self, template_name: str, arch: str, **kwargs) -> str:
-        """Renderiza e compila o kernel via hipcc"""
+    def compile_kernel(self, template_name: str, arch: str, force_recompile: bool = False, **kwargs) -> str:
+        """Renderiza e compila o kernel via hipcc.
+
+        `force_recompile=True` ignora um `.hsaco` já existente no cache e
+        força uma recompilação de verdade -- usado por `load_kernel_safe()`
+        quando um binário PRÉ-COMPILADO distribuído com o projeto (AOT, ver
+        docs/BUGS.md) falha ao carregar por incompatibilidade de driver/ABI
+        do ROCm local: sem isto, recompilar encontraria o MESMO arquivo
+        corrompido/incompatível no cache e devolveria o mesmo caminho
+        quebrado de novo."""
         cpp_code = self.render_template(template_name, **kwargs)
         if not cpp_code:
             cpp_code = kwargs.get("mock_code", "")
             if not cpp_code:
                  cpp_code = str(kwargs)
-                 
+
         cache_path = get_kernel_cache_path(cpp_code, arch)
-        
+
         Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
-        
+
         code_hash = hashlib.sha256(cpp_code.encode('utf-8')).hexdigest()[:16]
         log_file = self.logs_dir / f"{template_name}_{code_hash}.hip"
         with open(log_file, "w", encoding="utf-8") as f:
             f.write(cpp_code)
-            
-        if Path(cache_path).exists():
+
+        if not force_recompile and Path(cache_path).exists():
             logger.debug(f"Cache hit: {cache_path}")
             return cache_path
-        
+
+        # Semeadura AOT (Fase 2): antes de chamar hipcc, checa se já existe
+        # um binário PRÉ-COMPILADO congelado com o projeto (mesmo hash de
+        # código renderizado -- ou seja, exatamente este template com estes
+        # kwargs, pra esta arch). Se existir, copia pro cache local e usa
+        # direto -- hipcc/MSVC Build Tools nunca são chamados pro caso comum
+        # (arquitetura já coberta pelo build_kernel_cache.py). Pulado
+        # quando `force_recompile=True`: nesse caso o binário do cache (que
+        # pode ser exatamente essa mesma semente) já falhou ao carregar, ver
+        # `load_kernel_safe()` -- copiar de novo devolveria o mesmo binário
+        # incompatível.
+        if not force_recompile:
+            asset_path = self.assets_dir / arch / Path(cache_path).name
+            if asset_path.exists():
+                shutil.copy2(asset_path, cache_path)
+                logger.debug(f"Semeado do AOT empacotado: {asset_path} -> {cache_path}")
+                return cache_path
+
         env = self._setup_hip_env()
-            
+
         if not shutil.which("hipcc", path=env.get("PATH")):
+            if force_recompile:
+                # Binário AOT pré-compilado falhou ao carregar (driver/ABI do
+                # ROCm local incompatível) E não há hipcc disponível pra
+                # recompilar sob medida -- NUNCA sobrescreve com um mock aqui
+                # (faria o kernel "funcionar" silenciosamente com um .hsaco
+                # inútil, escondendo o problema real até o próximo load
+                # falhar de um jeito mais confuso). Falha alto e claro.
+                raise HIPSafetyError(
+                    f"O kernel pré-compilado para '{template_name}' ({arch}) não carregou "
+                    f"(driver/ROCm local incompatível com o binário distribuído) e não há "
+                    f"hipcc no PATH pra recompilar. Instale o HIP SDK + MSVC Build Tools "
+                    f"para compilar este kernel localmente."
+                )
             logger.warning(f"hipcc não encontrado no PATH. Simulando compilaão de {cache_path}")
             with open(cache_path, "wb") as f:
                 f.write(b"MOCK_HSACO")
             return cache_path
-            
+
+        if force_recompile and Path(cache_path).exists():
+            try:
+                Path(cache_path).unlink()
+            except OSError:
+                pass
+
         cmd = [
             "hipcc",
             "--genco",
@@ -176,5 +224,75 @@ class CodegenEngine:
                 
         except subprocess.CalledProcessError as e:
             raise HIPSafetyError(f"Falha na compilação do kernel {template_name}:\n{e.stderr}")
-            
+
         return cache_path
+
+    def compile_source_for_arch(self, cpp_code: str, arch: str, label: str = "unknown") -> str:
+        """
+        Compila um código-fonte JÁ RENDERIZADO pra uma arquitetura, sem
+        passar por `render_template()` de novo -- usado por
+        `scripts/cross_compile_kernel_cache.py` pra gerar binários AOT de
+        arquiteturas RDNA3 irmãs (gfx1100/gfx1101) a partir dos `.hip` já
+        renderizados durante o warm-up real em gfx1102 (ver
+        `scripts/build_kernel_cache.py`), sem precisar re-executar nenhum
+        modelo. Mesmo hash de cache que `compile_kernel()` usaria pro MESMO
+        código-fonte (`get_kernel_cache_path` não depende de template_name,
+        só do conteúdo) -- então o resultado cai no mesmo lugar que
+        `compile_kernel()` encontraria via `Path(cache_path).exists()`.
+
+        IMPORTANTE: isto compila OFFLINE pra uma arquitetura que não é a
+        deste processo -- hipcc aceita (`--offload-arch` é um alvo, não
+        depende da GPU local), mas o binário resultante nunca é
+        carregado/executado aqui (não tem como: esta máquina não tem essa
+        GPU). "Compilou sem erro" não é o mesmo que "está correto" -- ver
+        docs/LIMITATIONS.md."""
+        cache_path = get_kernel_cache_path(cpp_code, arch)
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        if Path(cache_path).exists():
+            return cache_path
+
+        env = self._setup_hip_env()
+        if not shutil.which("hipcc", path=env.get("PATH")):
+            raise HIPSafetyError("hipcc não encontrado no PATH -- necessário para cross-compilação AOT.")
+
+        code_hash = hashlib.sha256(cpp_code.encode('utf-8')).hexdigest()[:16]
+        log_file = self.logs_dir / f"{label}_{code_hash}.hip"
+        with open(log_file, "w", encoding="utf-8") as f:
+            f.write(cpp_code)
+
+        cmd = ["hipcc", "--genco", f"--offload-arch={arch}", "-O3", str(log_file), "-o", cache_path]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
+        except subprocess.CalledProcessError as e:
+            raise HIPSafetyError(f"Falha na cross-compilação de '{label}' para {arch}:\n{e.stderr}")
+        return cache_path
+
+    def load_kernel_safe(self, hip, template_name: str, arch: str, kernel_name: str, **kwargs):
+        """
+        `compile_kernel()` + `hip.load_kernel()` num só passo, com fallback
+        automático se o `.hsaco` resolvido (seja do cache local, seja um
+        binário AOT pré-compilado distribuído com o projeto -- ver
+        docs/BUGS.md) falhar ao carregar no driver local.
+
+        `hipModuleLoad` pode falhar por incompatibilidade de ABI do Code
+        Object do ROCm (driver atualizado, versão de ROCm diferente da que
+        gerou o binário) -- um `.hsaco` pré-compilado é só um arquivo de
+        bytes até ser testado no driver de verdade, não tem como saber de
+        antemão se vai carregar. Em vez de tentar adivinhar códigos de erro
+        específicos (frágil -- a ABI de erro do HIP muda entre versões do
+        SDK), a política aqui é: qualquer falha em `hip.load_kernel()`
+        aciona UMA tentativa de recompilação forçada (`force_recompile=True`,
+        descarta o binário ruim) via `hipcc` local, e tenta carregar de novo.
+        Se a segunda tentativa também falhar, o erro é real (não é
+        incompatibilidade de binário) e sobe normalmente.
+        """
+        hsaco_path = self.compile_kernel(template_name=template_name, arch=arch, **kwargs)
+        try:
+            return hip.load_kernel(hsaco_path, kernel_name)
+        except Exception as e:
+            logger.warning(
+                f"Falha ao carregar '{hsaco_path}' ({e}) -- possível binário pré-compilado "
+                f"incompatível com o driver/ROCm local. Descartando e recompilando com hipcc..."
+            )
+            hsaco_path = self.compile_kernel(template_name=template_name, arch=arch, force_recompile=True, **kwargs)
+            return hip.load_kernel(hsaco_path, kernel_name)

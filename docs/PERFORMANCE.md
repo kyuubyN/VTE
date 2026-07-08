@@ -45,10 +45,21 @@ Both models were benchmarked against Ollama running the *exact same GGUF files o
 | Model | VTE | Ollama (llama.cpp) | VTE / Ollama |
 |---|---|---|---|
 | Qwen2.5 1.5B (Q4_K_M) | 107.85 tok/s | 110.76 tok/s | 97.4% (tied) |
+| Qwen2.5 7B (Q4_K_M) | 35.89 tok/s | 42.71 tok/s | 84.0% |
 | Granite 4.1 3B (Q8_0) | **55.65 tok/s** | 50.84 tok/s | **109.5% (VTE faster)** |
 | Qwen3.5 2B (Q6_K) | 69.00 tok/s | 77.00 tok/s | 89.6% |
 
 This is a real milestone: Granite now decodes *faster* on VTE than on Ollama/llama.cpp with the identical GGUF file, and Qwen2.5 is within measurement noise of a tie. Both results came from the same change — see below.
+
+### Qwen 2.5 7B (Q4_K_M)
+
+Same methodology, same GGUF file on both sides (registered in Ollama via `ollama create qwen25-7b-ref -f Modelfile` with `FROM "<absolute path>"` — the path needs quoting, this repo's own path has a space in it, `Aetheris Flow`, an unquoted `FROM` silently reads garbage). File size matching (4683074208 bytes both sides) is **not** sufficient verification on its own — a raw fixed-offset byte comparison between the two files showed differences starting at byte 0, which looked alarming until parsing both with `gguf.GGUFReader` (which respects each file's own tensor-offset table rather than assuming identical raw layout) confirmed the actual tensor data is byte-identical; Ollama's ingestion repacks the metadata/header section, shifting every tensor's absolute file offset without changing a single weight value. Verify by comparing tensor `sha256` through `gguf.GGUFReader`, not raw file diffing, in future benchmarks. Prompt: "Write a long, detailed essay about the history of space exploration.", `num_predict`/`max_tokens=700`, `temperature=0`, decode-only timing (first token excluded on both sides).
+
+**35.89 tok/s (VTE) vs. 42.71 tok/s (Ollama) — 84.0%.** The largest model registered so far (28 layers, hidden=3584, ffn=18944 — 2.3x Qwen2.5 1.5B's hidden size), and the widest gap of the four models. Per-category profiling (`VTE_PROFILE=1`, eager/`FallbackExecutor` path — the only one instrumented; absolute ms/tok don't transfer to the HIP-Graph production path due to eliminated per-launch dispatch overhead, but the *proportion* between categories does) confirms the gap lives where expected: ~73% of GPU time in the four large GEMV categories (FFN_Gate_Up 28.0%, QKV_proj 18.4%, FFN_Down 15.9%, AttnOutput 6.9%, LMHead 3.8%) — the same shared GEMV/FFN kernels already tuned for Qwen2.5 1.5B and Granite, not a dispatch-overhead or missing-fusion problem (both already ruled out at this model's smaller siblings).
+
+Effective-bandwidth math makes the size-dependent trend concrete: VTE moves its ~4.5GB of resident weights at ~161 GB/s effective (35.89 tok/s), Ollama at ~192 GB/s (42.71 tok/s) — the same style of comparison at 1.5B lands at 97.4% parity, not 84%, so the relative gap to llama.cpp's hand-tuned GEMV genuinely widens as the matrices get bigger. Leading hypothesis (not yet proven down to the instruction level, would need `rocprof` or equivalent): `gemv_q4k.hip.template`'s per-layer working set roughly doubles at this size (ffn=18944 vs 8960), and RDNA3's 32MB Infinity Cache likely holds a smaller fraction of it in cache across the decode of a single token — the same cache-pressure mechanism already documented for the batch=8 batched-decode regression, just triggered by model width here instead of batch size.
+
+**Accepted as the current number, not a pending TODO** — same posture as the Qwen3.5 tok/s gap above. Closing it further would mean re-tuning the shared GEMV kernel's tiling for larger `K`/`N` dimensions specifically, which risks regressing the already-tuned 1.5B/Granite paths and is a real kernel-engineering project, not a quick fix — deferred until there's a specific reason to prioritize it over other work.
 
 <details>
 <summary>Previous numbers (before the VRAM-reduction pass), kept for history</summary>

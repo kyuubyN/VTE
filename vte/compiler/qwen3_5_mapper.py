@@ -4,6 +4,7 @@ from vte.core.model_config import ModelConfig
 from vte.bridge.memory import SlabAllocator, MemoryRegion
 from vte.bridge.errors import HIPSafetyError
 from vte.compiler.qwen_mapper import ActivationArena, format_oom_error  # genéricos, não específicos do Qwen
+from vte.compiler.ggml_types import block_size_bytes
 from vte.bridge.logger import get_logger
 
 logger = get_logger(__name__)
@@ -132,7 +133,11 @@ class Qwen3_5TensorMapper:
         for dim in tensor_info["shape"]:
             elements *= dim
         if is_raw_q6k_weight(name, tensor_info):
-            return (elements // 256) * 210  # Q6_K cru: 210 bytes / 256 elementos
+            # Fonte única `ggml_types.block_size_bytes` (reusa
+            # gguf.GGML_QUANT_SIZES) em vez da aritmética hardcoded que
+            # existia aqui antes -- a decisão de "fica cru" continua em
+            # is_raw_q6k_weight (própria deste arquivo), intocada.
+            return block_size_bytes(tensor_info["dtype"], elements)
         return elements * 2  # FP16 (F32 dequantizado a partir daqui, ou Q8_0 dequantizado)
 
     def calculate_memory_requirements(self, context_length: int = 2048, batch_size: int = 1) -> dict:

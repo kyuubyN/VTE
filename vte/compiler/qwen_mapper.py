@@ -4,6 +4,7 @@ from vte.bridge.memory import SlabAllocator, MemoryBlock, MemoryRegion
 from vte.bridge.errors import HIPSafetyError
 from vte.compiler.ir import IRGraph, IRNode, FusedGateUpProjNode, QuantizationInfo
 from vte.compiler.rope_computer import compute_rope_cache
+from vte.compiler.ggml_types import block_size_bytes
 from vte.bridge.logger import get_logger
 
 logger = get_logger(__name__)
@@ -32,6 +33,7 @@ def format_oom_error(model_label: str, total_required: int, allocator: SlabAlloc
 # IDs de tipo GGML relevantes.
 GGML_TYPE_Q4_K = 12
 GGML_TYPE_Q6_K = 14
+GGML_TYPE_Q5_0 = 6
 
 
 def is_raw_q4k_weight(name: str, tensor_info: dict) -> bool:
@@ -87,6 +89,32 @@ def is_raw_q6k_weight(name: str, tensor_info: dict) -> bool:
     return (name.endswith("ffn_down.weight") or name == "token_embd.weight"
             or name == "output.weight"
             or name.endswith("attn_v.weight"))
+
+
+def is_raw_q5_0_weight(name: str, tensor_info: dict) -> bool:
+    """
+    True se o tensor fica CRU em Q5_0 na VRAM (roteado ao gemv_q5_0).
+
+    Achado ao otimizar VRAM do draft model (Qwen2.5 0.5B, Fase 5,
+    speculative decoding): esse GGUF mistura Q5_0 em attn_q/attn_k/attn_v/
+    attn_output/ffn_gate/ffn_up (132 de 290 tensores, ~165MB no arquivo) --
+    até aqui só existia DEQUANT de Q5_0 pra FP16 no load
+    (dequantizer.py::dequantize_q5_0), nunca um kernel que lê os bytes crus
+    direto no GEMV, então TODOS esses 132 tensores viravam ~480MB em FP16 na
+    VRAM (quase 3x maior, ~70% do peso total do draft). Mesmo cuidado de
+    is_raw_q4k_weight/is_raw_q6k_weight: como attn_q/k/v/output entram na
+    lista, a fusão QKV precisa ficar desativada quando qualquer um deles
+    estiver cru em Q5_0 (ver checagem contra RAW_Q5_0_WEIGHTS em
+    fallback_executor.py/hip_graph_executor.py/batched executors) -- sem
+    isso o kernel fundido leria os bytes Q5_0 como `__half*` puro (mesmo bug,
+    já visto e documentado em docs/BUGS.md, que corrigimos nesta sessão pra
+    Q4_K/Q6_K/Q8_0 quando dois modelos coexistem)."""
+    if tensor_info.get('dtype') != GGML_TYPE_Q5_0:
+        return False
+    return (name.endswith("attn_q.weight") or name.endswith("attn_k.weight")
+            or name.endswith("attn_v.weight") or name.endswith("attn_output.weight")
+            or name.endswith("ffn_gate.weight") or name.endswith("ffn_up.weight")
+            or name.endswith("ffn_down.weight"))
 
 
 class ActivationArena:
@@ -215,10 +243,13 @@ class QwenTensorMapper:
         elements = 1
         for dim in tensor_info["shape"]:
             elements *= dim
-        if is_raw_q4k_weight(name, tensor_info):
-            return (elements // 256) * 144    # Q4_K cru
-        if is_raw_q6k_weight(name, tensor_info):
-            return (elements // 256) * 210    # Q6_K cru
+        if is_raw_q4k_weight(name, tensor_info) or is_raw_q6k_weight(name, tensor_info) or is_raw_q5_0_weight(name, tensor_info):
+            # Tamanho cru real do dtype -- fonte única `ggml_types.block_size_bytes`
+            # (reusa gguf.GGML_QUANT_SIZES) em vez da aritmética hardcoded
+            # duplicada que existia aqui antes. A DECISÃO de "fica cru"
+            # continua em is_raw_q4k_weight/is_raw_q6k_weight, intocada --
+            # só o cálculo de QUANTOS bytes isso ocupa mudou.
+            return block_size_bytes(tensor_info["dtype"], elements)
         return elements * 2
 
     def map_and_allocate_tensors(self, allocator: SlabAllocator, hip_runtime, profiler=None, context_length=2048, batch_size=1) -> Dict[str, int]:

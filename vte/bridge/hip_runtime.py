@@ -154,6 +154,24 @@ HIP_STREAM_CAPTURE_MODE_RELAXED = 2
 class HIPRuntime:
     """Wrapper nativo para a dll do HIP SDK com barreiras de segurança."""
 
+    # Estado de PROCESSO (não por instância) -- ver `safe_malloc`/`cleanup`.
+    # Bug real encontrado na Fase 5 (dois modelos/HIPRuntime coexistindo no
+    # mesmo processo, draft + alvo): (1) o teto de 95% de VRAM
+    # (`VRAM_USAGE_LIMIT`) somava só `self._active_allocations` -- cada
+    # instância de HIPRuntime achava que tinha os 95% inteiros pra si,
+    # ignorando o que a OUTRA instância já tinha alocado no mesmo contexto
+    # HIP/GPU física; (2) `cleanup()` chama `hipDeviceReset()`
+    # incondicionalmente, que reseta o contexto HIP INTEIRO -- ao descarregar
+    # um modelo (ex.: o draft) com o alvo ainda carregado, o reset destruía
+    # também as alocações do alvo, causando os `hipFree retornou código 1`
+    # observados ao descarregar o segundo modelo em testes com dois modelos.
+    # Corrigido com dois contadores de CLASSE (compartilhados por todas as
+    # instâncias no processo): `_process_wide_allocated_bytes` (soma real de
+    # bytes vivos, usada na checagem de 95%) e `_live_instance_count` (só
+    # chama hipDeviceReset quando a ÚLTIMA instância do processo faz cleanup).
+    _process_wide_allocated_bytes: int = 0
+    _live_instance_count: int = 0
+
     def __init__(self, library_path: Optional[str] = None):
         """Inicializa o runtime localizando a amdhip64.dll e mapeando funções."""
         self._lib: Optional[ctypes.CDLL] = None
@@ -169,6 +187,7 @@ class HIPRuntime:
         self._stream: ctypes.c_void_p = ctypes.c_void_p(0)
         self.watchdog = None
         self.gpu_utilization_guard = None
+        self._counted_as_live = False
 
         # Limitador de duty cycle: complementa o GPUUtilizationGuard (que só
         # DETECTA uso sustentado alto via contador do Windows, com atraso de
@@ -238,6 +257,8 @@ class HIPRuntime:
         self._lib.hipDeviceSynchronize.restype = ctypes.c_int
         self._lib.hipDeviceReset.argtypes = []
         self._lib.hipDeviceReset.restype = ctypes.c_int
+        self._lib.hipMemGetInfo.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+        self._lib.hipMemGetInfo.restype = ctypes.c_int
         self._lib.hipStreamCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
         self._lib.hipStreamCreate.restype = ctypes.c_int
 
@@ -357,6 +378,9 @@ class HIPRuntime:
             self.gpu_utilization_guard = GPUUtilizationGuard(self.watchdog, threshold_percent=95.0)
             self.gpu_utilization_guard.start()
 
+            HIPRuntime._live_instance_count += 1
+            self._counted_as_live = True
+
             return True
         except Exception as e:
             logger.error(f"Falha ao ler propriedades da GPU: {e}")
@@ -420,6 +444,27 @@ class HIPRuntime:
         logger.warning(f"Arquitetura para GPU '{gpu_name}' não mapeada. Usando fallback {DEFAULT_GPU_ARCH}.")
         return DEFAULT_GPU_ARCH
 
+    def get_real_mem_info(self) -> tuple[int, int]:
+        """
+        `hipMemGetInfo()` -- (bytes livres, bytes totais) REAIS, medidos pelo
+        driver na GPU física inteira, não uma estimativa a partir do que ESTE
+        processo já alocou. Ao contrário de `_process_wide_allocated_bytes`
+        (soma só do que o VTE mesmo pediu via hipMalloc, em qualquer
+        instância deste processo), isto reflete TUDO que está usando VRAM
+        naquele momento -- outro processo (jogo, navegador com aceleração de
+        GPU, outro app de IA) reduz o "livre" reportado aqui exatamente como
+        reduziria no Gerenciador de Tarefas, mesmo sem o VTE saber nada sobre
+        esse outro processo. Fonte de verdade real para a checagem de 95% em
+        `safe_malloc` e para o `VRAMPressureGuard` (vram_pressure_guard.py).
+        """
+        if not self._initialized:
+            raise HIPSafetyError("Operação HIP requer inicialização (chame initialize()).")
+        free_bytes = ctypes.c_size_t(0)
+        total_bytes = ctypes.c_size_t(0)
+        err = self._lib.hipMemGetInfo(ctypes.byref(free_bytes), ctypes.byref(total_bytes))
+        self._check_error(err, "hipMemGetInfo")
+        return free_bytes.value, total_bytes.value
+
     def safe_malloc(self, size_bytes: int, tag: str = "unnamed") -> ctypes.c_void_p:
         """Aloca VRAM com validações de segurança."""
         if not self._initialized:
@@ -429,10 +474,42 @@ class HIPRuntime:
         if size_bytes > MAX_ALLOCATION_SIZE:
             raise HIPSafetyError(f"Tentativa de alocar acima do máximo: {size_bytes} > {MAX_ALLOCATION_SIZE}.")
             
-        total_allocated = sum(size for size, _ in self._active_allocations.values())
+        # Checagem de PROCESSO (não só desta instância) -- ver comentário na
+        # classe. Sem isto, um segundo modelo (ex.: draft da Fase 5) via os
+        # 95% inteiros como livres, ignorando o que o primeiro já reservou no
+        # mesmo contexto HIP físico.
+        total_allocated = HIPRuntime._process_wide_allocated_bytes
         if (total_allocated + size_bytes) > (self._vram_total * VRAM_USAGE_LIMIT):
-            raise MemoryGuardianOOMError(f"OOM Preventivo: Alocar {size_bytes} excederia 95% da VRAM ({self._vram_total}).")
-            
+            raise MemoryGuardianOOMError(
+                f"OOM Preventivo: alocar {size_bytes} bytes [{tag}] excederia 95% da VRAM "
+                f"({self._vram_total} bytes totais). Já reservado no processo (todos os "
+                f"modelos carregados): {total_allocated} bytes."
+            )
+
+        # Checagem REAL (não só o que o VTE mesmo alocou): `hipMemGetInfo`
+        # reflete a GPU física inteira, incluindo VRAM usada por QUALQUER
+        # outro processo (jogo, navegador com aceleração de GPU, outro app de
+        # IA) -- a checagem acima só sabe sobre alocações do próprio VTE, e
+        # ficaria cega pra esse caso (poderia aprovar uma alocação que passa
+        # de 95% real só porque, do ponto de vista do VTE, "ainda cabia").
+        # Falha best-effort: se `hipMemGetInfo` falhar por algum motivo, não
+        # bloqueia a alocação por causa disso -- a checagem acima já cobre o
+        # caso comum (só VTE usando a GPU).
+        try:
+            real_free, real_total = self.get_real_mem_info()
+            if size_bytes > (real_free - int(real_total * (1.0 - VRAM_USAGE_LIMIT))):
+                raise MemoryGuardianOOMError(
+                    f"OOM Preventivo (VRAM real da GPU): alocar {size_bytes} bytes [{tag}] passaria de "
+                    f"{VRAM_USAGE_LIMIT*100:.0f}% de uso real da GPU. Livre agora: {real_free} de "
+                    f"{real_total} bytes -- outro programa (jogo, navegador, etc.) pode estar usando "
+                    f"VRAM além do que o VTE alocou. Feche outros programas que usam a GPU ou reduza "
+                    f"o context_length/modelo antes de carregar."
+                )
+        except MemoryGuardianOOMError:
+            raise
+        except Exception as e:
+            logger.warning(f"Não foi possível consultar hipMemGetInfo para checagem real de VRAM: {e}")
+
         ptr = ctypes.c_void_p()
         err = self._lib.hipMalloc(ctypes.byref(ptr), size_bytes)
         if err == HIPError.outOfMemory:
@@ -442,8 +519,9 @@ class HIPRuntime:
         ptr_val = ptr.value
         if ptr_val is None:
             raise HIPSafetyError("hipMalloc retornou ponteiro nulo com status 0.")
-            
+
         self._active_allocations[ptr_val] = (size_bytes, tag)
+        HIPRuntime._process_wide_allocated_bytes += size_bytes
         logger.debug(f"Alocado {size_bytes} bytes na VRAM em 0x{ptr_val:016X} [{tag}]")
         return ptr
 
@@ -457,9 +535,11 @@ class HIPRuntime:
             else:
                 raise HIPSafetyError(f"Tentativa de liberar ponteiro não rastreado: 0x{ptr_val:016X} [{tag}]. Uso após free ou corrupção.")
                 
+        size_bytes, _ = self._active_allocations[ptr_val]
         err = self._lib.hipFree(ptr)
         self._check_error(err, "hipFree")
         del self._active_allocations[ptr_val]
+        HIPRuntime._process_wide_allocated_bytes = max(0, HIPRuntime._process_wide_allocated_bytes - size_bytes)
         logger.debug(f"Liberada memória em 0x{ptr_val:016X} [{tag}]")
         return True
 
@@ -858,13 +938,26 @@ class HIPRuntime:
                 self.safe_free(ctypes.c_void_p(ptr_val), f"{tag}_cleanup")
             except Exception as e:
                 logger.error(f"Erro ao limpar alocação 0x{ptr_val:016X}: {e}")
-                
-        if self._initialized and self._lib and hasattr(self._lib, 'hipDeviceReset'):
+
+        if self._counted_as_live:
+            HIPRuntime._live_instance_count = max(0, HIPRuntime._live_instance_count - 1)
+            self._counted_as_live = False
+
+        # hipDeviceReset() reseta o CONTEXTO HIP INTEIRO -- não só as
+        # alocações desta instância. Bug real encontrado na Fase 5: com dois
+        # modelos carregados no mesmo processo (draft + alvo), descarregar
+        # UM deles (ex.: o draft) chamava isto incondicionalmente e destruía
+        # também as alocações do OUTRO modelo ainda em uso, causando
+        # `hipFree retornou código 1` ao tentar descarregá-lo depois. Só
+        # reseta o device quando esta é a ÚLTIMA instância viva do processo
+        # (`_live_instance_count`, decrementado acima) -- com um único
+        # modelo carregado (caso comum) o comportamento é idêntico a antes.
+        if self._initialized and self._lib and hasattr(self._lib, 'hipDeviceReset') and HIPRuntime._live_instance_count == 0:
             try:
                 self._lib.hipDeviceReset()
             except Exception as e:
                 logger.error(f"Erro em hipDeviceReset: {e}")
-                
+
         self._in_cleanup_mode = False
         self._initialized = False
         logger.info("Cleanup HIP concluído.")

@@ -106,6 +106,7 @@ class GGUFSanitizer:
     def __init__(self, model_path: str | Path):
         self.path = Path(model_path)
         self.header: GGUFHeader | None = None
+        self.is_uncataloged_variant: bool = False
 
     def _validate_or_generate_hash(self, profile: dict) -> bool:
         """
@@ -222,14 +223,23 @@ class GGUFSanitizer:
     def _validate_metadata_consistency(self) -> dict:
         """Valida que os metadados são consistentes com o PERFIL da arquitetura
         detectada (`SUPPORTED_ARCHITECTURES`) e retorna a VARIANTE (tamanho de
-        modelo) resolvida por nome de arquivo, usada em seguida por
-        `validate()` para checar tamanho/hash -- checagens que antes eram
-        feitas ANTES de saber a arquitetura (só funcionava porque só existia
-        uma arquitetura possível).
+        modelo) resolvida por `block_count` + faixa de tamanho de arquivo
+        (não mais por nome de arquivo -- descoberta de modelos é dinâmica
+        agora, ver `VTEModel.from_pretrained`: basta copiar um .gguf pra
+        pasta Model/, sem editar código). A arquitetura em si (lida do
+        próprio GGUF, `general.architecture`) continua sendo o gate DURO --
+        arquitetura desconhecida é sempre rejeitada.
 
-        block_count é validado contra a VARIANTE, não a arquitetura: achado
-        real ao adicionar o Qwen2.5 0.5B (draft model) -- tem 24 camadas,
-        diferente do 1.5B/7B (28, que só coincidem entre si por acaso)."""
+        `block_count` sozinho NÃO é suficiente pra desambiguar: o Qwen2.5
+        1.5B e 7B têm o MESMO block_count (28) -- só o tamanho do arquivo
+        distingue as duas variantes. Por isso checa as duas coisas juntas,
+        na ordem das variantes cadastradas. Se nada bater (block_count
+        novo, ou block_count conhecido mas tamanho fora de toda faixa
+        catalogada), NÃO é rejeitado -- pode ser um tamanho novo, ainda não
+        visto, da mesma arquitetura já suportada -- vira um aviso claro
+        (log + status, ver `VTEModel.from_pretrained`) e usa limites de
+        tamanho/hash genéricos em vez dos específicos de uma variante
+        conhecida."""
         profile = SUPPORTED_ARCHITECTURES.get(self.header.architecture)
         if profile is None:
             supported = ", ".join(SUPPORTED_ARCHITECTURES.keys())
@@ -241,16 +251,34 @@ class GGUFSanitizer:
         if self.header.context_length > profile["max_context_length"]:
             raise HIPSafetyError(f"context_length suspeito: {self.header.context_length}")
 
-        variant = next((v for v in profile["variants"] if v["expected_filename"] == self.path.name), None)
+        import vte.config as config
+        file_size = self.path.stat().st_size
+        variant = None
+        for v in profile["variants"]:
+            if v["block_count"] != self.header.block_count:
+                continue
+            size_min = getattr(config, v["size_min_key"])
+            size_max = getattr(config, v["size_max_key"])
+            if size_min <= file_size <= size_max:
+                variant = v
+                break
         if variant is None:
-            raise HIPSafetyError("Nome do modelo incorreto")
-
-        if self.header.block_count != variant["block_count"]:
-            raise HIPSafetyError(
-                f"Block count inválido para '{self.path.name}'. "
-                f"Esperado: {variant['block_count']}, Recebido: {self.header.block_count}"
+            self.is_uncataloged_variant = True
+            logger.warning(
+                f"'{self.path.name}': arquitetura '{self.header.architecture}' suportada, mas "
+                f"block_count={self.header.block_count} não corresponde a nenhuma variante "
+                f"catalogada (tamanhos conhecidos: {[v['block_count'] for v in profile['variants']]}). "
+                f"Carregando com validação de tamanho/hash genérica -- confirme que este é "
+                f"realmente um GGUF válido dessa arquitetura antes de usar em produção."
             )
+            return {
+                "block_count": self.header.block_count,
+                "size_min_key": None,
+                "size_max_key": None,
+                "hash_config_key": f"UNCATALOGED_{self.header.architecture.upper()}",
+            }
 
+        self.is_uncataloged_variant = False
         return variant
 
     def validate(self) -> bool:
@@ -259,22 +287,13 @@ class GGUFSanitizer:
         if not self.path.exists() or not self.path.is_file():
             raise HIPSafetyError("Modelo não encontrado")
 
-        # Whitelist rápida por nome de arquivo, ANTES de tentar fazer parse
-        # do conteúdo -- rejeita arquivos com nome desconhecido/malformado
-        # sem precisar interpretar bytes não confiáveis primeiro (mesma
-        # postura de segurança do gate original de nome único, agora
-        # parametrizada por todas as variantes de todas as arquiteturas
-        # suportadas -- cada arquitetura pode ter mais de um tamanho de
-        # modelo, ex. Qwen2.5 1.5B/7B, mesmo block_count, arquivos
-        # diferentes).
-        known_filenames = {
-            v["expected_filename"]
-            for profile in SUPPORTED_ARCHITECTURES.values()
-            for v in profile["variants"]
-        }
-        if self.path.name not in known_filenames:
-            raise HIPSafetyError("Nome do modelo incorreto")
-
+        # Descoberta dinâmica (ver VTEModel.from_pretrained): sem whitelist
+        # de nome de arquivo -- o gate de segurança real é a arquitetura
+        # (`general.architecture`, lida do próprio GGUF em
+        # `_validate_metadata_consistency`, sempre um HARD gate) mais os
+        # limites estruturais já impostos abaixo (magic number, versão,
+        # tensor_count/kv_count com teto) ANTES de qualquer valor do arquivo
+        # ser usado pra dimensionar alocação.
         try:
             with open(self.path, "rb") as f:
                 magic = f.read(4)
@@ -302,12 +321,18 @@ class GGUFSanitizer:
             raise HIPSafetyError(f"Erro de struct lendo GGUF: {e}")
 
         # Checagens que dependem de já saber a arquitetura/variante (tamanho,
-        # hash) -- feitas DEPOIS do parse, usando a variante já resolvida por
-        # nome de arquivo em `_validate_metadata_consistency`.
+        # hash) -- feitas DEPOIS do parse, usando a variante resolvida em
+        # `_validate_metadata_consistency`. Variante não-catalogada (tamanho
+        # novo dentro de uma arquitetura já suportada) usa limites de
+        # tamanho genéricos (1MB-64GB, só descarta lixo/arquivo vazio) em
+        # vez dos min/max específicos calibrados pra cada variante conhecida.
         import vte.config as config
         size = self.path.stat().st_size
-        size_min = getattr(config, variant["size_min_key"])
-        size_max = getattr(config, variant["size_max_key"])
+        if variant["size_min_key"] is None:
+            size_min, size_max = 1024 * 1024, 64 * 1024 * 1024 * 1024
+        else:
+            size_min = getattr(config, variant["size_min_key"])
+            size_max = getattr(config, variant["size_max_key"])
         if size < size_min or size > size_max:
              raise HIPSafetyError(f"Tamanho fora do esperado: {size} bytes")
 

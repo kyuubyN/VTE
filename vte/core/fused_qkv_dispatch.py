@@ -37,8 +37,7 @@ class FusedQKVDispatcher:
     def _get_kernel(self):
         if 'fused_qkv' not in self._kernel_cache:
             arch = self.hip.get_gpu_architecture()
-            hsaco = self.codegen.compile_kernel(template_name='fused_norm_matmul_rope', arch=arch)
-            _, fn = self.hip.load_kernel(hsaco, 'fused_norm_matmul_rope_kernel')
+            _, fn = self.codegen.load_kernel_safe(self.hip, 'fused_norm_matmul_rope', arch, 'fused_norm_matmul_rope_kernel')
             self._kernel_cache['fused_qkv'] = fn
         return self._kernel_cache['fused_qkv']
 
@@ -46,16 +45,13 @@ class FusedQKVDispatcher:
         if 'rmsnorm' not in self._kernel_cache:
             arch = self.hip.get_gpu_architecture()
             from vte.bridge.memory import MemoryRegion
-            hsaco = self.codegen.compile_kernel(template_name='rmsnorm', arch=arch)
-            _, fn = self.hip.load_kernel(hsaco, 'rmsnorm_kernel')
+            _, fn = self.codegen.load_kernel_safe(self.hip, 'rmsnorm', arch, 'rmsnorm_kernel')
             self._kernel_cache['rmsnorm'] = fn
 
-            hsaco = self.codegen.compile_kernel(template_name='split_k_qkv_pass1', arch=arch)
-            _, fn = self.hip.load_kernel(hsaco, 'split_k_qkv_pass1_kernel')
+            _, fn = self.codegen.load_kernel_safe(self.hip, 'split_k_qkv_pass1', arch, 'split_k_qkv_pass1_kernel')
             self._kernel_cache['pass1'] = fn
 
-            hsaco = self.codegen.compile_kernel(template_name='split_k_qkv_pass2', arch=arch)
-            _, fn = self.hip.load_kernel(hsaco, 'split_k_qkv_pass2_kernel')
+            _, fn = self.codegen.load_kernel_safe(self.hip, 'split_k_qkv_pass2', arch, 'split_k_qkv_pass2_kernel')
             self._kernel_cache['pass2'] = fn
 
             hidden_size = self.metadata.get('embedding_length', 1536)
@@ -229,16 +225,14 @@ class FusedFFNDispatcher:
     def _get_rmsnorm_kernel(self):
         if 'ffn_rmsnorm' not in self._kernel_cache:
             arch = self.hip.get_gpu_architecture()
-            hsaco = self.codegen.compile_kernel(template_name='rmsnorm', arch=arch)
-            _, fn = self.hip.load_kernel(hsaco, 'rmsnorm_kernel')
+            _, fn = self.codegen.load_kernel_safe(self.hip, 'rmsnorm', arch, 'rmsnorm_kernel')
             self._kernel_cache['ffn_rmsnorm'] = fn
         return self._kernel_cache['ffn_rmsnorm']
 
     def _get_gate_up_silu_kernel(self):
         if 'fused_ffn' not in self._kernel_cache:
             arch = self.hip.get_gpu_architecture()
-            hsaco = self.codegen.compile_kernel(template_name='fused_rmsnorm_gate_up_silu', arch=arch)
-            _, fn = self.hip.load_kernel(hsaco, 'fused_gate_up_silu_kernel')
+            _, fn = self.codegen.load_kernel_safe(self.hip, 'fused_rmsnorm_gate_up_silu', arch, 'fused_gate_up_silu_kernel')
             self._kernel_cache['fused_ffn'] = fn
         return self._kernel_cache['fused_ffn']
 

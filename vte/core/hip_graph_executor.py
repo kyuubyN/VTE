@@ -144,13 +144,15 @@ class HIPGraphExecutor:
             NodeType.PER_HEAD_RMSNORM: "per_head_rmsnorm",
             NodeType.SIGMOID_GATE_MUL: "sigmoid_gate_mul",
         }
-        from vte.core.fallback_executor import _is_vectorized_matmul, _is_q4k_matmul, _is_q6k_matmul, _is_q8_0_matmul
+        from vte.core.fallback_executor import _is_vectorized_matmul, _is_q4k_matmul, _is_q6k_matmul, _is_q8_0_matmul, _is_q5_0_matmul
         if _is_q4k_matmul(node):
             template = "gemv_q4k"
         elif _is_q6k_matmul(node):
             template = "gemv_q6k"
         elif _is_q8_0_matmul(node):
             template = "gemv_q8_0"
+        elif _is_q5_0_matmul(node):
+            template = "gemv_q5_0"
         elif _is_vectorized_matmul(node):
             template = "gemv_coalesced"
         else:
@@ -170,14 +172,11 @@ class HIPGraphExecutor:
             return self._kernel_cache[cache_key][1]
 
         try:
-            hsaco_path = self.codegen.compile_kernel(
-                template_name=template,
-                arch=arch,
+            module, function = self.codegen.load_kernel_safe(
+                self.hip, template, arch, f"{template}_kernel",
                 hidden_size=node.shape[-1] if node.shape else 1536,
                 is_mega_kernel=(node.op_type == "mega_kernel")
             )
-
-            module, function = self.hip.load_kernel(hsaco_path, f"{template}_kernel")
             self._kernel_cache[cache_key] = (module, function)
             return function
         except Exception as e:
@@ -194,8 +193,7 @@ class HIPGraphExecutor:
         arch = self.hip.get_gpu_architecture()
         cache_key = "fused_gdn_proj"
         if cache_key not in self._kernel_cache:
-            hsaco_path = self.codegen.compile_kernel(template_name=cache_key, arch=arch)
-            module, function = self.hip.load_kernel(hsaco_path, f"{cache_key}_kernel")
+            module, function = self.codegen.load_kernel_safe(self.hip, cache_key, arch, f"{cache_key}_kernel")
             self._kernel_cache[cache_key] = (module, function)
         fn = self._kernel_cache[cache_key][1]
 
@@ -267,8 +265,7 @@ class HIPGraphExecutor:
             template = "embedding_lookup"
         cache_key = template
         if cache_key not in self._kernel_cache:
-            hsaco_path = self.codegen.compile_kernel(template_name=template, arch=arch)
-            module, function = self.hip.load_kernel(hsaco_path, f"{template}_kernel")
+            module, function = self.codegen.load_kernel_safe(self.hip, template, arch, f"{template}_kernel")
             self._kernel_cache[cache_key] = (module, function)
         else:
             function = self._kernel_cache[cache_key][1]
@@ -325,8 +322,8 @@ class HIPGraphExecutor:
         block_size = 256
 
         if node.op_type == NodeType.MATMUL:
-            from vte.core.fallback_executor import _is_vectorized_matmul, _is_q4k_matmul, _is_q6k_matmul, _is_q8_0_matmul, _coalesced_gemv_dims
-            if _is_q4k_matmul(node) or _is_q6k_matmul(node) or _is_q8_0_matmul(node) or _is_vectorized_matmul(node):
+            from vte.core.fallback_executor import _is_vectorized_matmul, _is_q4k_matmul, _is_q6k_matmul, _is_q8_0_matmul, _is_q5_0_matmul, _coalesced_gemv_dims
+            if _is_q4k_matmul(node) or _is_q6k_matmul(node) or _is_q8_0_matmul(node) or _is_q5_0_matmul(node) or _is_vectorized_matmul(node):
                 return _coalesced_gemv_dims(node, seq_len, batch)
             out_features = node.shape[-1]
             m = batch * seq_len
@@ -525,6 +522,7 @@ class HIPGraphExecutor:
                     RAW_Q4K_WEIGHTS as _RAW_Q4K_WEIGHTS,
                     RAW_Q6K_WEIGHTS as _RAW_Q6K_WEIGHTS,
                     RAW_Q8_0_WEIGHTS as _RAW_Q8_0_WEIGHTS,
+                    RAW_Q5_0_WEIGHTS as _RAW_Q5_0_WEIGHTS,
                 )
                 # Checa as 4 matrizes (Q/K/V/O), não só Q -- ver comentário
                 # completo na cópia irmã em fallback_executor.py (bug real
@@ -532,7 +530,7 @@ class HIPGraphExecutor:
                 # cru em Q8_0 enquanto attn_q segue FP16 na mesma camada).
                 _layer_idx_str = node.name.split('.')[1] if (node.op_type == NodeType.RMSNORM and node.name.endswith('.attn_norm')) else None
                 _attn_q_name = f"blk.{_layer_idx_str}.attn_q.weight" if _layer_idx_str is not None else None
-                _raw_sets = (_RAW_Q4K_WEIGHTS, _RAW_Q6K_WEIGHTS, _RAW_Q8_0_WEIGHTS)
+                _raw_sets = (_RAW_Q4K_WEIGHTS, _RAW_Q6K_WEIGHTS, _RAW_Q8_0_WEIGHTS, _RAW_Q5_0_WEIGHTS)
                 _any_qkvo_raw = _attn_q_name is not None and any(
                     f"blk.{_layer_idx_str}.{suffix}" in s
                     for suffix in ("attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight")

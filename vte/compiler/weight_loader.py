@@ -5,7 +5,7 @@ from pathlib import Path
 from vte.bridge.errors import HIPSafetyError
 from vte.bridge.logger import get_logger
 from vte.compiler.dequantizer import to_fp16_bytes
-from vte.compiler.qwen_mapper import is_raw_q4k_weight, is_raw_q6k_weight
+from vte.compiler.qwen_mapper import is_raw_q4k_weight, is_raw_q6k_weight, is_raw_q5_0_weight
 from vte.compiler.granite_mapper import is_raw_q8_0_weight
 
 logger = get_logger(__name__)
@@ -27,7 +27,8 @@ class GGUFWeightLoader:
     """
 
     def __init__(self, gguf_path: str | Path, parser, tensor_mapping: dict,
-                 raw_q4k: set | None = None, raw_q6k: set | None = None, raw_q8_0: set | None = None):
+                 raw_q4k: set | None = None, raw_q6k: set | None = None, raw_q8_0: set | None = None,
+                 raw_q5_0: set | None = None):
         """
         `raw_q4k`/`raw_q6k`/`raw_q8_0`: conjuntos de nomes de tensor JÁ
         decididos como "cru na VRAM" (mesmos conjuntos que model.py registra
@@ -50,6 +51,7 @@ class GGUFWeightLoader:
         self.raw_q4k = raw_q4k
         self.raw_q6k = raw_q6k
         self.raw_q8_0 = raw_q8_0
+        self.raw_q5_0 = raw_q5_0
 
     def load_all(self, hip_runtime) -> tuple[int, int]:
         """Mapeia o arquivo GGUF via mmap e copia cada tensor para seu ponteiro VRAM."""
@@ -87,17 +89,19 @@ class GGUFWeightLoader:
                     # vai FP16. Usa os conjuntos já unificados (se fornecidos)
                     # em vez de rechamar is_raw_*_weight isoladamente -- ver
                     # docstring do __init__.
-                    if self.raw_q4k is not None or self.raw_q6k is not None or self.raw_q8_0 is not None:
+                    if self.raw_q4k is not None or self.raw_q6k is not None or self.raw_q8_0 is not None or self.raw_q5_0 is not None:
                         is_raw = (
                             (self.raw_q4k is not None and name in self.raw_q4k)
                             or (self.raw_q6k is not None and name in self.raw_q6k)
                             or (self.raw_q8_0 is not None and name in self.raw_q8_0)
+                            or (self.raw_q5_0 is not None and name in self.raw_q5_0)
                         )
                     else:
                         is_raw = (
                             is_raw_q4k_weight(name, t_info)
                             or is_raw_q6k_weight(name, t_info)
                             or is_raw_q8_0_weight(name, t_info)
+                            or is_raw_q5_0_weight(name, t_info)
                         )
                     if is_raw:
                         upload_bytes = bytes(raw_bytes)

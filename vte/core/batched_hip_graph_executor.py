@@ -125,6 +125,18 @@ class BatchedHIPGraphExecutor:
         last_hidden_ptr = self.tensor_mapping.get('output_norm.output')
         last_hidden_val = last_hidden_ptr.ptr if hasattr(last_hidden_ptr, 'ptr') else last_hidden_ptr
 
+        # Bug real (achado na Fase 5, ao escrever a captura irmã em
+        # speculative_verify_executor.py e bater em access violation):
+        # gemv_coalesced/gemv_q4k/gemv_q6k/gemv_q8_0/gemv_q5_0 têm ABI de 10
+        # argumentos -- faltava o último (`residual_scale`, float), sempre
+        # presente no kernel real (usado pro logit_scale do Granite). Sem
+        # ele, o kernel lia um 10o parâmetro nunca passado -- UB (às vezes
+        # crash, às vezes logits errados sem aviso nenhum). Nunca detectado
+        # porque generate_batch() nunca tinha sido exercitado o suficiente
+        # com o LM Head capturado no grafo batched contra um caso que
+        # revelasse o problema.
+        logit_scale = self.metadata.get('logit_scale', 1.0) or 1.0
+
         args = [
             ctypes.c_void_p(last_hidden_val),
             ctypes.c_void_p(info['weight_ptr']),
@@ -135,6 +147,7 @@ class BatchedHIPGraphExecutor:
             ctypes.c_int(info['vocab_size']),
             ctypes.c_void_p(0),                  # bias (LM head não tem)
             ctypes.c_void_p(0),                  # residual (sem epilogue aqui)
+            ctypes.c_float(1.0 / logit_scale),
         ]
 
         self.hip.launch_kernel_recorded(
@@ -170,6 +183,39 @@ class BatchedHIPGraphExecutor:
 
                 if node.op_type == NodeType.RMSNORM and node.name.endswith('.attn_norm'):
                     layer_idx = int(node.name.split('.')[1])
+                    # Mesmo guard de FallbackExecutor.execute_layer (ver
+                    # docs/BUGS.md, "QKV-fusion guard só verificava
+                    # attn_q.weight") -- faltava aqui também. O kernel
+                    # fundido lê Q/K/V como `__half*` puro; se qualquer uma
+                    # das 4 projeções estiver roteada crua (Q4_K/Q6_K/Q8_0,
+                    # caso de attn_q.weight no Qwen2.5 1.5B/7B), a fusão lia
+                    # bytes quantizados como FP16 -- NaN. Sem checar aqui,
+                    # generate_batch() nunca teria funcionado corretamente
+                    # para esses dois modelos (só nunca foi exercitado com
+                    # eles em conjunto até a Fase 5 expor o gap).
+                    from vte.core.fallback_executor import RAW_Q4K_WEIGHTS, RAW_Q6K_WEIGHTS, RAW_Q8_0_WEIGHTS, RAW_Q5_0_WEIGHTS
+                    _attn_q_name = f"blk.{layer_idx}.attn_q.weight"
+                    _attn_k_name = f"blk.{layer_idx}.attn_k.weight"
+                    _attn_v_name = f"blk.{layer_idx}.attn_v.weight"
+                    _attn_o_name = f"blk.{layer_idx}.attn_output.weight"
+                    _raw_sets = (RAW_Q4K_WEIGHTS, RAW_Q6K_WEIGHTS, RAW_Q8_0_WEIGHTS, RAW_Q5_0_WEIGHTS)
+                    _qkv_fusable = (_attn_q_name in self.tensor_mapping
+                                    and not any(n in s for n in (_attn_q_name, _attn_k_name, _attn_v_name, _attn_o_name) for s in _raw_sets)
+                                    and self.metadata.get('rope_type') != 2)
+                    if not _qkv_fusable:
+                        kernel_func = self._inner._get_or_compile_kernel(node)
+                        if kernel_func is not None:
+                            args, _ = self._inner.arg_builder.build_args(
+                                node=node, tensor_mapping=self.tensor_mapping,
+                                staging_buffers=self._inner.staging_buffers, seq_len=1,
+                                metadata=self.metadata, kv_offset_ptr=self.staging_kv_offset.ptr,
+                                batch=self.batch_size,
+                            )
+                            grid, block, shared_mem = self._inner._calculate_launch_dims(node, seq_len=1, batch=self.batch_size)
+                            self.hip.launch_kernel_recorded(kernel_func, args, grid, block, shared_mem)
+                            nodes_recorded += 1
+                        continue
+
                     launches = self._fused_qkv.build_launches(
                         layer_idx, self.tensor_mapping, self.staging_kv_offset.ptr, batch=self.batch_size
                     )

@@ -57,4 +57,9 @@ vte-ui = "vte.ui.app:cli_main"
 packages = ["vte", "vte.bridge", "vte.compiler", "vte.core", "vte.ui"]
 
 [tool.setuptools.package-data]
-vte = ["templates/*.hip.template", "reference/*.py"]
+# Chaves são por PACOTE (relativo à própria pasta do pacote, não à raiz de
+# "vte") -- "vte.compiler" resolve pra vte/compiler/templates/*, "vte.core"
+# resolve pra vte/core/assets/kernels/**/*.hsaco (binários AOT congelados
+# via scripts/build_kernel_cache.py, ver docs/BUGS.md/LIMITATIONS.md).
+"vte.compiler" = ["templates/*.hip.template", "reference/*.py"]
+"vte.core" = ["assets/kernels/**/*.hsaco"]

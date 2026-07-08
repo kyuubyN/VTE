@@ -91,21 +91,21 @@ class GGUFParser:
             skip_value(vtype)
 
     def _calculate_tensor_size(self, shape: tuple, dtype: int) -> int:
-        """Calcula o tamanho em bytes dependendo do tipo da quantização"""
+        """Calcula o tamanho em bytes dependendo do tipo da quantização.
+
+        Fonte única de verdade: `ggml_types.block_size_bytes`, que reusa a
+        tabela canônica `gguf.GGML_QUANT_SIZES` em vez de uma cópia
+        hardcoded aqui -- essa cópia tinha um bug real (Q8_K usava 272
+        bytes/bloco, o valor certo é 292) que nunca se manifestou por
+        nenhum tensor Q8_K real ter sido carregado ainda. Fail-fast em
+        dtype desconhecido (era um fallback silencioso `elements*2` antes
+        -- a mesma classe de suposição silenciosa que corrompeu o
+        carregamento do Qwen2.5 0.5B em Q5_0 até virar crash em outro
+        lugar)."""
         import math
+        from vte.compiler.ggml_types import block_size_bytes
         elements = math.prod(shape)
-        
-        if dtype == 0: return elements * 4
-        elif dtype == 1: return elements * 2
-        elif dtype == 6: return (elements // 32) * 22 # Q5_0 (32 elem/22 bytes: fp16 d + 4 qh + 16 qs)
-        elif dtype == 8: return (elements // 32) * 34 # Q8_0 (32 elem/34 bytes: fp16 d + 32 int8)
-        elif dtype == 12: return (elements // 256) * 144 # Q4_K
-        elif dtype == 13: return (elements // 256) * 176 # Q5_K
-        elif dtype == 14: return (elements // 256) * 210 # Q6_K
-        elif dtype == 15: return (elements // 256) * 272 # Q8_K
-        else:
-            logger.warning(f"Calculo de tamanho aproximado para dtype não nativo: {dtype}")
-            return elements * 2
+        return block_size_bytes(dtype, elements)
 
     def _validate_tensor_bounds(self, tensor_info: dict, file_size: int):
         """Barreira de segurança: Garante que o tensor existe fisicamente no arquivo"""

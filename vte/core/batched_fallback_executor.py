@@ -151,11 +151,32 @@ class BatchedFallbackExecutor:
             # kernels desagregados a seguir (m = batch*seq_len, seq_len=1).
             self._inner._execute_embedding_lookup(self.batch_size)
 
+        # Mesmo guard de FallbackExecutor.execute_layer (ver docs/BUGS.md,
+        # "QKV-fusion guard só verificava attn_q.weight"): faltava aqui --
+        # o kernel fundido (fused_norm_matmul_rope/split_k_qkv_pass1/pass2)
+        # lê Q/K/V como `__half*` puro, sem dequant embutido. Se qualquer uma
+        # das 4 projeções (Q/K/V/O) estiver roteada crua (Q4_K/Q6_K/Q8_0) --
+        # como é o caso de attn_q.weight no Qwen2.5 1.5B/7B -- a fusão lia
+        # bytes quantizados reinterpretados como FP16, produzindo NaN. Sem
+        # este guard, BatchedFallbackExecutor (usado por generate_batch() E
+        # por SpeculativeVerifyExecutor) nunca tinha sido exercitado contra
+        # um modelo com Q/K/V/O crus -- por isso o gap passou despercebido
+        # até a Fase 5 (verificação especulativa) tropeçar nele.
+        from vte.core.fallback_executor import RAW_Q4K_WEIGHTS, RAW_Q6K_WEIGHTS, RAW_Q8_0_WEIGHTS, RAW_Q5_0_WEIGHTS
+        _attn_q_name = f"blk.{layer_idx}.attn_q.weight"
+        _attn_k_name = f"blk.{layer_idx}.attn_k.weight"
+        _attn_v_name = f"blk.{layer_idx}.attn_v.weight"
+        _attn_o_name = f"blk.{layer_idx}.attn_output.weight"
+        _raw_sets = (RAW_Q4K_WEIGHTS, RAW_Q6K_WEIGHTS, RAW_Q8_0_WEIGHTS, RAW_Q5_0_WEIGHTS)
+        _qkv_fusable = (_attn_q_name in self.tensor_mapping
+                        and not any(n in s for n in (_attn_q_name, _attn_k_name, _attn_v_name, _attn_o_name) for s in _raw_sets)
+                        and self.metadata.get('rope_type') != 2)
+
         qkv_fused_names = {
             f"blk.{layer_idx}.attn_norm", f"blk.{layer_idx}.q_proj",
             f"blk.{layer_idx}.k_proj", f"blk.{layer_idx}.v_proj",
             f"blk.{layer_idx}.rope",
-        }
+        } if _qkv_fusable else set()
 
         layer_prefix = f"blk.{layer_idx}."
         for node in self._inner.execution_order:
@@ -166,7 +187,7 @@ class BatchedFallbackExecutor:
             if node.name in SKIP_ADD_NODES:
                 continue
 
-            if node.name == f"blk.{layer_idx}.attn_norm":
+            if _qkv_fusable and node.name == f"blk.{layer_idx}.attn_norm":
                 launches = self._fused_qkv.build_launches(
                     layer_idx, self.tensor_mapping, self._kv_offset_buf.ptr, batch=self.batch_size
                 )

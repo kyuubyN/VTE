@@ -3,6 +3,7 @@ from vte.core.model_config import ModelConfig
 from vte.bridge.memory import SlabAllocator, MemoryRegion
 from vte.bridge.errors import HIPSafetyError
 from vte.compiler.qwen_mapper import ActivationArena, format_oom_error  # genéricos, não específicos do Qwen
+from vte.compiler.ggml_types import block_size_bytes
 from vte.bridge.logger import get_logger
 
 logger = get_logger(__name__)
@@ -124,7 +125,11 @@ class GraniteTensorMapper:
         for dim in tensor_info["shape"]:
             elements *= dim
         if is_raw_q8_0_weight(name, tensor_info):
-            return (elements // 32) * 34  # Q8_0 cru
+            # Fonte única `ggml_types.block_size_bytes` (reusa
+            # gguf.GGML_QUANT_SIZES) em vez da aritmética hardcoded que
+            # existia aqui antes -- a decisão de "fica cru" continua em
+            # is_raw_q8_0_weight, intocada.
+            return block_size_bytes(tensor_info["dtype"], elements)
         return elements * 2
 
     def map_and_allocate_tensors(self, allocator: SlabAllocator, hip_runtime, profiler=None, context_length=2048, batch_size=1) -> Dict[str, int]:
