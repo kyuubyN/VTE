@@ -55,6 +55,14 @@ Desktop.ini
 # Distribuicao
 dist/
 build/
+dist-vte-server/
+build-vte-server/
+release-assets/
+
+# Lemonade -- repositorio Git SEPARADO, clonado dentro deste diretorio de
+# trabalho para a integracao do backend VTE, nunca deve ser versionado como
+# parte do repo do VTE.
+Lemonade/
 *.egg-info/
 scripts/
 scripts/diagnostics/qwen35_reference/

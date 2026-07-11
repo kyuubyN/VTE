@@ -87,6 +87,25 @@ def _get_pairs(word: tuple) -> set:
     return pairs
 
 
+def _coerce_chat_messages(user_message, system: Optional[str], default_system: str) -> List[dict]:
+    """Normaliza o primeiro argumento de `apply_chat_template` para uma lista
+    de mensagens `{"role", "content"}`. Compatível com o uso atual (uma única
+    string de usuário, comportamento inalterado) e com um histórico
+    multi-turno completo já pronto (lista de mensagens, ex.: vindo de uma
+    requisição OpenAI `chat/completions`) -- necessário para hosts externos
+    (ex.: um servidor HTTP que embrulha VTEModel) que precisam repassar uma
+    conversa inteira, não só a última mensagem do usuário."""
+    if isinstance(user_message, list):
+        messages = list(user_message)
+        if not any(m.get("role") == "system" for m in messages):
+            messages.insert(0, {"role": "system", "content": system if system is not None else default_system})
+        return messages
+    return [
+        {"role": "system", "content": system if system is not None else default_system},
+        {"role": "user", "content": user_message},
+    ]
+
+
 class QwenTokenizer:
     """
     Tokenizador BPE byte-level do Qwen2.5, reconstruído a partir do vocabulário
@@ -272,8 +291,9 @@ class QwenTokenizer:
         "English."
     )
 
-    def apply_chat_template(self, user_message: str, system: str = None, enable_thinking: bool = False) -> str:
-        """Formata uma mensagem de usuário no chat template do Qwen2.5 (ChatML).
+    def apply_chat_template(self, user_message, system: str = None, enable_thinking: bool = False) -> str:
+        """Formata uma mensagem (ou histórico completo) no chat template do
+        Qwen2.5 (ChatML).
 
         Sem isto, o modelo Instruct recebe o texto cru e faz *completion*
         (continua o texto como um documento) em vez de responder como
@@ -283,18 +303,21 @@ class QwenTokenizer:
         <|im_end|> ao final da resposta é o eos_token_id, o que faz a geração
         parar sozinha no ponto certo.
 
+        `user_message` aceita tanto uma string única (comportamento original,
+        preservado) quanto uma lista de mensagens `{"role", "content"}`
+        (histórico multi-turno completo) -- ver `_coerce_chat_messages`.
+
         `enable_thinking` não tem efeito aqui -- o ChatML do Qwen2.5 não tem
         um bloco <think>. O parâmetro só existe para manter a assinatura
         igual à de outros tokenizers (ver GraniteTokenizer.apply_chat_template
         e vte/core/thinking_scanner.py), pronta para um modelo que use isso
         de verdade (ex.: Qwen3.5) sem precisar mudar quem chama.
         """
-        system = system if system is not None else self.DEFAULT_SYSTEM_PROMPT
-        return (
-            f"<|im_start|>system\n{system}<|im_end|>\n"
-            f"<|im_start|>user\n{user_message}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
+        messages = _coerce_chat_messages(user_message, system, self.DEFAULT_SYSTEM_PROMPT)
+        rendered = "".join(
+            f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages
         )
+        return rendered + "<|im_start|>assistant\n"
 
     @property
     def stop_token_ids(self) -> set:
@@ -465,11 +488,15 @@ class GraniteTokenizer:
         "English."
     )
 
-    def apply_chat_template(self, user_message: str, system: str = None, enable_thinking: bool = False) -> str:
+    def apply_chat_template(self, user_message, system: str = None, enable_thinking: bool = False) -> str:
         """Renderiza o Jinja2 real embutido em `tokenizer.chat_template` do
         GGUF (não uma f-string aproximada) -- o template do Granite é bem
         mais complexo que o ChatML do Qwen (suporta tools/documents, que não
         usamos aqui, mas o template exige as variáveis existirem mesmo assim).
+
+        `user_message` aceita tanto uma string única (comportamento original,
+        preservado) quanto uma lista de mensagens `{"role", "content"}`
+        (histórico multi-turno completo) -- ver `_coerce_chat_messages`.
 
         `<|end_of_text|>` (o EOS) é emitido pelo próprio template ao final de
         cada turno -- é ele que faz a geração parar sozinha, mesmo mecanismo
@@ -486,12 +513,7 @@ class GraniteTokenizer:
             raise RuntimeError(
                 "Chat template do Granite não carregado do GGUF (tokenizer.chat_template ausente)."
             )
-        system = system if system is not None else self.DEFAULT_SYSTEM_PROMPT
-
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_message},
-        ]
+        messages = _coerce_chat_messages(user_message, system, self.DEFAULT_SYSTEM_PROMPT)
 
         env = Environment(trim_blocks=True, lstrip_blocks=True)
         env.filters["tojson"] = json.dumps
@@ -697,7 +719,7 @@ class Qwen3_5Tokenizer:
         "English."
     )
 
-    def apply_chat_template(self, user_message: str, system: str = None, enable_thinking: bool = False) -> str:
+    def apply_chat_template(self, user_message, system: str = None, enable_thinking: bool = False) -> str:
         """Renderiza o Jinja2 real embutido em `tokenizer.chat_template` do
         GGUF -- mesmo mecanismo do GraniteTokenizer, mas o template do
         Qwen3.5 de fato usa `enable_thinking` (bloco condicional real: insere
@@ -705,14 +727,17 @@ class Qwen3_5Tokenizer:
         já fechado se enable_thinking for False -- ver Model/"template
         chat.txt"). `add_vision_id` é passado como False explicitamente
         (o template real referencia essa variável num bloco de imagem/vídeo
-        que não usamos em texto puro)."""
+        que não usamos em texto puro).
+
+        `user_message` aceita tanto uma string única (comportamento original,
+        preservado) quanto uma lista de mensagens `{"role", "content"}`
+        (histórico multi-turno completo) -- ver `_coerce_chat_messages`."""
         if not self._chat_template_src:
             raise RuntimeError(
                 "Chat template do Qwen3.5 não carregado do GGUF (tokenizer.chat_template ausente)."
             )
 
-        system = system if system is not None else self.DEFAULT_SYSTEM_PROMPT
-        messages = [{"role": "system", "content": system}, {"role": "user", "content": user_message}]
+        messages = _coerce_chat_messages(user_message, system, self.DEFAULT_SYSTEM_PROMPT)
 
         env = Environment(trim_blocks=True, lstrip_blocks=True)
         env.filters["tojson"] = json.dumps

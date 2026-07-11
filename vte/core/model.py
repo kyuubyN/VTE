@@ -175,7 +175,40 @@ class VTEModel:
         instance._load()
         instance._lifecycle.start_monitoring()
         return instance
-    
+
+    @classmethod
+    def from_path(
+        cls,
+        gguf_path: str,
+        use_hip_graph: bool = True,
+        enable_fusion: bool = True,
+        idle_timeout_seconds: int = 300,
+        enable_auto_unload: bool = True,
+        max_batch_size: int = 1,
+        context_length: int = None
+    ) -> "VTEModel":
+        """Mesma lógica final de `from_pretrained`, mas para um path absoluto
+        já resolvido pelo chamador -- pula inteiramente MODEL_REGISTRY/
+        discover_models(). Existe para hosts externos (ex.: vte-server, que
+        recebe o path já resolvido por um model manager de terceiros) que não
+        querem/precisam da convenção de pasta Model/ deste projeto."""
+        p = Path(gguf_path)
+        if not p.is_file():
+            raise FileNotFoundError(f"Arquivo GGUF não encontrado: {gguf_path}")
+
+        instance = cls(
+            str(p),
+            use_hip_graph=use_hip_graph,
+            enable_fusion=enable_fusion,
+            context_length=context_length,
+            idle_timeout=idle_timeout_seconds,
+            auto_unload=enable_auto_unload,
+            max_batch_size=max_batch_size
+        )
+        instance._load()
+        instance._lifecycle.start_monitoring()
+        return instance
+
     def _load_qwen2_metadata(self, sanitizer) -> dict:
         """Lê os hiperparâmetros REAIS do GGUF em vez de depender de defaults
         espalhados pelo código. Vários defaults estavam ERRADOS para o

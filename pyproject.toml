@@ -32,6 +32,8 @@ dependencies = [
     "pywin32; sys_platform == 'win32'",
     "jinja2>=3.1.0",
     "regex>=2023.0.0",
+    "starlette>=0.37.0",
+    "uvicorn>=0.29.0",
 ]
 
 [project.optional-dependencies]
@@ -42,19 +44,21 @@ dev = [
     "hip-python>=0.1.0",
     "gguf>=0.19.0",
     "transformers>=5.12.1",
+    "pyinstaller>=6.10.0",
 ]
 
 [project.urls]
-Homepage = "https://github.com/kyuubyN/VTE---Vector-Tensor-Engine"
-Repository = "https://github.com/kyuubyN/VTE---Vector-Tensor-Engine"
-Documentation = "https://github.com/kyuubyN/VTE---Vector-Tensor-Engine#readme"
-Issues = "https://github.com/kyuubyN/VTE---Vector-Tensor-Engine/issues"
+Homepage = "https://github.com/kyuubyN/VTE"
+Repository = "https://github.com/kyuubyN/VTE"
+Documentation = "https://github.com/kyuubyN/VTE#readme"
+Issues = "https://github.com/kyuubyN/VTE/issues"
 
 [project.scripts]
 vte-ui = "vte.ui.app:cli_main"
+vte-server = "vte.server.http_server:cli_main"
 
 [tool.setuptools]
-packages = ["vte", "vte.bridge", "vte.compiler", "vte.core", "vte.ui"]
+packages = ["vte", "vte.bridge", "vte.compiler", "vte.core", "vte.ui", "vte.server"]
 
 [tool.setuptools.package-data]
 # Chaves são por PACOTE (relativo à própria pasta do pacote, não à raiz de
