@@ -1,5 +1,9 @@
 name: Validate Structs
 on: [push, pull_request]
+
+permissions:
+  contents: read
+
 jobs:
   validate:
     runs-on: windows-latest
