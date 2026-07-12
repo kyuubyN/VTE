@@ -34,6 +34,7 @@ dependencies = [
     "regex>=2023.0.0",
     "starlette>=0.37.0",
     "uvicorn>=0.29.0",
+    "huggingface_hub>=0.24.0",
 ]
 
 [project.optional-dependencies]
@@ -54,6 +55,7 @@ Documentation = "https://github.com/kyuubyN/VTE#readme"
 Issues = "https://github.com/kyuubyN/VTE/issues"
 
 [project.scripts]
+vte = "vte.cli:main"
 vte-ui = "vte.ui.app:cli_main"
 vte-server = "vte.server.http_server:cli_main"
 

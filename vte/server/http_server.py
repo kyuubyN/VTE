@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import uuid
+from pathlib import Path
 
 import uvicorn
 from starlette.applications import Starlette
@@ -40,6 +41,8 @@ class _ServerState:
     """Guarda o único VTEModel que este processo serve, mais a config lida
     da linha de comando (usada pelos handlers de requisição)."""
     model: VTEModel = None
+    model_id: str = "vte"
+    load_timestamp: int = 0
     default_max_tokens: int = 512
 
 
@@ -163,8 +166,28 @@ def _check_vram_preflight(vram_limit_pct: float):
 
 _QUEUE_STOP = object()
 
+# --------------------------------------------------------------------------
+# Serialização de geração: um único VTEModel neste processo compartilha um
+# contexto HIP, um grafo de decode capturado e um KV cache/arena com estado
+# mutável (kv_offset, estado do Gated DeltaNet) -- nada disso é reentrante.
+# Duas requisições concorrentes (ex.: dois streams abertos ao mesmo tempo)
+# chamariam generate() simultaneamente de threads Python diferentes contra o
+# MESMO executor/allocator, corrompendo o KV cache ou lançando kernels HIP
+# fora de ordem. Este lock torna o vte-server "uma geração de cada vez" por
+# processo -- exatamente o nível de isolamento que o Lemonade já assume ao
+# tratar cada backend como um único slot de modelo por subprocesso.
+# --------------------------------------------------------------------------
+_generation_lock = threading.Lock()
 
-def _run_generation(gen, out_queue: "queue.Queue", stop_event: threading.Event):
+_BUSY_RESPONSE = {
+    "error": {
+        "message": "O VTE já está gerando outra resposta; esta instância processa um pedido por vez.",
+        "type": "server_busy",
+    },
+}
+
+
+def _run_generation(gen, out_queue: "queue.Queue", stop_event: threading.Event, lock: threading.Lock):
     try:
         for word in gen:
             out_queue.put(("chunk", word))
@@ -175,6 +198,7 @@ def _run_generation(gen, out_queue: "queue.Queue", stop_event: threading.Event):
         out_queue.put(("error", str(e)))
     finally:
         out_queue.put(("done", None))
+        lock.release()
 
 
 def _openai_chunk(request_id: str, model_name: str, delta: dict, finish_reason=None) -> dict:
@@ -203,8 +227,23 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ready" if ready else "loading"}, status_code=200 if ready else 503)
 
 
+async def models_list(request: Request) -> JSONResponse:
+    return JSONResponse({
+        "object": "list",
+        "data": [{
+            "id": state.model_id,
+            "object": "model",
+            "created": state.load_timestamp,
+            "owned_by": "vte",
+        }],
+    })
+
+
 async def chat_completions(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": {"message": "Corpo da requisição não é um JSON válido.", "type": "invalid_request_error"}}, status_code=400)
     try:
         messages = _extract_prompt(body)
     except ValueError as e:
@@ -222,6 +261,8 @@ async def chat_completions(request: Request):
     prompt = state.model.tokenizer.apply_chat_template(messages)
 
     if not stream:
+        if not _generation_lock.acquire(blocking=False):
+            return JSONResponse(_BUSY_RESPONSE, status_code=429)
         try:
             text = "".join(
                 state.model.generate(
@@ -233,6 +274,8 @@ async def chat_completions(request: Request):
             return JSONResponse({"error": {"message": str(e), "type": "server_error"}}, status_code=500)
         except (ValueError, FileNotFoundError) as e:
             return JSONResponse({"error": {"message": str(e), "type": "invalid_request_error"}}, status_code=400)
+        finally:
+            _generation_lock.release()
         return JSONResponse({
             "id": request_id,
             "object": "chat.completion",
@@ -245,6 +288,9 @@ async def chat_completions(request: Request):
             }],
         })
 
+    if not _generation_lock.acquire(blocking=False):
+        return JSONResponse(_BUSY_RESPONSE, status_code=429)
+
     out_queue: "queue.Queue" = queue.Queue()
     stop_event = threading.Event()
     gen = state.model.generate(
@@ -252,7 +298,7 @@ async def chat_completions(request: Request):
         top_p=top_p, top_k=top_k, repetition_penalty=repetition_penalty,
     )
     gen_thread = threading.Thread(
-        target=_run_generation, args=(gen, out_queue, stop_event), daemon=True,
+        target=_run_generation, args=(gen, out_queue, stop_event, _generation_lock), daemon=True,
         name="VTE-GenerationThread",
     )
     gen_thread.start()
@@ -285,7 +331,10 @@ async def chat_completions(request: Request):
 
 
 async def completions(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": {"message": "Corpo da requisição não é um JSON válido.", "type": "invalid_request_error"}}, status_code=400)
     prompt = body.get("prompt")
     if not prompt:
         return JSONResponse({"error": {"message": "Campo 'prompt' ausente.", "type": "invalid_request_error"}}, status_code=400)
@@ -296,6 +345,8 @@ async def completions(request: Request):
     top_k = body.get("top_k", 50)
     repetition_penalty = body.get("repetition_penalty")
 
+    if not _generation_lock.acquire(blocking=False):
+        return JSONResponse(_BUSY_RESPONSE, status_code=429)
     try:
         text = "".join(
             state.model.generate(
@@ -307,6 +358,8 @@ async def completions(request: Request):
         return JSONResponse({"error": {"message": str(e), "type": "server_error"}}, status_code=500)
     except (ValueError, FileNotFoundError) as e:
         return JSONResponse({"error": {"message": str(e), "type": "invalid_request_error"}}, status_code=400)
+    finally:
+        _generation_lock.release()
 
     return JSONResponse({
         "id": f"cmpl-{uuid.uuid4().hex[:24]}",
@@ -317,11 +370,26 @@ async def completions(request: Request):
     })
 
 
-app = Starlette(routes=[
-    Route("/health", health, methods=["GET"]),
-    Route("/v1/chat/completions", chat_completions, methods=["POST"]),
-    Route("/v1/completions", completions, methods=["POST"]),
-])
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    # Rede de segurança final: qualquer exceção que escape dos handlers acima
+    # (bug real, tipo inesperado de campo, etc.) não pode vazar um traceback
+    # cru pro cliente (potencialmente o próprio Lemonade tentando parsear a
+    # resposta como JSON de erro OpenAI) nem derrubar o processo -- Starlette
+    # já isola isso por requisição, mas sem este handler a resposta default
+    # não segue o formato `{"error": {...}}` que o resto da API usa.
+    logger.error(f"Erro não tratado em {request.url.path}: {exc}", exc_info=True)
+    return JSONResponse({"error": {"message": "Erro interno do servidor.", "type": "server_error"}}, status_code=500)
+
+
+app = Starlette(
+    routes=[
+        Route("/health", health, methods=["GET"]),
+        Route("/v1/models", models_list, methods=["GET"]),
+        Route("/v1/chat/completions", chat_completions, methods=["POST"]),
+        Route("/v1/completions", completions, methods=["POST"]),
+    ],
+    exception_handlers={Exception: _unhandled_exception_handler},
+)
 
 
 def _parse_args(argv=None):
@@ -348,15 +416,29 @@ def cli_main():
     if args.parent_pid is not None:
         _start_parent_watchdog(args.parent_pid)
 
-    _check_vram_preflight(args.vram_limit_pct)
+    # Falha rápida e legível: um host como o Lemonade spawna este processo e
+    # faz polling em /health esperando "ready" -- se o load falhar (VRAM
+    # insuficiente, GGUF corrompido, arquitetura não suportada), deixar a
+    # exceção subir crua faria o processo morrer com um traceback Python no
+    # stderr em vez de um log claro, e ainda assim o host ficaria fazendo
+    # polling até estourar o próprio timeout dele. Aqui o processo morre
+    # IMEDIATAMENTE (exit code 1) com uma linha de log objetiva, para o host
+    # detectar a falha de carregamento o quanto antes.
+    try:
+        _check_vram_preflight(args.vram_limit_pct)
+        logger.info(f"Carregando {args.gguf_path}...")
+        state.model = VTEModel.from_path(
+            args.gguf_path,
+            context_length=args.context_length,
+            idle_timeout_seconds=args.idle_timeout,
+            enable_auto_unload=True,
+        )
+    except Exception as e:
+        logger.error(f"Falha ao carregar o modelo, encerrando: {e}")
+        sys.exit(1)
 
-    logger.info(f"Carregando {args.gguf_path}...")
-    state.model = VTEModel.from_path(
-        args.gguf_path,
-        context_length=args.context_length,
-        idle_timeout_seconds=args.idle_timeout,
-        enable_auto_unload=True,
-    )
+    state.model_id = Path(args.gguf_path).stem
+    state.load_timestamp = int(time.time())
     logger.info(f"Modelo carregado. Servindo em http://{args.host}:{args.port}")
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
