@@ -106,6 +106,37 @@ def _coerce_chat_messages(user_message, system: Optional[str], default_system: s
     ]
 
 
+def _strip_literal_special_tokens(messages: List[dict], special_tokens: Dict[str, int]) -> List[dict]:
+    """Remove ocorrências literais dos tokens especiais deste tokenizer (ex.:
+    "<|im_start|>", "<|im_end|>") do `content` de cada mensagem, antes de
+    renderizar o chat template.
+
+    Sem isto, uma mensagem vinda de um chamador externo (ex.: vte-server,
+    que repassa `content` de requisições HTTP não confiáveis direto pra cá)
+    poderia embutir um literal desses -- `encode()`/`_split_special_tokens`
+    (mais abaixo) faz `re.split` sobre o texto JÁ RENDERIZADO inteiro, sem
+    nenhuma forma de distinguir um marcador que o próprio template inseriu
+    de um literal que veio de dentro do `content` de uma mensagem "user".
+    Isso deixaria quem chama `apply_chat_template` com uma lista de
+    mensagens externa forjar um limite de turno falso (ex.: um "system"
+    extra depois do prompt de sistema real), sobrescrevendo instruções que
+    um integrador downstream (ex.: quem embute o vte-server no próprio
+    produto) esperava que fossem definitivas. Aplicado uniformemente a
+    TODA mensagem (inclusive as inseridas internamente por
+    `_coerce_chat_messages`), já que essas nunca contêm esses literais e a
+    checagem é barata."""
+    if not special_tokens:
+        return messages
+    pattern = re.compile("|".join(re.escape(t) for t in special_tokens))
+    sanitized = []
+    for m in messages:
+        content = m.get("content", "")
+        if isinstance(content, str) and pattern.search(content):
+            m = {**m, "content": pattern.sub("", content)}
+        sanitized.append(m)
+    return sanitized
+
+
 class QwenTokenizer:
     """
     Tokenizador BPE byte-level do Qwen2.5, reconstruído a partir do vocabulário
@@ -314,6 +345,7 @@ class QwenTokenizer:
         de verdade (ex.: Qwen3.5) sem precisar mudar quem chama.
         """
         messages = _coerce_chat_messages(user_message, system, self.DEFAULT_SYSTEM_PROMPT)
+        messages = _strip_literal_special_tokens(messages, self.special_tokens)
         rendered = "".join(
             f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages
         )
@@ -514,6 +546,7 @@ class GraniteTokenizer:
                 "Chat template do Granite não carregado do GGUF (tokenizer.chat_template ausente)."
             )
         messages = _coerce_chat_messages(user_message, system, self.DEFAULT_SYSTEM_PROMPT)
+        messages = _strip_literal_special_tokens(messages, self.special_tokens)
 
         env = Environment(trim_blocks=True, lstrip_blocks=True)
         env.filters["tojson"] = json.dumps
@@ -738,6 +771,7 @@ class Qwen3_5Tokenizer:
             )
 
         messages = _coerce_chat_messages(user_message, system, self.DEFAULT_SYSTEM_PROMPT)
+        messages = _strip_literal_special_tokens(messages, self.special_tokens)
 
         env = Environment(trim_blocks=True, lstrip_blocks=True)
         env.filters["tojson"] = json.dumps
