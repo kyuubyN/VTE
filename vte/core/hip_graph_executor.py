@@ -71,10 +71,16 @@ class HIPGraphExecutor:
         self._kernel_cache: Dict[str, tuple] = {}
         self.arg_builder = KernelArgBuilder()
 
-        hipcc_available = shutil.which("hipcc") is not None
-        self._has_real_kernels = hipcc_available
-        if not hipcc_available:
-            logger.info("hipcc não encontrado. HIP Graph capturará grafo vazio (overhead mínimo via lançamento único).")
+        # `codegen.compile_kernel()` semeia binários AOT empacotados antes de
+        # sequer checar hipcc (ver codegen.py "Semeadura AOT"), então a
+        # ausência de hipcc no PATH não implica ausência de kernels reais --
+        # só bloqueava a recompilação sob demanda quando NENHUM AOT bate.
+        # Gatear a captura inteira aqui nesse caso fazia o grafo virar
+        # vazio (logits sempre zero) em qualquer máquina sem hipcc, mesmo
+        # com o AOT certo pra GPU local já no pacote -- achado real rodando
+        # sem hipcc numa RX 7600 com kernels AOT gfx1102 presentes.
+        if shutil.which("hipcc") is None:
+            logger.info("hipcc não encontrado no PATH; kernels virão do cache AOT empacotado (recompilação sob demanda indisponível).")
 
         self.codegen = CodegenEngine()
 
@@ -120,11 +126,10 @@ class HIPGraphExecutor:
     def _get_or_compile_kernel(self, node: IRNode) -> Optional[ctypes.c_void_p]:
         """
         Compila e carrega o kernel para um nó, com cache para evitar recompilação.
-        Retorna None se hipcc não estiver disponível (modo simbólico).
+        Sempre tenta `codegen.load_kernel_safe` (que semeia do AOT empacotado
+        antes de precisar de hipcc); só devolve None se essa tentativa falhar
+        de verdade (nem AOT bate nem há hipcc pra compilar sob demanda).
         """
-        if not self._has_real_kernels:
-            return None
-
         arch = self.hip.get_gpu_architecture()
 
         op_to_template = {
@@ -460,10 +465,9 @@ class HIPGraphExecutor:
 
     def _capture_graph(self, mode: str, seq_len: int) -> ctypes.c_void_p:
         """
-        Captura o fluxo de kernels no stream da AMD.
-
-        Se hipcc estiver disponível: grava kernels reais compilados.
-        Se não estiver: grava um grafo vazio (overhead Python é removido via graph_launch).
+        Captura o fluxo de kernels no stream da AMD, sempre a partir do AOT
+        empacotado (ou de hipcc, se disponível, para recompilação sob
+        demanda quando nenhum AOT bate).
         """
         logger.info(f"Iniciando captura de HIP Graph para mode='{mode}', seq_len={seq_len}")
 
@@ -473,9 +477,8 @@ class HIPGraphExecutor:
         try:
             self.hip.stream_begin_capture()
 
-            if self._has_real_kernels:
-                self._capture_embedding_lookup(seq_len)
-                nodes_recorded += 1
+            self._capture_embedding_lookup(seq_len)
+            nodes_recorded += 1
 
             # Fusão Profunda: quando encontramos o attn_norm de uma camada
             # (seq_len==1, único caso suportado pelo kernel fundido), gravamos

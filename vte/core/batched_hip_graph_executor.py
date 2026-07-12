@@ -165,9 +165,8 @@ class BatchedHIPGraphExecutor:
         try:
             self.hip.stream_begin_capture()
 
-            if self._inner._has_real_kernels:
-                self._capture_embedding_lookup_batch()
-                nodes_recorded += 1
+            self._capture_embedding_lookup_batch()
+            nodes_recorded += 1
 
             qkv_fused_names: set = set()
 
