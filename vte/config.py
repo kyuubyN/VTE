@@ -51,9 +51,14 @@ GPU_ARCH_MAP = {
     "rx 7600": "gfx1102", "rx 7600 xt": "gfx1101", "rx 7700": "gfx1101",
     "rx 7700 xt": "gfx1101", "rx 7800 xt": "gfx1101", "rx 7900": "gfx1100",
     "rx 7900 xt": "gfx1100", "rx 7900 xtx": "gfx1100",
-    "rx 6600": "gfx1032", "rx 6600 xt": "gfx1032", "rx 6700": "gfx1031",
-    "rx 6700 xt": "gfx1031", "rx 6800": "gfx1030", "rx 6800 xt": "gfx1030",
-    "rx 6900": "gfx1030", "rx 6900 xt": "gfx1030",
+    # RDNA2 (Navi21/22/23/24) -- ver scripts/cross_compile_rdna2_kernel_cache.py
+    # para os binários AOT (nunca executados em hardware real, ver
+    # docs/LIMITATIONS.md).
+    "rx 6600": "gfx1032", "rx 6600 xt": "gfx1032", "rx 6650 xt": "gfx1032",
+    "rx 6700": "gfx1031", "rx 6700 xt": "gfx1031", "rx 6750 xt": "gfx1031",
+    "rx 6800": "gfx1030", "rx 6800 xt": "gfx1030",
+    "rx 6900": "gfx1030", "rx 6900 xt": "gfx1030", "rx 6950 xt": "gfx1030",
+    "rx 6500 xt": "gfx1034", "rx 6400": "gfx1034",
 }
 
 VRAM_USAGE_LIMIT = VRAM_SAFETY_MARGIN
