@@ -12,7 +12,24 @@ def mock_hip():
     hip._active_allocations = {}
     hip._in_cleanup_mode = False
     hip._vram_total = 8 * 1024 * 1024 * 1024
+    hip._counted_as_live = False
     return hip
+
+
+@pytest.fixture(autouse=True)
+def _reset_process_wide_hip_state():
+    """_process_wide_allocated_bytes/_live_instance_count are HIPRuntime
+    CLASS attributes (shared across every instance in the process, see the
+    "Fase 5" comment in hip_runtime.py -- needed so two coexisting
+    HIPRuntime instances see each other's allocations for the real 95% VRAM
+    guard). Tests construct throwaway instances via __new__, but a class
+    attribute mutated by one test leaks into every test that runs after it
+    in the same process. Snapshot and restore around each test."""
+    saved_bytes = HIPRuntime._process_wide_allocated_bytes
+    saved_count = HIPRuntime._live_instance_count
+    yield
+    HIPRuntime._process_wide_allocated_bytes = saved_bytes
+    HIPRuntime._live_instance_count = saved_count
 
 def test_malloc_rejects_zero(mock_hip):
     with pytest.raises(HIPSafetyError):
@@ -27,7 +44,12 @@ def test_malloc_rejects_oversized(mock_hip):
         mock_hip.safe_malloc(MAX_ALLOCATION_SIZE + 1)
 
 def test_malloc_rejects_vram_overflow(mock_hip):
-    mock_hip._active_allocations[1] = (int(mock_hip._vram_total * 0.9), "large_alloc")
+    # The 95% guard sums HIPRuntime._process_wide_allocated_bytes (a
+    # process-wide class counter), not this instance's _active_allocations
+    # -- see the "Fase 5" comment on HIPRuntime for why (two HIPRuntime
+    # instances in the same process, e.g. draft + target model, must see
+    # each other's allocations against the same physical VRAM).
+    HIPRuntime._process_wide_allocated_bytes = int(mock_hip._vram_total * 0.9)
     with pytest.raises(HIPSafetyError):
         mock_hip.safe_malloc(int(mock_hip._vram_total * 0.1))
 
@@ -62,6 +84,7 @@ def test_cleanup_releases_all():
     hip._lib = None
     hip._initialized = True
     hip._in_cleanup_mode = False
+    hip._counted_as_live = False
 
     def mock_free(ptr, tag=""):
         val = ptr.value or 0

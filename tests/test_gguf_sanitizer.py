@@ -43,11 +43,16 @@ def test_missing_file():
     with pytest.raises(HIPSafetyError, match="não encontrado"):
         sanitizer.validate()
 
-def test_wrong_name(tmp_path):
+def test_truncated_file_rejected(tmp_path):
+    """Filename is no longer part of validation (model discovery resolves
+    variants by block_count + file size now, see
+    GGUFSanitizer._validate_metadata_consistency) -- a mismatched name alone
+    is not rejected. What must still fail loudly is a file too short to
+    contain a real GGUF header, regardless of its name."""
     p = tmp_path / "wrong_name.gguf"
     p.write_bytes(b"GGUF")
     sanitizer = GGUFSanitizer(p)
-    with pytest.raises(HIPSafetyError, match="Nome do modelo incorreto"):
+    with pytest.raises(HIPSafetyError, match="Erro de struct lendo GGUF"):
         sanitizer.validate()
 
 def test_size_out_of_bounds(mock_gguf_file, monkeypatch):
