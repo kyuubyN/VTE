@@ -111,6 +111,7 @@ The full write-up is split by topic: each page is self-contained and links back 
 | [**Bugs found during development**](docs/BUGS.md) | The full "symptom → root cause → fix → measurement" history: silent data corruption, a real Windows TDR crash, and everything in between |
 | [**Known limitations**](docs/LIMITATIONS.md) | What's genuinely unfinished or unresolved right now |
 | [**Getting started**](docs/USAGE.md) | Full Python API examples and desktop-UI setup details |
+| [**Integrating with Lemonade**](docs/LEMONADE.md) | `vte-server`'s API surface and safety fallbacks, `vte pull`, the Lemonade-side recipe, the `recipe_options.ctx_size` gotcha, and the release process |
 | [**Security policy**](SECURITY.md) | Threat model and defense mechanisms (untrusted GGUF input, VRAM sandboxing, watchdogs) |
 
 ---
