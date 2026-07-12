@@ -187,7 +187,7 @@ _BUSY_RESPONSE = {
 }
 
 
-def _run_generation(gen, out_queue: "queue.Queue", stop_event: threading.Event, lock: threading.Lock):
+def _run_generation(gen, out_queue: "queue.Queue", stop_event: threading.Event, lock: threading.Lock, stats: dict = None):
     try:
         for word in gen:
             out_queue.put(("chunk", word))
@@ -197,7 +197,9 @@ def _run_generation(gen, out_queue: "queue.Queue", stop_event: threading.Event, 
     except Exception as e:
         out_queue.put(("error", str(e)))
     finally:
-        out_queue.put(("done", None))
+        # `stats` foi preenchido por generate() (por referência) ao exaurir o
+        # generator -- carrega completion_tokens pro chunk final de usage.
+        out_queue.put(("done", stats))
         lock.release()
 
 
@@ -249,25 +251,32 @@ async def chat_completions(request: Request):
     except ValueError as e:
         return JSONResponse({"error": {"message": str(e), "type": "invalid_request_error"}}, status_code=400)
 
-    max_tokens = body.get("max_tokens", state.default_max_tokens)
+    # Aceita tanto os nomes OpenAI modernos (max_completion_tokens,
+    # repeat_penalty -- o que o Lemonade e clientes OpenAI atuais mandam)
+    # quanto os originais do VTE. O adapter C++ do Lemonade também normaliza,
+    # mas manter aqui deixa o vte-server correto quando falado direto.
+    max_tokens = body.get("max_tokens", body.get("max_completion_tokens", state.default_max_tokens))
     temperature = body.get("temperature")
     top_p = body.get("top_p", 0.9)
     top_k = body.get("top_k", 50)
-    repetition_penalty = body.get("repetition_penalty")
+    repetition_penalty = body.get("repetition_penalty", body.get("repeat_penalty"))
     stream = bool(body.get("stream", False))
     request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     model_name = body.get("model", "vte")
 
     prompt = state.model.tokenizer.apply_chat_template(messages)
+    prompt_tokens = len(state.model.tokenizer.encode(prompt))
 
     if not stream:
         if not _generation_lock.acquire(blocking=False):
             return JSONResponse(_BUSY_RESPONSE, status_code=429)
+        gen_stats: dict = {}
         try:
             text = "".join(
                 state.model.generate(
                     prompt, max_tokens=max_tokens, temperature=temperature,
                     top_p=top_p, top_k=top_k, repetition_penalty=repetition_penalty,
+                    stats=gen_stats,
                 )
             )
         except (HIPSafetyError, HIPRuntimeError, VTEError) as e:
@@ -276,6 +285,7 @@ async def chat_completions(request: Request):
             return JSONResponse({"error": {"message": str(e), "type": "invalid_request_error"}}, status_code=400)
         finally:
             _generation_lock.release()
+        completion_tokens = gen_stats.get("completion_tokens", 0)
         return JSONResponse({
             "id": request_id,
             "object": "chat.completion",
@@ -286,6 +296,11 @@ async def chat_completions(request: Request):
                 "message": {"role": "assistant", "content": text},
                 "finish_reason": "stop",
             }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
         })
 
     if not _generation_lock.acquire(blocking=False):
@@ -293,12 +308,14 @@ async def chat_completions(request: Request):
 
     out_queue: "queue.Queue" = queue.Queue()
     stop_event = threading.Event()
+    gen_stats: dict = {}
     gen = state.model.generate(
         prompt, max_tokens=max_tokens, temperature=temperature,
         top_p=top_p, top_k=top_k, repetition_penalty=repetition_penalty,
+        stats=gen_stats,
     )
     gen_thread = threading.Thread(
-        target=_run_generation, args=(gen, out_queue, stop_event, _generation_lock), daemon=True,
+        target=_run_generation, args=(gen, out_queue, stop_event, _generation_lock, gen_stats), daemon=True,
         name="VTE-GenerationThread",
     )
     gen_thread.start()
@@ -322,6 +339,23 @@ async def chat_completions(request: Request):
                     break
                 elif kind == "done":
                     yield f"data: {json.dumps(_openai_chunk(request_id, model_name, {}, finish_reason='stop'))}\n\n"
+                    # Chunk final de usage (convenção OpenAI stream_options.
+                    # include_usage): choices vazio + objeto usage, logo antes
+                    # do [DONE]. `payload` aqui é o dict stats de _run_generation.
+                    completion_tokens = (payload or {}).get("completion_tokens", 0)
+                    usage_chunk = {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model_name,
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": prompt_tokens + completion_tokens,
+                        },
+                    }
+                    yield f"data: {json.dumps(usage_chunk)}\n\n"
                     yield "data: [DONE]\n\n"
                     break
         finally:
@@ -339,19 +373,23 @@ async def completions(request: Request):
     if not prompt:
         return JSONResponse({"error": {"message": "Campo 'prompt' ausente.", "type": "invalid_request_error"}}, status_code=400)
 
-    max_tokens = body.get("max_tokens", state.default_max_tokens)
+    max_tokens = body.get("max_tokens", body.get("max_completion_tokens", state.default_max_tokens))
     temperature = body.get("temperature")
     top_p = body.get("top_p", 0.9)
     top_k = body.get("top_k", 50)
-    repetition_penalty = body.get("repetition_penalty")
+    repetition_penalty = body.get("repetition_penalty", body.get("repeat_penalty"))
+
+    prompt_tokens = len(state.model.tokenizer.encode(prompt))
 
     if not _generation_lock.acquire(blocking=False):
         return JSONResponse(_BUSY_RESPONSE, status_code=429)
+    gen_stats: dict = {}
     try:
         text = "".join(
             state.model.generate(
                 prompt, max_tokens=max_tokens, temperature=temperature,
                 top_p=top_p, top_k=top_k, repetition_penalty=repetition_penalty,
+                stats=gen_stats,
             )
         )
     except (HIPSafetyError, HIPRuntimeError, VTEError) as e:
@@ -361,12 +399,18 @@ async def completions(request: Request):
     finally:
         _generation_lock.release()
 
+    completion_tokens = gen_stats.get("completion_tokens", 0)
     return JSONResponse({
         "id": f"cmpl-{uuid.uuid4().hex[:24]}",
         "object": "text_completion",
         "created": int(time.time()),
         "model": body.get("model", "vte"),
         "choices": [{"index": 0, "text": text, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
     })
 
 

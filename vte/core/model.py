@@ -790,8 +790,17 @@ class VTEModel:
         top_p: float = 0.9,
         top_k: int = 50,
         repetition_penalty: float = None,
+        stats: dict = None,
     ):
-        """Gera texto como um Generator, permitindo interrupção caller-side."""
+        """Gera texto como um Generator, permitindo interrupção caller-side.
+
+        `stats` (opcional): se um dict for passado, ao fim da geração normal
+        recebe `completion_tokens` = número de tokens REALMENTE gerados
+        (len(input_tokens) - prompt_len, exato -- vem da contabilidade interna,
+        não de uma re-tokenização aproximada do texto). Usado pelo vte-server
+        pra preencher o campo `usage` da resposta OpenAI. Não é preenchido se
+        a geração for cancelada no meio (gen.close()), já que o caller nesse
+        caso descarta a resposta."""
         self._lifecycle.ensure_loaded()
         self._lifecycle.touch()
 
@@ -924,6 +933,9 @@ class VTEModel:
         tail = utf8_decoder.flush()
         if tail:
             yield tail
+
+        if stats is not None:
+            stats["completion_tokens"] = len(input_tokens) - prompt_len
 
     def generate_batch(
         self,
