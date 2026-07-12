@@ -1,7 +1,7 @@
 import pytest
 import ctypes
 from pathlib import Path
-from vte.config import find_hip_dll
+from vte.bridge.dll_discovery import find_hip_dll
 
 @pytest.fixture
 def project_root():

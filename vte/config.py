@@ -1,7 +1,4 @@
-import sys
-import ctypes.util
-import os
-from pathlib import Path
+﻿from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent
 MODEL_DIR = PROJECT_ROOT / "Model"
@@ -64,34 +61,3 @@ GPU_ARCH_MAP = {
 VRAM_USAGE_LIMIT = VRAM_SAFETY_MARGIN
 MAX_SHARED_MEM_PER_BLOCK = 64 * 1024
 MAX_GRID_DIMENSIONS = (2**31) - 1
-
-def find_hip_dll() -> str | None:
-    hip_path = os.environ.get("HIP_PATH")
-    if hip_path:
-        p = Path(hip_path) / "bin" / "amdhip64.dll"
-        if p.exists(): return str(p)
-    base = Path(r"C:\Program Files\AMD\ROCm")
-    for version in ["6.4", "6.3", "6.2", "6.1", "6.0", "5.7"]:
-        p = base / version / "bin" / "amdhip64.dll"
-        if p.exists(): return str(p)
-    p = Path(r"C:\Program Files\AMD\HIPinmdhip64.dll")
-    if p.exists(): return str(p)
-    lib = ctypes.util.find_library("amdhip64")
-    if lib: return lib
-    return None
-
-def preflight_safety_check() -> tuple[bool, str]:
-    if sys.platform != "win32":
-        return False, "VTE requer Windows (WDDM resiliência)."
-    dll = find_hip_dll()
-    if not dll:
-        return False, "amdhip64.dll não encontrada. Instale o ROCm/HIP SDK."
-    if not MODEL_DIR.exists():
-        MODEL_DIR.mkdir(parents=True)
-        return False, f"Diretório Model/ criado. Coloque o modelo em {MODEL_PATH}."
-    if not MODEL_PATH.exists():
-        return False, f"Modelo não encontrado em {MODEL_PATH}."
-    size = MODEL_PATH.stat().st_size
-    if size < ALLOWED_MODEL_SIZE_MIN or size > ALLOWED_MODEL_SIZE_MAX:
-        return False, f"Tamanho do modelo fora do range permitido: {size} bytes."
-    return True, "Preflight Ok."

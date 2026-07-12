@@ -18,7 +18,7 @@ from .logger import get_logger
 logger = get_logger(__name__)
 
 from vte.config import MAX_ALLOCATION_SIZE, VRAM_USAGE_LIMIT
-from vte.config import DEFAULT_GPU_ARCH, GPU_ARCH_MAP, CACHE_DIR, find_hip_dll, MAX_GRID_DIMENSIONS
+from vte.config import DEFAULT_GPU_ARCH, GPU_ARCH_MAP, CACHE_DIR, MAX_GRID_DIMENSIONS
 
 from enum import IntEnum
 from dataclasses import dataclass
