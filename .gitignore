@@ -58,6 +58,9 @@ build/
 dist-vte-server/
 build-vte-server/
 release-assets/
+# Stray release bundles emitted at repo root by Compress-Archive; the
+# authoritative copies live under release-assets/ (also ignored above).
+vte-server-*.zip
 
 # Lemonade -- repositorio Git SEPARADO, clonado dentro deste diretorio de
 # trabalho para a integracao do backend VTE, nunca deve ser versionado como
