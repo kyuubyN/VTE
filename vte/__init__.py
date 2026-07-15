@@ -12,7 +12,7 @@ Exemplo de uso:
 from .core.model import VTEModel
 from .bridge.dll_discovery import validate_hip_installation
 
-__version__ = "0.1.0"
+__version__ = "0.3.1"
 __author__ = "VTE Contributors"
 
 import sys
