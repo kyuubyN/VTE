@@ -73,9 +73,19 @@ class GPUUtilizationGuard:
     def _query_gpu_utilization(self) -> float | None:
         cmd = _POWERSHELL_CMD_TEMPLATE.format(pid=self._pid)
         try:
+            # CREATE_NO_WINDOW é ESSENCIAL aqui: este `subprocess.run` roda
+            # em loop contínuo (`_monitor_loop`, a cada `_poll_interval`).
+            # Quando o processo pai é uma app GUI sem console (ex.: o backend
+            # do Aetheris lançado via pythonw.exe), CADA chamada de
+            # powershell abre uma NOVA janela de console visível -- o
+            # sintoma "abre terminais do PowerShell infinitamente" relatado.
+            # Com console anexado (python.exe normal) as janelas não
+            # aparecem, por isso só se manifesta no app empacotado. Mesmo
+            # padrão já usado em hip_runtime.py para o hipcc.
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             result = subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=5, creationflags=creationflags,
             )
             output = result.stdout.strip()
             if not output:
