@@ -444,7 +444,10 @@ def _parse_args(argv=None):
     p.add_argument("--context-length", type=int, default=None)
     p.add_argument("--idle-timeout", type=int, default=60,
                    help="Segundos de inatividade antes do unload automático (default: 60, mais curto "
-                        "que o padrão de 300s do vte-ui, pensado para uso desktop contínuo).")
+                        "que o padrão de 300s do vte-ui, pensado para uso desktop contínuo). "
+                        "0 ou negativo DESABILITA o unload automático -- usado quando um host "
+                        "externo (ex.: Lemonade) é dono do ciclo de vida do modelo e não quer "
+                        "que o vte-server descarregue por conta própria durante um request longo.")
     p.add_argument("--vram-limit-pct", type=float, default=80.0,
                    help="Heurística de coexistência (ver docstring de _check_vram_preflight): recusa "
                         "carregar se a VRAM livre atual estiver abaixo deste percentual.")
@@ -475,7 +478,7 @@ def cli_main():
             args.gguf_path,
             context_length=args.context_length,
             idle_timeout_seconds=args.idle_timeout,
-            enable_auto_unload=True,
+            enable_auto_unload=(args.idle_timeout > 0),
         )
     except Exception as e:
         logger.error(f"Falha ao carregar o modelo, encerrando: {e}")
