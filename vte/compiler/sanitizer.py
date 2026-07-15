@@ -88,6 +88,21 @@ SUPPORTED_ARCHITECTURES = {
             },
         ],
     },
+    "llama": {
+        # Contexto nativo do Llama 3.1 é 131072 (128K, GGUF llama.context_length
+        # confirmado via gguf.GGUFReader real) -- teto de sanidade generoso o
+        # bastante sem virar cheque em branco.
+        "max_context_length": 150_000,
+        "variants": [
+            {
+                "expected_filename": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+                "block_count": 32,
+                "size_min_key": "LLAMA3_1_8B_SIZE_MIN",
+                "size_max_key": "LLAMA3_1_8B_SIZE_MAX",
+                "hash_config_key": "LLAMA3_1_8B_EXPECTED_HASH",
+            },
+        ],
+    },
 }
 
 
@@ -213,7 +228,14 @@ class GGUFSanitizer:
                  raise HIPSafetyError("EOF lendo array metadata")
              atype = struct.unpack("<I", atype_bytes)[0]
              alen = struct.unpack("<Q", alen_bytes)[0]
-             if alen > 250000:
+             # 250_000 estourava de verdade no Llama 3.1 8B: seu
+             # `tokenizer.ggml.merges` tem 280147 regras (vocabulário BPE de
+             # 128k tokens, medido via gguf.GGUFReader real), bem acima do
+             # teto anterior calibrado só contra Qwen2.5/Granite/Qwen3.5 (
+             # vocabulários bem menores). Ainda um teto real, não um cheque
+             # em branco -- só generoso o bastante pro maior array legítimo
+             # já visto (merges), não pra qualquer array malformado.
+             if alen > 500000:
                  raise HIPSafetyError(f"Array muito longo nos metadados: {alen} elementos")
              for _ in range(alen):
                  self._skip_value(f, atype)

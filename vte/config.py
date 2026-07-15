@@ -42,6 +42,12 @@ QWEN2_5_7B_SIZE_MAX = 5 * 1024 * 1024 * 1024
 QWEN2_5_0_5B_EXPECTED_HASH = "sha256:PLACEHOLDER"
 QWEN2_5_0_5B_SIZE_MIN = 300 * 1024 * 1024
 QWEN2_5_0_5B_SIZE_MAX = 500 * 1024 * 1024
+# Arquivo real medido nesta sessão (bartowski/Meta-Llama-3.1-8B-Instruct-GGUF,
+# Q4_K_M): 4920739232 bytes (~4.58GB). Hash calculado e confirmado nesta
+# sessão (mesmo arquivo usado para depurar e corrigir o bug de rope_type).
+LLAMA3_1_8B_EXPECTED_HASH = "7b064f5842bf9532c91456deda288a1b672397a54fa729aa665952863033557c"
+LLAMA3_1_8B_SIZE_MIN = int(4.5 * 1024 * 1024 * 1024)
+LLAMA3_1_8B_SIZE_MAX = 5 * 1024 * 1024 * 1024
 
 DEFAULT_GPU_ARCH = "gfx1100"
 GPU_ARCH_MAP = {

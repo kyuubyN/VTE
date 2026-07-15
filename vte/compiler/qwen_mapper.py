@@ -160,10 +160,18 @@ class ActivationArena:
         self._synchronized = True
 
 class QwenTensorMapper:
-    def __init__(self, parser, metadata: dict):
+    """Reaproveitado, sem subclasse, por qualquer arquitetura GQA "chata"
+    (RMSNorm->QKV->RoPE->GQA->O-proj->SwiGLU) que não precise de mapeamento
+    próprio -- hoje Qwen2.5 e Llama 3.1 (ver `model.py::_load_llama_metadata`).
+    `model_label` só troca o nome usado na mensagem de OOM preventivo
+    (`format_oom_error`); todo o resto do comportamento é genérico, lido de
+    `self.metadata`."""
+
+    def __init__(self, parser, metadata: dict, model_label: str = "Qwen2.5"):
         self.parser = parser
         self.metadata = metadata
-        
+        self._model_label = model_label
+
         # Cria um objeto dummy pra passar pro ModelConfig
         class DummyModel:
             pass
@@ -261,7 +269,7 @@ class QwenTensorMapper:
         free_vram = allocator.get_stats()['free_bytes']
 
         if total_required > free_vram:
-            raise HIPSafetyError(format_oom_error("Qwen2.5", total_required, allocator, context_length))
+            raise HIPSafetyError(format_oom_error(self._model_label, total_required, allocator, context_length))
 
         tensor_mapping = {}
         for name, t_info in self.parser.tensors.items():
@@ -419,9 +427,25 @@ class QwenTensorMapper:
 
         return tensor_mapping
 
+    def _read_rope_freq_scaling(self):
+        """Lê o tensor `rope_freqs.weight` do GGUF, se existir (Llama 3.1: NTK-
+        by-parts pré-computado pelo conversor, ver RoPECacheBuilder.__init__).
+        Tensor pequeno (head_dim//2 floats, ex. 64) -- lido direto do arquivo,
+        não pelo caminho geral de pesos (weight_loader.py só injeta o que está
+        em tensor_mapping, e este tensor nunca entra lá: é consumido aqui,
+        no host, para moldar a tabela de cos/sin, não copiado pra VRAM cru)."""
+        t_info = self.parser.tensors.get('rope_freqs.weight')
+        if t_info is None:
+            return None
+        import numpy as np
+        with open(self.parser.path, 'rb') as f:
+            f.seek(t_info['offset'])
+            raw = f.read(t_info['size'])
+        return np.frombuffer(raw, dtype=np.float32)
+
     def _build_and_upload_rope_cache(self, tensor_mapping: dict, allocator, hip_runtime, context_length: int):
         from vte.compiler.rope_cache_builder import RoPECacheBuilder
-        
+
         max_seq_len = context_length
         head_dim = 128
         for k, v in self.metadata.items():
@@ -431,11 +455,12 @@ class QwenTensorMapper:
         for k, v in self.metadata.items():
             if k.endswith('rope.freq_base'):
                 rope_theta = v
-                
+
         builder = RoPECacheBuilder(
             max_seq_len=max_seq_len,
             head_dim=head_dim,
-            rope_theta=rope_theta
+            rope_theta=rope_theta,
+            freq_scaling=self._read_rope_freq_scaling()
         )
         cos_cache, sin_cache = builder.build_cache()
         cos_ptr, sin_ptr = builder.upload_to_vram(cos_cache, sin_cache, hip_runtime, allocator)

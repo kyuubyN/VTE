@@ -801,3 +801,216 @@ class Qwen3_5Tokenizer:
         if eot is not None:
             ids.add(eot)
         return {i for i in ids if i is not None}
+
+
+class LlamaTokenizer:
+    """
+    Tokenizador BPE byte-level do Llama 3.1, reconstruído a partir do
+    vocabulário/merges do próprio GGUF -- mesmo motor de merge BPE do
+    QwenTokenizer (reaproveitado por atribuição direta, como Granite/
+    Qwen3.5 já fazem), pré-tokenizador `_DBRX_PATTERN` (é literalmente a
+    regex do Llama3 -- ver comentário na definição do pattern, llama.cpp
+    trata LLAMA_VOCAB_PRE_TYPE_DBRX/SMAUG/LLAMA3 como o mesmo case), e
+    tokens especiais/chat template PRÓPRIOS do Llama 3.1 (confirmados
+    contra os bytes reais de Model/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+    via gguf.GGUFReader, não adivinhados).
+    """
+
+    _bpe = QwenTokenizer._bpe
+    _split_special_tokens = QwenTokenizer._split_special_tokens
+
+    def __init__(self, vocab_path: Optional[str] = None, gguf_path: Optional[str | Path] = None):
+        self.vocab: Dict[str, int] = {}
+        self.inv_vocab: Dict[int, str] = {}
+        self.bpe_ranks: Dict[tuple, int] = {}
+        self._bpe_cache: Dict[str, str] = {}
+
+        self._byte_encoder = _bytes_to_unicode()
+        self._byte_decoder = {v: k for k, v in self._byte_encoder.items()}
+
+        # IDs confirmados contra os bytes reais do GGUF -- sobrescritos pelos
+        # valores reais do vocabulário logo abaixo em _load_from_gguf, este
+        # dict só serve de fallback pro caso vocab_path/sem-GGUF.
+        self.special_tokens = {
+            "<|begin_of_text|>": 128000,
+            "<|end_of_text|>": 128001,
+            "<|start_header_id|>": 128006,
+            "<|end_header_id|>": 128007,
+            "<|eom_id|>": 128008,
+            "<|eot_id|>": 128009,
+            "<|python_tag|>": 128010,
+        }
+        # tokenizer.ggml.eos_token_id real do GGUF aponta para <|eot_id|>
+        # (fim de turno do chat), não <|end_of_text|> -- mesma situação já
+        # vista no ChatML do Qwen (o EOS "de fato" do chat é o marcador de
+        # turno, não o EOS bruto de pré-treino). bos_token_id é
+        # <|begin_of_text|>: o chat template deste GGUF referencia
+        # `{{- bos_token }}` como variável Jinja (não como literal embutido),
+        # então apply_chat_template precisa passá-la explicitamente no
+        # render -- diferente de Granite/Qwen3.5, cujos templates não
+        # referenciam bos_token.
+        self.bos_token_id: Optional[int] = 128000
+        self.eos_token_id: Optional[int] = 128009
+        self.vocab_size = 0
+        self._chat_template_src: Optional[str] = None
+
+        if gguf_path is not None:
+            self._load_from_gguf(Path(gguf_path))
+        else:
+            logger.warning(
+                "LlamaTokenizer sem gguf_path: usando vocabulário mínimo de fallback (não-funcional para produção)."
+            )
+            self._load_fallback_vocab()
+
+    def _load_fallback_vocab(self):
+        self.vocab.update(self.special_tokens)
+        self._rebuild_inverse_vocab()
+
+    def _load_from_gguf(self, gguf_path: Path):
+        logger.info(f"[Llama] Extraindo vocabulário BPE do GGUF: {gguf_path}")
+        metadata = read_gguf_metadata(gguf_path, wanted_keys=_TOKENIZER_KEYS | {"tokenizer.chat_template"})
+
+        tokens: List[str] = metadata.get("tokenizer.ggml.tokens", [])
+        merges: List[str] = metadata.get("tokenizer.ggml.merges", [])
+
+        if not tokens:
+            logger.warning("GGUF não contém 'tokenizer.ggml.tokens'. Usando fallback mínimo.")
+            self._load_fallback_vocab()
+            return
+
+        for token_id, token_str in enumerate(tokens):
+            self.vocab[token_str] = token_id
+        self._rebuild_inverse_vocab()
+        self.vocab_size = len(tokens)
+
+        for token_str in list(self.special_tokens.keys()):
+            real_id = self.vocab.get(token_str)
+            if real_id is not None:
+                self.special_tokens[token_str] = real_id
+
+        bos_id = metadata.get("tokenizer.ggml.bos_token_id")
+        eos_id = metadata.get("tokenizer.ggml.eos_token_id")
+        if bos_id is not None:
+            self.bos_token_id = bos_id
+        if eos_id is not None:
+            self.eos_token_id = eos_id
+
+        for rank, merge_line in enumerate(merges):
+            parts = merge_line.split(" ")
+            if len(parts) == 2:
+                self.bpe_ranks[(parts[0], parts[1])] = rank
+
+        self._chat_template_src = metadata.get("tokenizer.chat_template")
+        if not self._chat_template_src:
+            logger.warning("GGUF não contém 'tokenizer.chat_template' -- apply_chat_template() falhará.")
+
+        logger.info(
+            f"[Llama] Tokenizer BPE carregado: {len(tokens)} tokens, {len(self.bpe_ranks)} regras de merge."
+        )
+
+    def _rebuild_inverse_vocab(self):
+        self.inv_vocab = {v: k for k, v in self.vocab.items()}
+
+    def encode(self, text: str) -> List[int]:
+        """Codifica texto em IDs de token via BPE byte-level, usando o
+        pré-tokenizador "dbrx" (idêntico ao do Llama3, ver `_DBRX_PATTERN`)."""
+        text = normalize(text)
+        token_ids: List[int] = []
+
+        for segment in self._split_special_tokens(text):
+            if segment in self.special_tokens:
+                token_ids.append(self.special_tokens[segment])
+                continue
+
+            for match in _DBRX_PATTERN.finditer(segment):
+                piece = match.group()
+                byte_piece = "".join(self._byte_encoder[b] for b in piece.encode("utf-8"))
+
+                for bpe_piece in self._bpe(byte_piece).split(" "):
+                    tid = self.vocab.get(bpe_piece)
+                    if tid is not None:
+                        token_ids.append(tid)
+                    else:
+                        for ch in bpe_piece:
+                            fallback_id = self.vocab.get(ch)
+                            if fallback_id is not None:
+                                token_ids.append(fallback_id)
+
+        return token_ids
+
+    def decode_bytes(self, token_ids: List[int]) -> bytes:
+        """Decodifica IDs de token pros bytes UTF-8 crus, SEM decodificar pra
+        str ainda -- usado pelo streaming (IncrementalUTF8Decoder) pra não
+        cortar caracteres multi-byte no meio."""
+        pieces = []
+        for tid in token_ids:
+            if tid == self.eos_token_id:
+                break
+            piece = self.inv_vocab.get(tid)
+            if piece is None:
+                continue
+            if piece in self.special_tokens:
+                continue
+            pieces.append(piece)
+
+        text = "".join(pieces)
+        return bytes(self._byte_decoder.get(ch, ord("?") & 0xFF) for ch in text)
+
+    def decode(self, token_ids: List[int]) -> str:
+        """Decodifica IDs de token de volta para texto UTF-8."""
+        return self.decode_bytes(token_ids).decode("utf-8", errors="replace")
+
+    DEFAULT_SYSTEM_PROMPT = (
+        "You are a helpful assistant. Always reply in the same language the "
+        "user's message is written in (e.g. reply in Portuguese to a "
+        "Portuguese message, in Spanish to a Spanish message) -- never "
+        "switch to English unless the user wrote in English."
+    )
+
+    def apply_chat_template(self, user_message, system: str = None, enable_thinking: bool = False) -> str:
+        """Renderiza o Jinja2 real embutido em `tokenizer.chat_template` do
+        GGUF. Diferença real em relação a Granite/Qwen3.5: o template do
+        Llama 3.1 referencia `{{- bos_token }}` como variável (confirmado
+        lendo o template real do GGUF), então precisa ser passada
+        explicitamente no render -- sem isso, o Jinja2 renderiza a variável
+        indefinida como string vazia (comportamento padrão do
+        `Undefined`, não um erro), e `<|begin_of_text|>` simplesmente não
+        apareceria no prompt.
+
+        `enable_thinking` é aceito só por paridade de assinatura com os
+        outros tokenizers (o template do Llama 3.1 não referencia essa
+        variável -- Jinja2 ignora silenciosamente uma variável de contexto
+        não usada)."""
+        if not self._chat_template_src:
+            raise RuntimeError(
+                "Chat template do Llama não carregado do GGUF (tokenizer.chat_template ausente)."
+            )
+
+        messages = _coerce_chat_messages(user_message, system, self.DEFAULT_SYSTEM_PROMPT)
+        messages = _strip_literal_special_tokens(messages, self.special_tokens)
+
+        bos_token_str = self.inv_vocab.get(self.bos_token_id, "<|begin_of_text|>")
+
+        env = Environment(trim_blocks=True, lstrip_blocks=True)
+        env.filters["tojson"] = json.dumps
+        template = env.from_string(self._chat_template_src)
+        return template.render(
+            messages=messages,
+            add_generation_prompt=True,
+            tools=None,
+            bos_token=bos_token_str,
+        )
+
+    @property
+    def stop_token_ids(self) -> set:
+        """Tokens que encerram a geração. `tokenizer.ggml.eos_token_id` real
+        do GGUF já é <|eot_id|> (fim de turno), mas <|end_of_text|> e
+        <|eom_id|> (fim de mensagem em modo ferramenta/ipython) também
+        encerram a geração na prática -- mesmo padrão defensivo usado em
+        QwenTokenizer/Qwen3_5Tokenizer."""
+        ids = {self.eos_token_id}
+        for name in ("<|end_of_text|>", "<|eom_id|>"):
+            tid = self.special_tokens.get(name)
+            if tid is not None:
+                ids.add(tid)
+        return {i for i in ids if i is not None}

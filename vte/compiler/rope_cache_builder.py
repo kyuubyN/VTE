@@ -19,11 +19,25 @@ class RoPECacheBuilder:
         self,
         max_seq_len: int = 2048,
         head_dim: int = 128,
-        rope_theta: float = 10000.0
+        rope_theta: float = 10000.0,
+        freq_scaling: "np.ndarray | None" = None
     ):
         self.max_seq_len = max_seq_len
         self.head_dim = head_dim
         self.rope_theta = rope_theta
+        # Fatores de escala NTK-by-parts do Llama 3.1 (tensor `rope_freqs.weight`
+        # do GGUF, shape [head_dim//2]): llama.cpp já vem com esses valores
+        # pré-computados no arquivo (1.0 nas dimensões de alta frequência/onda
+        # curta, subindo suavemente até `factor` -- 8.0 no Llama 3.1 8B -- nas
+        # de baixa frequência/onda longa), em vez de expor os hiperparâmetros
+        # crus (factor/low_freq_factor/high_freq_factor/original_context_length)
+        # como chaves de metadado. Aplicado como DIVISOR da frequência base,
+        # mesma convenção do `ggml_rope_ext`/`freq_factors` do llama.cpp
+        # (confirmado lendo o tensor real do GGUF: valores crescem de 1.0 a
+        # 8.0 ao longo das 64 dimensões, batendo com o factor=8 documentado
+        # do Llama 3.1). None (padrão) preserva o RoPE θ puro de antes --
+        # Qwen2.5/Granite/Qwen3.5 não têm esse tensor, comportamento intocado.
+        self.freq_scaling = freq_scaling
     
     def build_cache(self) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -43,7 +57,15 @@ class RoPECacheBuilder:
         freqs = 1.0 / (
             self.rope_theta ** (np.arange(0, freq_dim, dtype=np.float32) / freq_dim)
         )
-        
+
+        if self.freq_scaling is not None:
+            if len(self.freq_scaling) != freq_dim:
+                raise ValueError(
+                    f"freq_scaling tem {len(self.freq_scaling)} elementos, "
+                    f"esperado {freq_dim} (head_dim//2)."
+                )
+            freqs = freqs / self.freq_scaling.astype(np.float32)
+
         # Posições: 0, 1, 2, ..., max_seq_len-1
         positions = np.arange(self.max_seq_len, dtype=np.float32)
         

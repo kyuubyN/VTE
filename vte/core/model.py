@@ -65,6 +65,7 @@ class VTEModel:
         # relativo certo, e o whitelist de nome no sanitizer usa Path.name
         # (só o basename), então a subpasta não interfere na validação.
         "qwen2.5:0.5b-q4_k_m-draft": "Classifier/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
+        "llama3.1:8b-instruct-q4_k_m": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
     }
 
     # Modelos cujo tokenizer emite <think>/</think> como texto literal (ver
@@ -369,6 +370,59 @@ class VTEModel:
         )
         return metadata
 
+    def _load_llama_metadata(self, sanitizer) -> dict:
+        """Mesma ideia de `_load_qwen2_metadata`: lê os hiperparâmetros reais
+        do namespace 'llama.*' do GGUF em vez de assumir defaults do Qwen.
+        Confirmados contra Model/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf via
+        gguf.GGUFReader real: hidden=4096, heads=32, kv_heads=8, head_dim=128
+        (lido de rope.dimension_count -- Llama, ao contrário do Qwen2.5,
+        armazena isso separado em vez de hidden/n_heads), ffn=14336,
+        rope_theta=500000.0, eps=1e-5.
+
+        `rope_type=1` (NORM/intercalado), IGUAL ao Granite e DIFERENTE do
+        Qwen2.5: llama.cpp usa LLAMA_ROPE_TYPE_NORM para LLM_ARCH_LLAMA (o
+        mesmo case do Granite em llama-model.cpp::llama_model_rope_type),
+        não LLAMA_ROPE_TYPE_NEOX. O convert_hf_to_gguf.py permuta as linhas
+        de attn_q/attn_k do Llama justamente para casar com essa rotação
+        intercalada de pares adjacentes -- aplicar o split-half (rope_type=0,
+        do Qwen) sobre pesos permutados para intercalado embaralha a
+        informação posicional e produz geração incoerente/em loop (bug real
+        encontrado nesta sessão: o default 0 herdado por engano do caminho
+        do Qwen era a causa; Granite, que já setava rope_type=1, sempre
+        funcionou). NÃO vem do GGUF -- é propriedade fixa da arquitetura."""
+        from ..compiler.gguf_metadata import read_gguf_metadata
+        raw = read_gguf_metadata(self._path, wanted_keys={
+            "llama.embedding_length", "llama.block_count", "llama.context_length",
+            "llama.attention.head_count", "llama.attention.head_count_kv",
+            "llama.rope.dimension_count", "llama.feed_forward_length",
+            "llama.rope.freq_base", "llama.attention.layer_norm_rms_epsilon",
+        })
+
+        embedding_length = raw.get("llama.embedding_length", sanitizer.header.embedding_length)
+        head_count = raw.get("llama.attention.head_count", 32)
+        head_dim = raw.get("llama.rope.dimension_count", embedding_length // head_count)
+
+        metadata = {
+            "embedding_length": embedding_length,
+            "block_count": raw.get("llama.block_count", sanitizer.header.block_count),
+            "context_length": raw.get("llama.context_length", sanitizer.header.context_length),
+            "attention.head_count": head_count,
+            "attention.head_count_kv": raw.get("llama.attention.head_count_kv", 8),
+            "attention.key_length": head_dim,
+            "feed_forward_length": raw.get("llama.feed_forward_length", 14336),
+            "rope.freq_base": raw.get("llama.rope.freq_base", 500000.0),
+            "attention.layer_norm_rms_epsilon": raw.get("llama.attention.layer_norm_rms_epsilon", 1e-5),
+            # NORM/intercalado (ver docstring) -- NÃO o default 0 do Qwen.
+            "rope_type": 1,
+        }
+        logger.info(
+            f"Hiperparâmetros GGUF (Llama 3.1): hidden={embedding_length}, heads={head_count}, "
+            f"kv_heads={metadata['attention.head_count_kv']}, head_dim={head_dim}, "
+            f"ffn={metadata['feed_forward_length']}, rope_theta={metadata['rope.freq_base']}, "
+            f"eps={metadata['attention.layer_norm_rms_epsilon']:.2e}"
+        )
+        return metadata
+
     def _load(self):
         sanitizer = GGUFSanitizer(Path(self._path))
         sanitizer.validate()
@@ -382,6 +436,8 @@ class VTEModel:
             metadata = self._load_granite_metadata(sanitizer)
         elif architecture == "qwen35":
             metadata = self._load_qwen3_5_metadata(sanitizer)
+        elif architecture == "llama":
+            metadata = self._load_llama_metadata(sanitizer)
         else:
             metadata = self._load_qwen2_metadata(sanitizer)
         self.metadata = metadata
@@ -448,6 +504,11 @@ class VTEModel:
             elif architecture == "qwen35":
                 from vte.compiler.qwen3_5_mapper import Qwen3_5TensorMapper
                 mapper = Qwen3_5TensorMapper(self.parser, metadata)
+            elif architecture == "llama":
+                # Estrutura de camada idêntica ao Qwen2.5 (RMSNorm->QKV->RoPE->
+                # GQA->O-proj->SwiGLU) -- reaproveita QwenTensorMapper sem
+                # subclasse, só troca o rótulo usado na mensagem de OOM.
+                mapper = QwenTensorMapper(self.parser, metadata, model_label="Llama 3.1 8B")
             else:
                 mapper = QwenTensorMapper(self.parser, metadata)
             self._mapper = mapper  # Fase II (prep): reaproveitado por generate_batch()
@@ -517,6 +578,9 @@ class VTEModel:
         elif architecture == "qwen35":
             from vte.compiler.tokenizer import Qwen3_5Tokenizer
             self.tokenizer = Qwen3_5Tokenizer(gguf_path=self._path)
+        elif architecture == "llama":
+            from vte.compiler.tokenizer import LlamaTokenizer
+            self.tokenizer = LlamaTokenizer(gguf_path=self._path)
         else:
             self.tokenizer = QwenTokenizer(gguf_path=self._path)
         self.sampler = Sampler()

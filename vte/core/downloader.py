@@ -30,6 +30,7 @@ CURATED_CHECKPOINTS: dict[str, str] = {
     "qwen2.5:0.5b-q4_k_m-draft": "Qwen/Qwen2.5-0.5B-Instruct-GGUF:qwen2.5-0.5b-instruct-q4_k_m.gguf",
     "granite-4.1:3b-q8_0": "unsloth/granite-4.1-3b-GGUF:granite-4.1-3b-Q8_0.gguf",
     "qwen3.5:2b-q6_k": "unsloth/Qwen3.5-2B-GGUF:Qwen3.5-2B-Q6_K.gguf",
+    "llama3.1:8b-instruct-q4_k_m": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
 }
 
 # Nome de arquivo local (relativo a Model/) para cada nome curado -- réplica
@@ -42,6 +43,7 @@ _CURATED_LOCAL_NAMES: dict[str, str] = {
     "qwen2.5:0.5b-q4_k_m-draft": "Classifier/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
     "granite-4.1:3b-q8_0": "granite-4.1-3b-Q8_0.gguf",
     "qwen3.5:2b-q6_k": "Qwen3.5-2B-Q6_K.gguf",
+    "llama3.1:8b-instruct-q4_k_m": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
 }
 
 
