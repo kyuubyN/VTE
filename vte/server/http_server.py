@@ -203,14 +203,17 @@ def _run_generation(gen, out_queue: "queue.Queue", stop_event: threading.Event, 
         lock.release()
 
 
-def _openai_chunk(request_id: str, model_name: str, delta: dict, finish_reason=None) -> dict:
-    return {
+def _openai_chunk(request_id: str, model_name: str, delta: dict, finish_reason=None, usage=None) -> dict:
+    chunk = {
         "id": request_id,
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model_name,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
     }
+    if usage is not None:
+        chunk["usage"] = usage
+    return chunk
 
 
 def _extract_prompt(body: dict):
@@ -302,6 +305,8 @@ async def chat_completions(request: Request):
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens,
+                "prefill_duration_ttft": gen_stats.get("prefill_duration_ttft", 0.0),
+                "decoding_speed_tps": gen_stats.get("decoding_speed_tps", 0.0),
             },
         })
 
@@ -341,7 +346,17 @@ async def chat_completions(request: Request):
                     break
                 elif kind == "done":
                     finish_reason = (payload or {}).get("finish_reason", "stop")
-                    yield f"data: {json.dumps(_openai_chunk(request_id, model_name, {}, finish_reason=finish_reason))}\n\n"
+                    # FastFlowLM-convention timing fields (see generate()'s
+                    # stats["prefill_duration_ttft"/"decoding_speed_tps"]), sent
+                    # unconditionally on the finish chunk -- Lemonade's telemetry
+                    # (StreamingProxy::extract_telemetry_from_chunk) reads them from
+                    # any chunk's `usage`, not only the opt-in usage-only one below,
+                    # and Lemonade's own VTE requests don't set stream_options.
+                    timing_usage = {
+                        "prefill_duration_ttft": (payload or {}).get("prefill_duration_ttft", 0.0),
+                        "decoding_speed_tps": (payload or {}).get("decoding_speed_tps", 0.0),
+                    }
+                    yield f"data: {json.dumps(_openai_chunk(request_id, model_name, {}, finish_reason=finish_reason, usage=timing_usage))}\n\n"
                     # Chunk final de usage (convenção OpenAI stream_options.
                     # include_usage): choices vazio + objeto usage, logo antes
                     # do [DONE]. `payload` aqui é o dict stats de _run_generation.
@@ -358,6 +373,7 @@ async def chat_completions(request: Request):
                                 "prompt_tokens": prompt_tokens,
                                 "completion_tokens": completion_tokens,
                                 "total_tokens": prompt_tokens + completion_tokens,
+                                **timing_usage,
                             },
                         }
                         yield f"data: {json.dumps(usage_chunk)}\n\n"
@@ -415,6 +431,8 @@ async def completions(request: Request):
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            "prefill_duration_ttft": gen_stats.get("prefill_duration_ttft", 0.0),
+            "decoding_speed_tps": gen_stats.get("decoding_speed_tps", 0.0),
         },
     })
 

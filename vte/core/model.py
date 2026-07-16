@@ -863,12 +863,19 @@ class VTEModel:
         (len(input_tokens) - prompt_len, exato -- vem da contabilidade interna,
         não de uma re-tokenização aproximada do texto) e `finish_reason`
         ("stop" se um stop token foi amostrado, "length" se parou por
-        context_length/max_tokens -- convenção OpenAI). Usado pelo vte-server
-        pra preencher os campos `usage`/`finish_reason` da resposta OpenAI. Não
-        é preenchido se a geração for cancelada no meio (gen.close()), já que
-        o caller nesse caso descarta a resposta."""
+        context_length/max_tokens -- convenção OpenAI). Também recebe
+        `prefill_duration_ttft` (segundos, tokenização+prefill até o primeiro
+        logit) e `decoding_speed_tps` (tokens/s do loop de decode, excluindo
+        prefill), nomeados como a convenção usage.{prefill_duration_ttft,
+        decoding_speed_tps} do FastFlowLM que a telemetria do Lemonade já
+        sabe ler. Usado pelo vte-server pra preencher os campos
+        `usage`/`finish_reason` da resposta OpenAI. Não é preenchido se a
+        geração for cancelada no meio (gen.close()), já que o caller nesse
+        caso descarta a resposta."""
         self._lifecycle.ensure_loaded()
         self._lifecycle.touch()
+
+        t_start = time.perf_counter()
 
         if temperature is None:
             temperature = self._default_temperature()
@@ -940,6 +947,7 @@ class VTEModel:
             return np.frombuffer(logits_buffer, dtype=np.float16).astype(np.float32)
 
         logits = _read_logits()
+        t_prefill_end = time.perf_counter()
 
         stop_ids = self.tokenizer.stop_token_ids
         # Um token BPE byte-level pode carregar só METADE dos bytes de um
@@ -1007,8 +1015,18 @@ class VTEModel:
             yield tail
 
         if stats is not None:
-            stats["completion_tokens"] = len(input_tokens) - prompt_len
+            completion_tokens = len(input_tokens) - prompt_len
+            stats["completion_tokens"] = completion_tokens
             stats["finish_reason"] = finish_reason
+            # Named to match FastFlowLM's usage.{prefill_duration_ttft,decoding_speed_tps}
+            # convention, which Lemonade's telemetry (StreamingProxy::extract_telemetry_
+            # from_chunk) already parses -- reusing it means Lemonade picks these up with
+            # no adapter-side change needed.
+            stats["prefill_duration_ttft"] = t_prefill_end - t_start
+            decode_duration = time.perf_counter() - t_prefill_end
+            stats["decoding_speed_tps"] = (
+                completion_tokens / decode_duration if decode_duration > 0 and completion_tokens > 0 else 0.0
+            )
 
     def generate_batch(
         self,

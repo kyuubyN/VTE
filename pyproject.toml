@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vte"
-version = "0.3.4"
+version = "0.3.5"
 description = "VTE (Vector & Tensor Engine) - Motor de inferência AMD-native para Windows"
 readme = "README.md"
 license = {text = "Apache-2.0"}
