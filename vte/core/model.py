@@ -861,10 +861,12 @@ class VTEModel:
         `stats` (opcional): se um dict for passado, ao fim da geração normal
         recebe `completion_tokens` = número de tokens REALMENTE gerados
         (len(input_tokens) - prompt_len, exato -- vem da contabilidade interna,
-        não de uma re-tokenização aproximada do texto). Usado pelo vte-server
-        pra preencher o campo `usage` da resposta OpenAI. Não é preenchido se
-        a geração for cancelada no meio (gen.close()), já que o caller nesse
-        caso descarta a resposta."""
+        não de uma re-tokenização aproximada do texto) e `finish_reason`
+        ("stop" se um stop token foi amostrado, "length" se parou por
+        context_length/max_tokens -- convenção OpenAI). Usado pelo vte-server
+        pra preencher os campos `usage`/`finish_reason` da resposta OpenAI. Não
+        é preenchido se a geração for cancelada no meio (gen.close()), já que
+        o caller nesse caso descarta a resposta."""
         self._lifecycle.ensure_loaded()
         self._lifecycle.touch()
 
@@ -947,6 +949,11 @@ class VTEModel:
         # incompletos entre chamadas de feed() até a sequência completar.
         utf8_decoder = IncrementalUTF8Decoder()
         prompt_len = len(input_tokens)
+        # OpenAI's finish_reason: "length" is the default (covers both the
+        # context-length break below and natural max_tokens exhaustion, neither
+        # of which is a real stop condition), overwritten to "stop" only when
+        # a stop token is actually sampled.
+        finish_reason = "length"
 
         for i in range(max_tokens):
             next_token = self.sampler.sample(
@@ -965,6 +972,7 @@ class VTEModel:
             # retorna "" para esses tokens, mas o loop precisa PARAR, não só
             # emitir vazio.
             if next_token in stop_ids:
+                finish_reason = "stop"
                 break
 
             input_tokens.append(next_token)
@@ -1000,6 +1008,7 @@ class VTEModel:
 
         if stats is not None:
             stats["completion_tokens"] = len(input_tokens) - prompt_len
+            stats["finish_reason"] = finish_reason
 
     def generate_batch(
         self,

@@ -261,6 +261,8 @@ async def chat_completions(request: Request):
     top_k = body.get("top_k", 50)
     repetition_penalty = body.get("repetition_penalty", body.get("repeat_penalty"))
     stream = bool(body.get("stream", False))
+    # OpenAI default: the usage-only trailing chunk is opt-in, not automatic.
+    include_usage = bool((body.get("stream_options") or {}).get("include_usage", False))
     request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     model_name = body.get("model", "vte")
 
@@ -294,7 +296,7 @@ async def chat_completions(request: Request):
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
+                "finish_reason": gen_stats.get("finish_reason", "stop"),
             }],
             "usage": {
                 "prompt_tokens": prompt_tokens,
@@ -338,24 +340,27 @@ async def chat_completions(request: Request):
                     yield f"data: {json.dumps({'error': {'message': payload, 'type': 'server_error'}})}\n\n"
                     break
                 elif kind == "done":
-                    yield f"data: {json.dumps(_openai_chunk(request_id, model_name, {}, finish_reason='stop'))}\n\n"
+                    finish_reason = (payload or {}).get("finish_reason", "stop")
+                    yield f"data: {json.dumps(_openai_chunk(request_id, model_name, {}, finish_reason=finish_reason))}\n\n"
                     # Chunk final de usage (convenção OpenAI stream_options.
                     # include_usage): choices vazio + objeto usage, logo antes
                     # do [DONE]. `payload` aqui é o dict stats de _run_generation.
-                    completion_tokens = (payload or {}).get("completion_tokens", 0)
-                    usage_chunk = {
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": model_name,
-                        "choices": [],
-                        "usage": {
-                            "prompt_tokens": prompt_tokens,
-                            "completion_tokens": completion_tokens,
-                            "total_tokens": prompt_tokens + completion_tokens,
-                        },
-                    }
-                    yield f"data: {json.dumps(usage_chunk)}\n\n"
+                    # Só emitido se o cliente pediu (default OpenAI é NÃO incluir).
+                    if include_usage:
+                        completion_tokens = (payload or {}).get("completion_tokens", 0)
+                        usage_chunk = {
+                            "id": request_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model_name,
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": prompt_tokens + completion_tokens,
+                            },
+                        }
+                        yield f"data: {json.dumps(usage_chunk)}\n\n"
                     yield "data: [DONE]\n\n"
                     break
         finally:
@@ -405,7 +410,7 @@ async def completions(request: Request):
         "object": "text_completion",
         "created": int(time.time()),
         "model": body.get("model", "vte"),
-        "choices": [{"index": 0, "text": text, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "text": text, "finish_reason": gen_stats.get("finish_reason", "stop")}],
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
