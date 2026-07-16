@@ -185,6 +185,12 @@ class HIPRuntime:
         # REAL da GPU antes de qualquer kernel ser dimensionado.
         self._num_cus: int = 32
         self._stream: ctypes.c_void_p = ctypes.c_void_p(0)
+        # Índice do device HIP selecionado em initialize() (default 0 até lá).
+        # Numa máquina com mais de uma GPU AMD visível (ex.: dGPU RDNA3 +
+        # iGPU), NÃO é seguro assumir que o device 0 do driver é a discreta --
+        # a ordem de enumeração do HIP não é garantida pelo runtime. Ver
+        # _select_device_index().
+        self._device_index: int = 0
         self.watchdog = None
         self.gpu_utilization_guard = None
         self._counted_as_live = False
@@ -228,6 +234,8 @@ class HIPRuntime:
         if not self._lib: return
         self._lib.hipInit.argtypes = [ctypes.c_uint]
         self._lib.hipInit.restype = ctypes.c_int
+        self._lib.hipGetDeviceCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        self._lib.hipGetDeviceCount.restype = ctypes.c_int
         self._lib.hipSetDevice.argtypes = [ctypes.c_int]
         self._lib.hipSetDevice.restype = ctypes.c_int
         self._lib.hipGetDeviceProperties.argtypes = [ctypes.POINTER(hipDeviceProp_t), ctypes.c_int]
@@ -318,6 +326,68 @@ class HIPRuntime:
         if err != 0:
             raise HIPRuntimeError(f"Erro HIP: {context} retornou código {err}")
 
+    def _select_device_index(self) -> int:
+        """Escolhe QUAL device HIP usar quando o sistema tem mais de uma GPU
+        AMD visível (ex.: dGPU RDNA3 + iGPU no mesmo chassi/notebook).
+
+        hipSetDevice(0) fixo era inseguro nesse cenário: a ordem de
+        enumeração do driver HIP não é garantida colocar a discreta no índice
+        0, e VTE hoje só suporta arquiteturas discretas RDNA2/RDNA3 (ver
+        GPU_ARCH_MAP em vte/config.py -- nenhuma entrada de iGPU existe lá).
+        Reaproveita esse MESMO mapa (não gcnArchName, que a struct
+        hipDeviceProp_t hand-mantida aqui nem expõe -- ver o comentário sobre
+        multi_processor_count logo abaixo por que essa struct já mordeu a
+        gente antes) para inspecionar cada device pelo nome comercial e
+        escolher o primeiro que bate com uma arquitetura que VTE realmente
+        sabe rodar. Isso automaticamente pula qualquer iGPU (nenhum nome de
+        APU está em GPU_ARCH_MAP), sem precisar que o host (Lemonade) passe
+        nenhum índice explícito.
+
+        Só um device, ou nenhum bate no mapa: cai pro índice 0 (comportamento
+        de antes, preservado -- é o caso comum de máquina com uma GPU só).
+        VTE_DEVICE_INDEX força um índice específico, escape hatch pra quem
+        sabe exatamente qual quer (ex.: dois discretos RDNA3 na mesma
+        máquina, caso que a heurística de nome sozinha não desambigua)."""
+        override = os.environ.get('VTE_DEVICE_INDEX')
+        if override is not None:
+            logger.info(f"VTE_DEVICE_INDEX={override} (override manual, sem auto-detecção).")
+            return int(override)
+
+        count = ctypes.c_int(0)
+        err = self._lib.hipGetDeviceCount(ctypes.byref(count))
+        if err != 0 or count.value <= 1:
+            return 0
+
+        candidates = []
+        for i in range(count.value):
+            try:
+                name = self.get_device_properties(i)["name"]
+            except Exception as e:
+                logger.warning(f"Não foi possível ler propriedades do device {i}: {e}")
+                continue
+            name_lower = name.lower()
+            matched_arch = next((arch for pattern, arch in GPU_ARCH_MAP.items() if pattern in name_lower), None)
+            candidates.append((i, name, matched_arch))
+
+        supported = [(i, name) for i, name, arch in candidates if arch is not None]
+        if supported:
+            chosen_index, chosen_name = supported[0]
+            if len(supported) > 1:
+                logger.warning(
+                    f"Múltiplas GPUs AMD suportadas detectadas ({[n for _, n in supported]}); "
+                    f"usando a primeira ({chosen_name}, device {chosen_index}). Defina "
+                    f"VTE_DEVICE_INDEX para escolher outra explicitamente."
+                )
+            else:
+                logger.info(f"GPU selecionada: {chosen_name} (device {chosen_index}) entre {count.value} devices HIP visíveis.")
+            return chosen_index
+
+        logger.warning(
+            f"Nenhum dos {count.value} devices HIP visíveis bate com uma arquitetura "
+            f"conhecida ({[n for _, n, _ in candidates]}); usando device 0 como fallback."
+        )
+        return 0
+
     def initialize(self) -> bool:
         """Inicializa runtime HIP e detecta GPU."""
         try:
@@ -329,14 +399,16 @@ class HIPRuntime:
         if err != 0:
             logger.error(f"hipInit falhou com código {err}")
             return False
-            
-        err = self._lib.hipSetDevice(0)
+
+        self._device_index = self._select_device_index()
+
+        err = self._lib.hipSetDevice(self._device_index)
         if err != 0:
-            logger.error(f"hipSetDevice(0) falhou com código {err}")
+            logger.error(f"hipSetDevice({self._device_index}) falhou com código {err}")
             return False
-            
+
         try:
-            props = self.get_device_properties(0)
+            props = self.get_device_properties(self._device_index)
             self._vram_total = props["total_global_mem"]
             # Número real de Compute Units da GPU (lido uma vez aqui, não
             # re-consultado em hot path) -- usado para dimensionar grids
@@ -360,7 +432,7 @@ class HIPRuntime:
             # Processors), não de CUs -- RDNA agrupa 2 CUs por WGP. Medido
             # na RX 7600 (32 CUs reais, RDNA3/gfx1102): a API retornou 16,
             # exatamente a metade -- por isso o *2 abaixo.
-            self._num_cus = self._get_multiprocessor_count_raw(0) * 2
+            self._num_cus = self._get_multiprocessor_count_raw(self._device_index) * 2
             arch = self.get_gpu_architecture()
 
             err = self._lib.hipStreamCreate(ctypes.byref(self._stream))
@@ -430,11 +502,12 @@ class HIPRuntime:
         return self._num_cus
 
     def get_gpu_architecture(self) -> str:
-        """Detecta arquitetura da GPU dinamicamente."""
+        """Detecta arquitetura da GPU ativa (self._device_index, selecionado
+        em initialize() -- ver _select_device_index()) dinamicamente."""
         if not self._lib:
             raise HIPRuntimeError("HIPRuntime não inicializado (lib missing)")
-            
-        props = self.get_device_properties(0)
+
+        props = self.get_device_properties(self._device_index)
         gpu_name = props["name"].lower()
         
         for pattern, arch in GPU_ARCH_MAP.items():
@@ -714,7 +787,7 @@ class HIPRuntime:
         if total_grid > MAX_GRID_DIMENSIONS:
             raise HIPSafetyError(f"Grid Bomb bloqueada! O total de blocos solicitados ({total_grid}) excede o limite arquitetural de {MAX_GRID_DIMENSIONS}.")
             
-        props = self.get_device_properties(0)
+        props = self.get_device_properties(self._device_index)
         total_block = block[0] * block[1] * block[2]
         if total_block > props["max_threads_per_block"]:
             raise HIPSafetyError(f"Block size ({total_block}) excede o limite max_threads_per_block ({props['max_threads_per_block']}).")

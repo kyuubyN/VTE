@@ -125,3 +125,68 @@ def test_device_validation():
     is_valid, msg = props.validate_for_vte()
     assert is_valid is False
     assert "VRAM insuficiente" in msg
+
+
+def _mock_hip_with_devices(names, monkeypatch):
+    """HIPRuntime com hipGetDeviceCount/hipGetDeviceProperties mockados para
+    simular `len(names)` devices HIP visíveis, na ordem dada. Usado por
+    test_select_device_index_* -- não há iGPU+dGPU físicas nesta máquina de
+    teste (só a RX 7600 discreta), então a lógica de desambiguação de
+    múltiplos devices só pode ser verificada com mocks."""
+    from unittest.mock import MagicMock
+
+    monkeypatch.delenv("VTE_DEVICE_INDEX", raising=False)
+    hip = HIPRuntime.__new__(HIPRuntime)
+    hip._lib = MagicMock()
+
+    def fake_count(ptr):
+        ptr._obj.value = len(names)
+        return 0
+
+    def fake_props(props_ptr, device_id):
+        props_ptr._obj.name = names[device_id].encode("utf-8")
+        props_ptr._obj.totalGlobalMem = 0
+        props_ptr._obj.sharedMemPerBlock = 0
+        props_ptr._obj.maxThreadsPerBlock = 0
+        props_ptr._obj.warpSize = 0
+        props_ptr._obj.multiProcessorCount = 0
+        props_ptr._obj.major = 0
+        props_ptr._obj.minor = 0
+        return 0
+
+    hip._lib.hipGetDeviceCount.side_effect = fake_count
+    hip._lib.hipGetDeviceProperties.side_effect = fake_props
+    return hip
+
+
+def test_select_device_index_skips_igpu_when_dgpu_is_second(monkeypatch):
+    hip = _mock_hip_with_devices(
+        ["AMD Radeon(TM) 780M Graphics", "AMD Radeon RX 7600"], monkeypatch
+    )
+    assert hip._select_device_index() == 1
+
+
+def test_select_device_index_picks_dgpu_when_dgpu_is_first(monkeypatch):
+    hip = _mock_hip_with_devices(
+        ["AMD Radeon RX 7900 XTX", "AMD Radeon(TM) 890M Graphics"], monkeypatch
+    )
+    assert hip._select_device_index() == 0
+
+
+def test_select_device_index_falls_back_when_nothing_matches(monkeypatch, caplog):
+    hip = _mock_hip_with_devices(
+        ["AMD Radeon(TM) 780M Graphics", "AMD Radeon(TM) 890M Graphics"], monkeypatch
+    )
+    assert hip._select_device_index() == 0
+    assert "Nenhum" in caplog.text
+
+
+def test_select_device_index_respects_explicit_override(monkeypatch):
+    hip = _mock_hip_with_devices(["AMD Radeon RX 7600", "AMD Radeon RX 7900 XTX"], monkeypatch)
+    monkeypatch.setenv("VTE_DEVICE_INDEX", "1")
+    assert hip._select_device_index() == 1
+
+
+def test_select_device_index_skips_enumeration_for_single_device(monkeypatch):
+    hip = _mock_hip_with_devices(["AMD Radeon RX 7600"], monkeypatch)
+    assert hip._select_device_index() == 0
