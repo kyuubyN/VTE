@@ -2,7 +2,7 @@ import pytest
 import ctypes
 from vte.bridge.hip_runtime import HIPRuntime
 from vte.config import MAX_ALLOCATION_SIZE
-from vte.bridge.errors import HIPSafetyError
+from vte.bridge.errors import HIPSafetyError, HIPRuntimeError
 
 @pytest.fixture
 def mock_hip():
@@ -136,6 +136,7 @@ def _mock_hip_with_devices(names, monkeypatch):
     from unittest.mock import MagicMock
 
     monkeypatch.delenv("VTE_DEVICE_INDEX", raising=False)
+    monkeypatch.delenv("VTE_TARGET_ARCH_FAMILY", raising=False)
     hip = HIPRuntime.__new__(HIPRuntime)
     hip._lib = MagicMock()
 
@@ -189,4 +190,32 @@ def test_select_device_index_respects_explicit_override(monkeypatch):
 
 def test_select_device_index_skips_enumeration_for_single_device(monkeypatch):
     hip = _mock_hip_with_devices(["AMD Radeon RX 7600"], monkeypatch)
+    assert hip._select_device_index() == 0
+
+
+def test_select_device_index_target_family_picks_matching_generation(monkeypatch):
+    hip = _mock_hip_with_devices(["AMD Radeon RX 6800 XT", "AMD Radeon RX 7600"], monkeypatch)
+    monkeypatch.setenv("VTE_TARGET_ARCH_FAMILY", "gfx110X")
+    assert hip._select_device_index() == 1
+
+
+def test_select_device_index_target_family_rejects_mismatched_generation(monkeypatch):
+    hip = _mock_hip_with_devices(["AMD Radeon RX 6800 XT"], monkeypatch)
+    monkeypatch.setenv("VTE_TARGET_ARCH_FAMILY", "gfx110X")
+    with pytest.raises(HIPRuntimeError):
+        hip._select_device_index()
+
+
+def test_select_device_index_target_family_rejects_when_only_other_generation_present(monkeypatch):
+    hip = _mock_hip_with_devices(["AMD Radeon RX 6800 XT", "AMD Radeon RX 6900 XT"], monkeypatch)
+    monkeypatch.setenv("VTE_TARGET_ARCH_FAMILY", "gfx110X")
+    with pytest.raises(HIPRuntimeError):
+        hip._select_device_index()
+
+
+def test_select_device_index_without_target_family_ignores_generation(monkeypatch):
+    """Without VTE_TARGET_ARCH_FAMILY, enumeration order wins regardless of
+    generation -- this is exactly the gap the env var closes: RDNA2 first in
+    enumeration order gets picked even though an RDNA3 card is also present."""
+    hip = _mock_hip_with_devices(["AMD Radeon RX 6800 XT", "AMD Radeon RX 7600"], monkeypatch)
     assert hip._select_device_index() == 0

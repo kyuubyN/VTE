@@ -347,15 +347,33 @@ class HIPRuntime:
         de antes, preservado -- é o caso comum de máquina com uma GPU só).
         VTE_DEVICE_INDEX força um índice específico, escape hatch pra quem
         sabe exatamente qual quer (ex.: dois discretos RDNA3 na mesma
-        máquina, caso que a heurística de nome sozinha não desambigua)."""
+        máquina, caso que a heurística de nome sozinha não desambigua).
+
+        VTE_TARGET_ARCH_FAMILY (ex.: "gfx110X", o que o adapter VTE da
+        Lemonade sempre define hoje) restringe a escolha a uma geração RDNA
+        específica: sem isso, um sistema com uma RDNA2 E uma RDNA3 discretas
+        podia escolher a RDNA2 silenciosamente (primeira na ordem de
+        enumeração do HIP), mesmo numa integração que só valida gfx110X. Com
+        a env var definida e nenhum device dessa família encontrado, falha
+        alto e claro em vez de cair pra uma geração não validada."""
         override = os.environ.get('VTE_DEVICE_INDEX')
         if override is not None:
             logger.info(f"VTE_DEVICE_INDEX={override} (override manual, sem auto-detecção).")
             return int(override)
 
+        target_family = os.environ.get('VTE_TARGET_ARCH_FAMILY')
+
         count = ctypes.c_int(0)
         err = self._lib.hipGetDeviceCount(ctypes.byref(count))
         if err != 0 or count.value <= 1:
+            if count.value == 1 and target_family is not None:
+                name = self.get_device_properties(0)["name"]
+                matched_arch = next((arch for pattern, arch in GPU_ARCH_MAP.items() if pattern in name.lower()), None)
+                if matched_arch is None or not matched_arch.startswith(target_family[:-1]):
+                    raise HIPRuntimeError(
+                        f"VTE_TARGET_ARCH_FAMILY={target_family}, mas o único device HIP visível "
+                        f"('{name}', arch {matched_arch or 'desconhecida'}) não pertence a essa família."
+                    )
             return 0
 
         candidates = []
@@ -369,12 +387,22 @@ class HIPRuntime:
             matched_arch = next((arch for pattern, arch in GPU_ARCH_MAP.items() if pattern in name_lower), None)
             candidates.append((i, name, matched_arch))
 
-        supported = [(i, name) for i, name, arch in candidates if arch is not None]
+        supported = [(i, name, arch) for i, name, arch in candidates if arch is not None]
+        if target_family is not None:
+            family_prefix = target_family[:-1]  # "gfx110X" -> "gfx110"
+            supported = [(i, name, arch) for i, name, arch in supported if arch.startswith(family_prefix)]
+            if not supported:
+                raise HIPRuntimeError(
+                    f"VTE_TARGET_ARCH_FAMILY={target_family}, mas nenhum dos {count.value} devices "
+                    f"HIP visíveis pertence a essa família "
+                    f"({[(n, a) for _, n, a in candidates]}). Recusando escolher uma geração não validada."
+                )
+
         if supported:
-            chosen_index, chosen_name = supported[0]
+            chosen_index, chosen_name, _ = supported[0]
             if len(supported) > 1:
                 logger.warning(
-                    f"Múltiplas GPUs AMD suportadas detectadas ({[n for _, n in supported]}); "
+                    f"Múltiplas GPUs AMD suportadas detectadas ({[n for _, n, _ in supported]}); "
                     f"usando a primeira ({chosen_name}, device {chosen_index}). Defina "
                     f"VTE_DEVICE_INDEX para escolher outra explicitamente."
                 )
