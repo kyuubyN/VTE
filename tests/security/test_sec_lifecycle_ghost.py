@@ -1,14 +1,78 @@
+import os
+import sys
+import socket
+import urllib.request
 import pytest
 import time
 import subprocess
 from vte.core.gpu_monitor import GPUMonitor
 from vte.bridge.hip_runtime import HIPRuntime
 
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@pytest.mark.skipif(
+    os.environ.get("VTE_RUN_INTEGRATION_TESTS") != "1",
+    reason="Requer GPU AMD, modelo baixado e spawn de subprocessos",
+)
 def test_zombie_kernel_detection():
-    """Valida que kernels nao ficam orfaos apos crash do processo."""
-    # Esse teste depende de subprocessos. Para evitar travar ambientes de CI reais, 
-    # rodariamos num container ou skipamos se nao estiver no ambiente apropriado.
-    pytest.skip("Ignorado por padrao fora do ambiente Docker isolado.")
+    """Valida que o vte-server encerra (liberando VRAM) quando o processo pai
+    designado desaparece, sem deixar kernels/alocacoes orfaos -- exercita o
+    watchdog de parent-pid (http_server._start_parent_watchdog)."""
+    model_path = "Model/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf"
+    if not os.path.exists(model_path):
+        pytest.skip(f"Modelo nao encontrado: {model_path}")
+
+    parent = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+    port = _free_port()
+    server = subprocess.Popen([
+        sys.executable, "-m", "vte.server.http_server",
+        "--gguf-path", model_path, "--port", str(port), "--host", "127.0.0.1",
+        "--context-length", "512", "--idle-timeout", "0", "--vram-limit-pct", "0",
+        "--parent-pid", str(parent.pid),
+    ])
+    try:
+        ready = False
+        for _ in range(120):
+            if server.poll() is not None:
+                break
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as r:
+                    if r.status == 200:
+                        ready = True
+                        break
+            except Exception:
+                pass
+            time.sleep(1)
+        assert ready, "vte-server nao ficou ready antes de matar o pai"
+        assert server.poll() is None, "vte-server morreu antes de matarmos o pai"
+
+        parent.kill()
+        parent.wait(timeout=10)
+
+        # Watchdog faz poll a cada 5s; espera esse intervalo + margem.
+        exited = False
+        for _ in range(20):
+            if server.poll() is not None:
+                exited = True
+                break
+            time.sleep(1)
+        assert exited, (
+            "vte-server nao encerrou apos o pai sumir: watchdog de orfao falhou, "
+            "os kernels/VRAM ficariam orfaos"
+        )
+    finally:
+        for p in (server, parent):
+            if p.poll() is None:
+                p.kill()
+                try:
+                    p.wait(timeout=10)
+                except Exception:
+                    pass
 
 def test_power_consumption_idle():
     """Valida que GPU nao consome energia quando ociosa e nao possui threads zumbis."""
