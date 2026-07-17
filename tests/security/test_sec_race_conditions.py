@@ -8,6 +8,9 @@ def test_lifecycle_race_condition_stress():
     class MockVTEModel:
         def __init__(self):
             self.loaded = False
+            self._hip = None
+            self._allocator = None
+            self._graph = None
         def reload(self):
             self.loaded = True
         def _load(self):
