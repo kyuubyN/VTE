@@ -112,6 +112,7 @@ The full write-up is split by topic: each page is self-contained and links back 
 | [**Known limitations**](docs/LIMITATIONS.md) | What's genuinely unfinished or unresolved right now |
 | [**Getting started**](docs/USAGE.md) | Full Python API examples and desktop-UI setup details |
 | [**Integrating with Lemonade**](docs/LEMONADE.md) | `vte-server`'s API surface and safety fallbacks, `vte pull`, the Lemonade-side recipe, the `recipe_options.ctx_size` gotcha, and the release process |
+| [**ROCm / RDNA3 architecture reference**](docs/ROCm/README.md) | Original notes on WGP/CU/SIMD, LDS/GDS, the memory hierarchy, wave32/64, and the HIP programming model, distilled from AMD's official documentation |
 | [**Security policy**](SECURITY.md) | Threat model and defense mechanisms (untrusted GGUF input, VRAM sandboxing, watchdogs) |
 
 ---
