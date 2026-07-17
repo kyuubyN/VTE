@@ -105,9 +105,17 @@ class CodegenEngine:
         """Prepara variáveis de ambiente para o hipcc funcionar no Windows com MSVC."""
         import glob
         env = os.environ.copy()
-        
-        rocm_bin = r"C:\Program Files\AMD\ROCm\6.4\bin"
-        if rocm_bin not in env.get("PATH", ""):
+
+        rocm_bin = None
+        hip_root = env.get("HIP_PATH") or env.get("ROCM_PATH")
+        if hip_root and (Path(hip_root) / "bin" / "hipcc.exe").exists():
+            rocm_bin = str(Path(hip_root) / "bin")
+        else:
+            default_roots = sorted(glob.glob(r"C:\Program Files\AMD\ROCm\*\bin"), reverse=True)
+            if default_roots:
+                rocm_bin = default_roots[0]
+
+        if rocm_bin and rocm_bin not in env.get("PATH", ""):
             env["PATH"] = rocm_bin + os.pathsep + env.get("PATH", "")
         
         vs_roots = glob.glob(r"C:\Program Files (x86)\Microsoft Visual Studio\*\BuildTools\VC\Tools\MSVC\*\include")
