@@ -12,6 +12,8 @@ On this page:
 - [Portability: dynamic Compute-Unit detection](#portability-dynamic-compute-unit-detection-rdna2rdna3-not-just-the-rx-7600)
 - [Optimizations tried and rejected](#optimizations-tried-and-rejected)
 - [Investigation: pushing past ~100 tok/s (2026-07)](#investigation-pushing-past-100-toks-2026-07): speculative decoding feasibility, RDNA3 kernel micro-architecture audit, tooling gaps
+- [Thesis V6: achieved-bandwidth-driven `gemv_q4k` optimization (2026-07)](#thesis-v6-achieved-bandwidth-driven-gemv_q4k-optimization-2026-07): the header-coalescing kernel rewrite that followed the V5 investigation above, a same-process A/B methodology bug caught along the way, and the real end-to-end tok/s gain measured on all three Q4_K models
+- [Follow-up: GPU duty-cycle investigation (2026-07)](#follow-up-gpu-duty-cycle-investigation-2026-07): a live Task Manager observation after V6, two plausible hypotheses killed by measurement, and the real (smaller) per-token overhead found outside the kernel itself — sampling and LM-head logits readback
 
 ## Single-sequence decode (batch=1)
 
@@ -189,3 +191,91 @@ A structured pass through several falsifiable hypotheses about why the GEMV/atte
 ### Conclusion
 
 Across `gemv_q4k` (55.9% of GPU time) and the FlashAttention family (23.6%) — 79.5% combined — every kernel checked shows zero VGPR/SGPR spill, zero scratch memory, maximum compiler-reported occupancy, and already-vectorized memory access. Every hypothesis generated this round (Split-K occupancy fix, LDS double-buffering, per-launch occupancy sensitivity, ILP prefetch depth, X-read vectorization) was checked against real evidence — assembly output, dispatcher code, or measured per-launch timing — rather than assumed, and each came back either factually wrong about the active code path or already handled by the compiler. That convergence is itself the finding: these kernels are close to what `hipcc`'s backend can extract for this access pattern on this hardware, using tools available on this machine. Closing the remaining gap to the ~130 tok/s GPU-only ceiling (let alone the ~250 tok/s theoretical bandwidth ceiling) most likely requires hardware-counter data (achieved vs. theoretical memory bandwidth, real cache hit rates, true wavefront stall reasons) that RGP would provide and this machine's driver stack can't — see "Tooling" above — or a genuinely different architectural approach, not further micro-tuning of the current kernels.
+
+## Thesis V6: achieved-bandwidth-driven `gemv_q4k` optimization (2026-07)
+
+V5 above left one thing unmeasured: the *achieved* memory bandwidth of `gemv_q4k` in isolation, as opposed to its compiler-reported resource usage (which was already clean). A kernel can have zero register spill and maximum occupancy and still leave bandwidth on the table through access-pattern effects invisible to `-Rpass-analysis` — this round measured that directly with a standalone HIP-events microbenchmark (`tools/bench_gemv_q4k_bandwidth.py`), rather than inferring it from end-to-end tok/s (which conflates the GEMV with attention, sampler, and dispatch overhead).
+
+### Phase A: the achieved-bandwidth gate
+
+Isolated `gemv_q4k` against a same-topology read-bandwidth baseline kernel (coalesced `uint4` reads, no dequant, no MAC) on the FFN-down shape (`in_features=8960 × out_features=1536`, Qwen2.5-1.5B's largest single Q4_K GEMV). Getting a trustworthy number took four failed methodologies in a row before landing on one (documented in the tool's own module docstring): sync-per-launch was dominated by CPU dispatch overhead; no-sync batch timing let the GPU pipeline/overlap launches and defeated the cold-buffer pool; per-launch GPU-only event timing (`VTE_PROFILE=1`) fixed the signal-to-noise problem but still showed real clock/thermal drift across runs with a short warm-up. The fix: a 300-launch warm-up before each timed section, 5 independent trials per run, reporting median/min/max.
+
+**Result: `gemv_q4k` achieved a median 76.5% of the baseline's bandwidth** (range 71.5–85.9% across 5 trials) — inside the plan's pre-registered 55–85% "real headroom exists" band, not the ≥85% "already saturated" band. Root cause identified by reading the kernel against the RDNA3 memory-hierarchy notes in [`RDNA3-ARCHITECTURE.md`](ROCm/RDNA3-ARCHITECTURE.md#memory-hierarchy): each superblock's 16-byte header (`d`/`dmin`/`scales`) was read independently by all 8 threads sharing that superblock — 8x redundant small scattered loads, alongside the already-coalesced 128-bit weight-chunk loads.
+
+### Phase B1: header coalescing via `__shfl`
+
+Rewrote `gemv_q4k.hip.template` so only the thread at `chunk==0` in each 8-thread `sbgroup` issues the single aligned 16-byte header load (`uint4`), broadcasting `d`/`dmin`/`scales` to its 7 peers via `__shfl` (register-to-register, no extra memory traffic) — valid because a 8-thread `sbgroup` never crosses a wave32 boundary (`sbgroup*8` is always a multiple of 8, and 8 divides 32).
+
+**Bug found and fixed along the way**: the first working version compiled with `ScratchSize: 32 bytes/lane` despite zero VGPR/SGPR spill — a real register-spill regression the header-coalescing rewrite introduced. Root cause: dynamically indexing (`s[sub0]`, with a runtime `sub0 = 2*mblk`) into a *local* byte array to extract scale/min bytes forces scratch-memory allocation, because dynamic indexing into register-resident local data has no hardware support (unlike the same pattern against *global* memory, which the original kernel already did safely). Fixed with a pure-ALU helper (`q4k_header_sbyte()`, ternary SELECT + variable shift over separate scalar words instead of array indexing) that brought `ScratchSize` back to 0. This is a useful general lesson for future RDNA3 kernel work here: local/register-resident aggregates must be indexed statically or via ALU select, never dynamically like a global-memory pointer.
+
+Numeric correctness: validated against `dequantizer.py::dequantize_q4_k` (the correct reference for this kernel — `math_refs.py::ref_dequantize_q4_k_m` has an unrelated `-8.0` nibble offset used by a *different* kernel, `matmul.hip.template`, and does not apply here). Output was bit-identical to the original kernel's on a real random-weight validation run.
+
+### The same-process methodology trap (a second lesson this round)
+
+Comparing Phase A's cross-process runs naively (76.5% before B1, separately re-run at 82.8% after) looked like a solid ~6-point win. It wasn't trustworthy: the *unchanged* baseline kernel's own measured bandwidth drifted >5% between the two separate `python` process launches (210→196 GB/s), meaning some — possibly most — of the apparent ratio improvement was GPU clock/thermal state varying between process launches, not the code change. Caught by comparing `gemv_q4k`'s own *absolute* GB/s across the two runs (it went slightly *down*, 160.9→156.4, while the ratio went up) — a result that shouldn't happen if the kernel change were a real, clean win.
+
+Fixed with a same-process, interleaved A/B tool (`tools/bench_gemv_q4k_ab_compare.py`): both kernel versions loaded and compiled once, benchmarked back-to-back within one process, alternating which one runs first each trial so neither is systematically favored by warm-up state. First pass (5 trials) was still noisy (median +1.3% per-trial, one trial negative). Extended to 15 trials for a clean signal: **mean +4.41% / median +3.8% per-trial gain, stdev 3.65%, 14 of 15 trials favored B1** (only one trial slightly negative, -2.1%) — a real, directionally consistent effect, more modest than the naive cross-process comparison implied but not noise.
+
+### End-to-end verification
+
+Per the plan's own gate (`gemv_q4k` is shared by every Q4_K model, so a change here must be validated beyond one model): full `pytest` green (77 passed, 3 skipped, unchanged from baseline), then real decode-only tok/s (`VTEModel.generate()`'s own `stats['decoding_speed_tps']` accounting, excludes prefill) measured on all three Q4_K models, `temperature=0`, median of 3 runs of 300 tokens each, same essay prompt used elsewhere on this page, before (original kernel, via `git stash`) and after (B1):
+
+| Model | Before (original) | After (B1) | Gain |
+|---|---|---|---|
+| Qwen2.5 1.5B (Q4_K_M) | 108.24 tok/s | 112.92 tok/s | +4.3% |
+| Qwen2.5 7B (Q4_K_M) | 37.15 tok/s | 40.36 tok/s | +8.6% |
+| Llama 3.1 8B (Q4_K_M) | 35.83 tok/s | 38.52 tok/s | +7.5% |
+
+All three generations remained coherent (no NaN/garbage output). The gain is larger on the 7B/8B models than on 1.5B — consistent with `gemv_q4k` making up a larger share of total GPU time on bigger models (more/larger FFN GEMVs per layer relative to the fixed per-token dispatch/attention overhead).
+
+**Verdict: kept.** B1 passes the plan's own gate (measurably faster, numerically correct) on real, verified evidence rather than the initially-misleading cross-process ratio. The gain is modest, not transformative — this remains well short of the ~130 tok/s GPU-only ceiling discussed in V5 — but it is real, reproducible, and positive on every model tested, with no regression anywhere.
+
+## Follow-up: GPU duty-cycle investigation (2026-07)
+
+After V6 shipped, live observation of Windows Task Manager during real generation suggested Qwen2.5 1.5B's GPU usage dropped to ~70% after the B1 change (from ~90% before), while Qwen2.5 7B and Llama 3.1 8B stayed pinned near ~90% throughout. Rather than building a theory on a visual reading, this was measured with tool-independent HIP events (`hipEventRecord`/`hipEventElapsedTime` bracketing the real production decode-graph replay, `HIPGraphExecutor.execute_decode`), since Task Manager's default "GPU" graph is usually the 3D engine rather than the Compute engine HIP kernels actually run on, and its sampling is coarser than a per-token measurement.
+
+### Real GPU duty cycle (GPU-busy-ms / wall-clock-ms, `tools/bench_dispatch_vs_gpu_duty.py`)
+
+| Model | Kernel | Duty cycle | tok/s |
+|---|---|---|---|
+| Qwen2.5 1.5B | original | 87.3% | 105.35 |
+| Qwen2.5 1.5B | B1 | 86.4% | 110.71 |
+| Qwen2.5 7B | original | 96.1% | 37.39 |
+| Qwen2.5 7B | B1 | 95.6% | 40.15 |
+
+The directional shape of the live observation was real (1.5B does run at a visibly lower duty cycle than 7B), but the before/after comparison was not: B1 barely moved either model's duty cycle (within ~1 point, noise-level), not a 90%→70% drop. Two specific hypotheses were then tested and **both rejected by measurement**:
+
+1. **"Bigger kernels end up less optimized" — rejected.** If true, 7B (bigger GEMVs) should show a *lower* duty cycle than 1.5B. The data show the opposite (96% vs 87%).
+2. **"The 95% GPU duty-cycle safety limiter (`HIPRuntime._enforce_duty_cycle_limit`, `_duty_cycle_limit = 0.95`) is capping 7B near that ceiling" — rejected.** 7B's duty cycle sitting suspiciously close to 95% was coincidence, not causation: instrumenting `_throttle_before_dispatch()` (the preventive check before every launch) and `synchronize()` (which also triggers the limiter) directly showed the limiter never actually engaged a sleep for either model (0/213 and 0/163 preventive checks slept; only 1/213 and 1/163 `synchronize()` calls exceeded 1ms, consistent with ordinary OS scheduling noise, not a real throttle event).
+
+### The real cause: a per-token decode-step breakdown (`tools/bench_decode_step_breakdown.py`)
+
+| Bucket | Qwen 1.5B | Qwen 7B |
+|---|---|---|
+| staging buffer memcpys | 0.298 ms/tok (3.7%) | 0.354 ms/tok (1.5%) |
+| `graph_launch()` wall time | 7.464 ms/tok (93.5%) | 23.724 ms/tok (97.6%) |
+| — of which GPU-busy | 6.431 ms/tok (80.6%) | 22.238 ms/tok (91.5%) |
+| `synchronize()` | 0.219 ms/tok (2.7%) | 0.231 ms/tok (0.9%) |
+| **total wall/tok** | **7.98 ms** | **24.31 ms** |
+
+Neither model's non-GPU time is dominated by a single big cost; it's distributed across staging-buffer memcpys, the `hipGraphLaunch` dispatch call itself, and the final device sync — all roughly *similar in absolute milliseconds* between the two models (~1.5–2ms combined), while GPU-busy time scales up ~3.5x from 1.5B to 7B. A near-fixed cost against a growing denominator is exactly what produces a lower duty-cycle *percentage* on the smaller/faster model — plain Amdahl's-law overhead amortization, not a sign of unoptimized kernels.
+
+**Instrumentation self-check**: before trusting that ~1–2ms/tok gap, it was checked against measurement artifact. `bench_decode_step_breakdown.py`'s own HIP-event wrapping (2 extra `hipEventRecord` calls + `hipEventElapsedTime`, none of which exist in production) could itself inflate the measured gap. A leaner check (`tools/bench_lean_decode_step.py`, a single `perf_counter` pair around the *unmodified* `execute_decode()`, zero added HIP calls) measured 7.69 ms/tok for Qwen 1.5B — close to, but about 0.29ms below, the heavier instrumentation's 7.98ms/tok. Conclusion: most of the gap is real production overhead, with a smaller (~0.3ms/tok) slice attributable to the measurement tool itself. This distinction matters before proposing any fix here — it's the same "verify against real state, not the first number you get" discipline used throughout V6's own methodology traps.
+
+### An overhead layer entirely outside the kernel dispatch path (`tools/bench_outer_loop_breakdown.py`)
+
+The lean measurement also surfaced a second, separate gap: production `decoding_speed_tps` (114.03 tok/s → 8.77 ms/tok for Qwen 1.5B) is itself higher than lean `execute_decode()` alone (7.69 ms/tok) — an extra **~1.08 ms/tok spent outside the HIP dispatch path entirely**, in `model.py`'s `generate()` Python loop (sampling, LM-head logits readback, detokenizing). Broken down directly (not guessed):
+
+| Component | ms/tok |
+|---|---|
+| Logits device-to-host memcpy (`tag="logits_d2h"`) | 0.380 |
+| `Sampler.sample()` | 0.272 |
+| `Tokenizer.decode_bytes()` | 0.010 |
+| Keep-alive pulse | 0.007 |
+| *(remainder: Python loop/generator overhead)* | ~0.43 |
+
+The logits memcpy and sampler cost together (~0.65 ms/tok) are notable because they scale with **vocabulary size** (151936 entries for Qwen2.5, read back in full every token), not model parameter count — the same fixed cost on Qwen 1.5B and Qwen2.5 7B alike, again hitting the faster model's smaller per-token budget harder. Read against the sampler's own optimization history above ("Vectorized sampler": top-k/top-p/argsort already restricted to ~50 surviving candidates instead of the full vocabulary) this looks like a real mismatch worth investigating on its own: the *compute* was narrowed to ~50 candidates, but the *readback* still moves the full 151936-entry logits buffer across PCIe every token before that narrowing happens on the CPU side.
+
+### Status
+
+Both hypotheses that motivated this follow-up (unoptimized big kernels, safety-limiter throttling) were killed by direct measurement — a valid, useful outcome, not a dead end. The real, smaller, and previously-uninvestigated opportunity this surfaced is the sampling/LM-head readback path (`_read_logits()` + `Sampler.sample()` in `vte/core/model.py`'s `generate()` loop), not `gemv_q4k` itself. This is a genuinely different subsystem — shared by every model, on every token, and correctness-sensitive — so it's scoped as its own follow-up investigation rather than folded into V6. See the codebase/session history for the next round once it starts.

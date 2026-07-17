@@ -1,7 +1,8 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-// GEMV Q4_K in-kernel — design "No-Sync Direct Unpack" (Etapa C.3).
+// GEMV Q4_K in-kernel — design "No-Sync Direct Unpack" (Etapa C.3), com
+// cabeçalho de superbloco compartilhado via __shfl (Tese V6, Fase B1).
 //
 // Chave de performance: os pesos Q4_K NUNCA tocam a LDS e NÃO há __syncthreads
 // dentro do loop K. Cada lane puxa seu próprio pedaço do super-bloco direto da
@@ -17,6 +18,18 @@
 //   Loop sobre sb_base += 8 até cobrir os n_sb super-blocos da linha.
 //   Reduções: uma única __shfl_down + combinação inter-wavefront no fim.
 //
+// Cabeçalho compartilhado (Fase B1, ver docs/PERFORMANCE.md "Investigation:
+// pushing past ~100 tok/s"): os 8 threads de um mesmo sbgroup (chunk=0..7,
+// tid = sbgroup*8..sbgroup*8+7) processam o MESMO superbloco -- antes, cada
+// um lia independentemente os 16 bytes de cabeçalho (d/dmin/scales),
+// 8 leituras pequenas e redundantes por superbloco. Como sbgroup*8 é sempre
+// múltiplo de 8 e 8 divide 32, esse grupo de 8 threads nunca cruza fronteira
+// de wavefront (wave32) -- só o thread chunk==0 lê o cabeçalho inteiro num
+// único uint4 alinhado, e os outros 7 recebem via __shfl (registrador ->
+// registrador, sem tráfego de memória extra). Medido via
+// tools/bench_gemv_q4k_bandwidth.py: gemv_q4k saturava só ~76.5% da banda
+// alcançável por um kernel de mesma topologia sem esse desperdício.
+//
 // LAYOUT Q4_K (espelha dequantizer.py, validado ~gguf):
 //   [0:2]d(fp16) [2:4]dmin(fp16) [4:16]scales(12) [16:144]qs(128).
 //   4 grupos de 64 (mblk). qs[32*mblk .. +32]: nibble BAIXO -> peso
@@ -25,6 +38,20 @@
 //
 // ABI de 8 args idêntica. block=64. in_features % 256 == 0. Todos os offsets
 // (row*n_sb*144, sb*144, 16, mblk*32, off16) são múltiplos de 16 -> uint4 OK.
+
+// Extrai o byte `n` (0..11) do array de 12 bytes de scales, dado como 3
+// palavras de 32 bits (h1/h2/h3 = bytes[4:8]/[8:12]/[12:16] do cabeçalho).
+// Só SELECT (ternário entre registradores) + shift por quantidade variável
+// -- ambos ALU puro, sem endereçamento -- de propósito: indexar `s[n]` como
+// array local (mesmo com n em registrador) força o compilador a alocar
+// scratch memory pro array, porque acesso dinâmico a memória local (ao
+// contrário de global) não existe em hardware sem endereço real. Medido:
+// trocar de array-indexing pra isto tirou ScratchSize de 32 bytes/lane
+// (spill) para 0.
+__device__ __forceinline__ unsigned int q4k_header_sbyte(unsigned int h1, unsigned int h2, unsigned int h3, int n) {
+    unsigned int w = (n < 4) ? h1 : ((n < 8) ? h2 : h3);
+    return (w >> (8 * (n & 3))) & 0xFFu;
+}
 
 extern "C" __global__ void gemv_q4k_kernel(
     const void* __restrict__ input_ptr,
@@ -61,25 +88,43 @@ extern "C" __global__ void gemv_q4k_kernel(
 
     float acc = 0.0f;
 
+    int header_src_lane = lane & ~7;  // posição (relativa ao wavefront) do chunk==0 deste sbgroup
+
     for (int sb_base = 0; sb_base < n_sb; sb_base += 8) {
         int sb = sb_base + sbgroup;
         if (sb >= n_sb) continue;
 
         const unsigned char* blk = row_q4k + (size_t)sb * 144;
-        float d = __half2float(*reinterpret_cast<const __half*>(blk + 0));
-        float dmin = __half2float(*reinterpret_cast<const __half*>(blk + 2));
-        const unsigned char* s = blk + 4;
+
+        // Um único load de 16 bytes alinhado (chunk==0) em vez de 8 leituras
+        // pequenas redundantes -- os outros 7 threads do sbgroup recebem via
+        // __shfl (ver comentário do cabeçalho do arquivo). Palavras separadas
+        // (h0/h1/h2/h3), não um uint4 struct, e sem tomar endereço de nada
+        // além de h0 (só em offsets ESTÁTICOS 0/2, ver extração de d/dmin
+        // abaixo) -- mantém tudo em registrador, ver q4k_header_sbyte acima.
+        unsigned int h0 = 0, h1 = 0, h2 = 0, h3 = 0;
+        if (chunk == 0) {
+            uint4 hv = *reinterpret_cast<const uint4*>(blk);
+            h0 = hv.x; h1 = hv.y; h2 = hv.z; h3 = hv.w;
+        }
+        h0 = __shfl((int)h0, header_src_lane);
+        h1 = __shfl((int)h1, header_src_lane);
+        h2 = __shfl((int)h2, header_src_lane);
+        h3 = __shfl((int)h3, header_src_lane);
+
+        float d = __half2float(*reinterpret_cast<const __half*>(&h0));
+        float dmin = __half2float(*(reinterpret_cast<const __half*>(&h0) + 1));
 
         // get_scale_min_k4 para os 2 sub-blocos deste mblk (em registrador).
         int sub0 = 2 * mblk, sub1 = 2 * mblk + 1;
         int sc0, mn0, sc1, mn1;
         // sub0 = 2*mblk é sempre < 8; ramo j<4 vs j>=4:
-        if (sub0 < 4) { sc0 = s[sub0] & 63; mn0 = s[sub0 + 4] & 63; }
-        else { sc0 = (s[sub0 + 4] & 0x0F) | ((s[sub0 - 4] >> 6) << 4);
-               mn0 = (s[sub0 + 4] >> 4) | ((s[sub0] >> 6) << 4); }
-        if (sub1 < 4) { sc1 = s[sub1] & 63; mn1 = s[sub1 + 4] & 63; }
-        else { sc1 = (s[sub1 + 4] & 0x0F) | ((s[sub1 - 4] >> 6) << 4);
-               mn1 = (s[sub1 + 4] >> 4) | ((s[sub1] >> 6) << 4); }
+        if (sub0 < 4) { sc0 = q4k_header_sbyte(h1, h2, h3, sub0) & 63; mn0 = q4k_header_sbyte(h1, h2, h3, sub0 + 4) & 63; }
+        else { sc0 = (q4k_header_sbyte(h1, h2, h3, sub0 + 4) & 0x0F) | ((q4k_header_sbyte(h1, h2, h3, sub0 - 4) >> 6) << 4);
+               mn0 = (q4k_header_sbyte(h1, h2, h3, sub0 + 4) >> 4) | ((q4k_header_sbyte(h1, h2, h3, sub0) >> 6) << 4); }
+        if (sub1 < 4) { sc1 = q4k_header_sbyte(h1, h2, h3, sub1) & 63; mn1 = q4k_header_sbyte(h1, h2, h3, sub1 + 4) & 63; }
+        else { sc1 = (q4k_header_sbyte(h1, h2, h3, sub1 + 4) & 0x0F) | ((q4k_header_sbyte(h1, h2, h3, sub1 - 4) >> 6) << 4);
+               mn1 = (q4k_header_sbyte(h1, h2, h3, sub1 + 4) >> 4) | ((q4k_header_sbyte(h1, h2, h3, sub1) >> 6) << 4); }
 
         float d0 = d * (float)sc0, o0 = dmin * (float)mn0;
         float d1 = d * (float)sc1, o1 = dmin * (float)mn1;
