@@ -16,6 +16,7 @@ from ..compiler.qwen_mapper import QwenTensorMapper, ActivationArena
 from ..bridge.memory import MemoryBlock, SlabAllocator, MemoryRegion
 from ..bridge.errors import HIPSafetyError
 from vte.core.vram_profiler import VRAMProfiler
+from vte.bridge.kernel_profiler import PROFILER as _KERNEL_PROFILER
 from ..compiler.gguf_parser import GGUFParser
 from ..compiler.weight_loader import GGUFWeightLoader
 from ..core.lm_head import LMHead
@@ -964,6 +965,7 @@ class VTEModel:
         finish_reason = "length"
 
         for i in range(max_tokens):
+            t_tok_start = time.perf_counter() if _KERNEL_PROFILER.enabled else 0.0
             next_token = self.sampler.sample(
                 logits=logits,
                 temperature=temperature,
@@ -1009,6 +1011,8 @@ class VTEModel:
             # VTE_KEEPALIVE_PULSE_MS para reverter sem deploy de código.
             self._keepalive.pulse(self._keepalive_pulse_s)
             logits = _read_logits()
+            if _KERNEL_PROFILER.enabled:
+                _KERNEL_PROFILER.mark_token((time.perf_counter() - t_tok_start) * 1000.0)
 
         tail = utf8_decoder.flush()
         if tail:
