@@ -220,6 +220,15 @@ class HIPRuntime:
         try:
             self._lib = ctypes.CDLL(path_to_load)
             logger.info(f"amdhip64.dll carregada de {path_to_load}")
+            # A DLL pode estar num SDK instalado fora do PATH global do Windows
+            # (ex.: local customizado do HIP SDK) -- injeta a pasta bin aqui pra
+            # que subprocessos deste processo (hipcc, via codegen.py) a encontrem
+            # mesmo sem configuração manual de ambiente. codegen.py::_setup_hip_env
+            # já faz sua própria busca (HIP_PATH/ROCM_PATH), mas isso não ajuda
+            # chamadas fora daquele caminho específico.
+            bin_dir = str(Path(path_to_load).parent)
+            if bin_dir not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
         except Exception as e:
             raise HIPRuntimeError(f"Falha ao carregar {path_to_load}: {e}")
             
