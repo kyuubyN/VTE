@@ -47,7 +47,7 @@ def test_hip_end_to_end():
         hip.synchronize()
         
         c_bytes = bytearray(size_bytes)
-        hip.safe_memcpy_device_to_host(c_bytes, c_ptr, "d2h_C")
+        hip.safe_memcpy_device_to_host(c_bytes, c_ptr, "output")
         
         c_arr = np.frombuffer(c_bytes, dtype=np.float32)
         
