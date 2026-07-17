@@ -25,10 +25,48 @@
 
 #define FUSED_FFN_MAX_HIDDEN 1536
 
+// ffn_gate.weight/ffn_up.weight ficam CRUS (Q4_K) na VRAM -- ver
+// is_raw_q4k_weight em qwen_mapper.py -- então não podem ser lidos como
+// __half* puro. Mesmo layout de superbloco do gemv_q4k.hip.template (144
+// bytes = [0:2]d [2:4]dmin [4:16]scales [16:144]qs, 4 mblks de 64 pesos),
+// mas em versão escalar (um peso por vez): a fusão já é 1 thread = 1 neurônio
+// com loop serial sobre hidden_size, então não há o paralelismo de 64 lanes
+// por linha que justificaria a versão vetorizada uint4 do gemv_q4k.
+__device__ __forceinline__ float q4k_dequant_at(const unsigned char* row_q4k, int k) {
+    int sb = k >> 8;          // k / 256
+    int within = k & 255;     // k % 256
+    int mblk = within >> 6;   // 0..3
+    int pos = within & 63;    // 0..63
+
+    const unsigned char* blk = row_q4k + (size_t)sb * 144;
+    float d = __half2float(*reinterpret_cast<const __half*>(blk + 0));
+    float dmin = __half2float(*reinterpret_cast<const __half*>(blk + 2));
+    const unsigned char* s = blk + 4;
+    const unsigned char* qs = blk + 16;
+
+    int sub, nibble;
+    if (pos < 32) {
+        sub = 2 * mblk;
+        nibble = qs[32 * mblk + pos] & 0x0F;
+    } else {
+        sub = 2 * mblk + 1;
+        nibble = qs[32 * mblk + (pos - 32)] >> 4;
+    }
+
+    int sc, mn;
+    if (sub < 4) { sc = s[sub] & 63; mn = s[sub + 4] & 63; }
+    else {
+        sc = (s[sub + 4] & 0x0F) | ((s[sub - 4] >> 6) << 4);
+        mn = (s[sub + 4] >> 4) | ((s[sub] >> 6) << 4);
+    }
+
+    return d * (float)sc * (float)nibble - dmin * (float)mn;
+}
+
 extern "C" __global__ void fused_gate_up_silu_kernel(
     const __half* __restrict__ x_norm,        // [batch, hidden_size] — já normalizado (RMSNorm em kernel separado)
-    const __half* __restrict__ gate_weight,   // [intermediate_size, hidden_size]
-    const __half* __restrict__ up_weight,     // [intermediate_size, hidden_size]
+    const void* __restrict__ gate_weight,     // [intermediate_size, hidden_size] Q4_K cru
+    const void* __restrict__ up_weight,       // [intermediate_size, hidden_size] Q4_K cru
     __half* __restrict__ output,              // [batch, intermediate_size] — SiLU(gate) * up
     int hidden_size,
     int intermediate_size
@@ -51,15 +89,18 @@ extern "C" __global__ void fused_gate_up_silu_kernel(
 
     if (n >= intermediate_size) return;
 
-    const __half* gate_row = gate_weight + (size_t)n * hidden_size;
-    const __half* up_row = up_weight + (size_t)n * hidden_size;
+    // Q4_K: 144 bytes por superbloco de 256 pesos (ver q4k_dequant_at acima).
+    // ABI idêntica ao gemv_q4k -- hidden_size % 256 == 0.
+    int n_sb = hidden_size / 256;
+    const unsigned char* gate_row = ((const unsigned char*)gate_weight) + (size_t)n * n_sb * 144;
+    const unsigned char* up_row = ((const unsigned char*)up_weight) + (size_t)n * n_sb * 144;
 
     float gate_sum = 0.0f;
     float up_sum = 0.0f;
     for (int k = 0; k < hidden_size; k++) {
         float xn = __half2float(x_sh[k]);
-        gate_sum += xn * __half2float(gate_row[k]);
-        up_sum += xn * __half2float(up_row[k]);
+        gate_sum += xn * q4k_dequant_at(gate_row, k);
+        up_sum += xn * q4k_dequant_at(up_row, k);
     }
 
     float sigmoid = 1.0f / (1.0f + __expf(-gate_sum));
