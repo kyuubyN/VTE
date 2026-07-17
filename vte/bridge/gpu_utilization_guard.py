@@ -1,16 +1,9 @@
 import os
-import subprocess
 import threading
 import time
 from vte.bridge.logger import get_logger
 
 logger = get_logger(__name__)
-
-_POWERSHELL_CMD_TEMPLATE = (
-    "(Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue)."
-    "CounterSamples | Where-Object {{ $_.Path -like '*pid_{pid}_*' -and $_.CookedValue -gt 0 }} | "
-    "Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum"
-)
 
 
 class GPUUtilizationGuard:
@@ -29,10 +22,12 @@ class GPUUtilizationGuard:
     que se quer aqui: o objetivo é a GPU rodar continuamente regulada a 95%,
     nunca "parar" por ter chegado perto do teto.
 
-    Só funciona no Windows (usa `Get-Counter`/WMI via PowerShell). Em qualquer
-    falha (powershell ausente, contador indisponível, timeout) apenas loga um
-    aviso e continua sem travar a aplicação — é uma ferramenta de
-    observabilidade best-effort, não uma dependência crítica.
+    Só funciona no Windows (usa a API PDH -- Performance Data Helper -- via
+    `win32pdh`, in-process, sem spawnar `powershell.exe` a cada amostra como
+    a versão anterior fazia). Em qualquer falha (win32pdh ausente, contador
+    indisponível) apenas loga um aviso e continua sem travar a aplicação — é
+    uma ferramenta de observabilidade best-effort, não uma dependência
+    crítica.
     """
 
     def __init__(
@@ -53,6 +48,13 @@ class GPUUtilizationGuard:
         self._consecutive_over = 0
         self._last_reading: float | None = None
 
+        self._query_handle = None
+        # instance path (ex.: "GPU Engine(pid_1234_luid_...engtype_3d)") -> counter handle.
+        # GPU Engine instances aparecem/somem dinamicamente conforme o PID
+        # realmente usa cada engine (3d, video codec, copy, ...), então a
+        # lista é resincronizada a cada amostra em vez de fixada uma vez.
+        self._counter_handles: dict = {}
+
     def start(self):
         if self._running:
             return
@@ -65,35 +67,89 @@ class GPUUtilizationGuard:
         self._running = False
         if self._thread:
             self._thread.join(timeout=2.0)
+        if self._query_handle is not None:
+            try:
+                import win32pdh
+                win32pdh.CloseQuery(self._query_handle)
+            except Exception:
+                pass
+            self._query_handle = None
+            self._counter_handles.clear()
         logger.info("GPUUtilizationGuard parado.")
 
     def get_last_reading(self) -> float | None:
         return self._last_reading
 
-    def _query_gpu_utilization(self) -> float | None:
-        cmd = _POWERSHELL_CMD_TEMPLATE.format(pid=self._pid)
+    def _ensure_query_open(self) -> bool:
+        if self._query_handle is not None:
+            return True
         try:
-            # CREATE_NO_WINDOW é ESSENCIAL aqui: este `subprocess.run` roda
-            # em loop contínuo (`_monitor_loop`, a cada `_poll_interval`).
-            # Quando o processo pai é uma app GUI sem console (ex.: o backend
-            # do Aetheris lançado via pythonw.exe), CADA chamada de
-            # powershell abre uma NOVA janela de console visível -- o
-            # sintoma "abre terminais do PowerShell infinitamente" relatado.
-            # Com console anexado (python.exe normal) as janelas não
-            # aparecem, por isso só se manifesta no app empacotado. Mesmo
-            # padrão já usado em hip_runtime.py para o hipcc.
-            creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-                capture_output=True, text=True, timeout=5, creationflags=creationflags,
-            )
-            output = result.stdout.strip()
-            if not output:
+            import win32pdh
+            self._query_handle = win32pdh.OpenQuery()
+            return True
+        except Exception as e:
+            logger.debug(f"GPUUtilizationGuard: win32pdh indisponível ({e}); monitor desativado.")
+            return False
+
+    def _sync_counters(self):
+        """Adiciona contadores para instâncias de GPU Engine deste PID que
+        apareceram desde a última amostra, e remove as que sumiram (ex.: uma
+        engine que parou de ser usada). PDH mantém o estado/baseline de cada
+        contador já existente entre chamadas -- só um contador recém-criado
+        nesta rodada não terá uma leitura válida ainda (resolve sozinho na
+        próxima amostra, já que CollectQueryData precisa de duas coletas com
+        um intervalo real entre elas para um contador de % ter um valor)."""
+        import win32pdh
+
+        pid_marker = f"pid_{self._pid}_"
+        try:
+            paths = win32pdh.ExpandCounterPath(r"\GPU Engine(*)\Utilization Percentage")
+        except Exception as e:
+            logger.debug(f"GPUUtilizationGuard: falha ao expandir contadores de GPU Engine: {e}")
+            return
+
+        matching = {p for p in paths if pid_marker in p}
+
+        for path in list(self._counter_handles):
+            if path not in matching:
+                try:
+                    win32pdh.RemoveCounter(self._counter_handles[path])
+                except Exception:
+                    pass
+                del self._counter_handles[path]
+
+        for path in matching:
+            if path not in self._counter_handles:
+                try:
+                    self._counter_handles[path] = win32pdh.AddCounter(self._query_handle, path)
+                except Exception as e:
+                    logger.debug(f"GPUUtilizationGuard: falha ao adicionar contador '{path}': {e}")
+
+    def _query_gpu_utilization(self) -> float | None:
+        if not self._ensure_query_open():
+            return None
+
+        import win32pdh
+
+        try:
+            self._sync_counters()
+            if not self._counter_handles:
                 return 0.0
-            # PowerShell formata números conforme a cultura do sistema (ex.: pt-BR
-            # usa vírgula decimal: "0,0082"). Normaliza para o formato que
-            # float() do Python entende, independente do locale da máquina.
-            return float(output.replace(",", "."))
+
+            win32pdh.CollectQueryData(self._query_handle)
+
+            total = 0.0
+            for handle in list(self._counter_handles.values()):
+                try:
+                    _, value = win32pdh.GetFormattedCounterValue(handle, win32pdh.PDH_FMT_DOUBLE)
+                    if value and value > 0:
+                        total += value
+                except Exception:
+                    # Contador recém-adicionado ainda sem baseline (primeira
+                    # coleta), ou instância que sumiu entre o sync e a
+                    # coleta -- ambos transitórios, ignora esta amostra dele.
+                    pass
+            return total
         except Exception as e:
             logger.debug(f"GPUUtilizationGuard: falha ao consultar contador de GPU: {e}")
             return None
