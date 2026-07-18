@@ -14,7 +14,6 @@
   <img alt="gpu" src="https://img.shields.io/badge/GPU-AMD%20RDNA2%2F3-ED1C24">
   <img alt="python" src="https://img.shields.io/badge/python-3.10%2B-3776AB">
   <img alt="license" src="https://img.shields.io/badge/license-Apache%202.0-blue">
-  <img alt="vte-vs-ollama" src="https://img.shields.io/badge/vs.%20llama.cpp-88.7%25%20throughput-00A36C">
 </p>
 
 ---
