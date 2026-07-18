@@ -51,6 +51,8 @@ for words in model.generate_batch(prompts, max_tokens=200, temperature=0.7):
     print(words)  # one word per sequence, per generation tick
 ```
 
+`VTE_TOPK_LOGITS_READBACK=1` (env var, off by default): reduces the logits readback to a small GPU-side candidate set for greedy decode (`temperature=0`) only. Bit-identical to the default path, with a small, model-size-dependent tok/s gain. See [Performance](PERFORMANCE.md#gpu-side-top-k-logits-reduction-2026-07).
+
 ## Desktop UI
 
 The UI (chat + live dashboard: tok/s, ms/token, VRAM, model lifecycle, logs; language toggle between Portuguese and English) lives entirely in [vte/ui/app.py](../vte/ui/app.py), a Flet 0.85+ app. Setup and launch are covered in [Quick start](../README.md#quick-start) (`pip install -e .[dev]` then `vte-ui`): the notes below are specifics that only matter once it's running.

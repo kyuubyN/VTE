@@ -615,11 +615,46 @@ class VTEModel:
                                 f"LM Head continuará rodando eager, fora do grafo.")
                 lm_head_capture_info = None
 
+        # Opt-in (padrão desligado): redução de logits na GPU pro caminho
+        # greedy (temperature<=0). Resolvido ANTES do HIPGraphExecutor pelo
+        # MESMO motivo do LM Head acima: o kernel precisa ser gravado DENTRO
+        # do grafo (ver HIPGraphExecutor._capture_topk_reduce), então seus
+        # ponteiros/kernel_fn (endereços fixos) precisam existir antes da
+        # captura. Uma primeira versão rodava isto eager (fora do grafo) e
+        # media uma perda líquida de tok/s -- o despacho de um kernel novo
+        # custava mais que a economia da leitura reduzida (ver
+        # docs/PERFORMANCE.md "Follow-up: GPU duty-cycle investigation").
+        # Só faz sentido com o LM Head também resolvido (usa o mesmo
+        # logits_buffer/vocab_size dele).
+        self._topk_reducer = None
+        topk_capture_info = None
+        if (self._use_hip_graph and lm_head_capture_info is not None
+                and os.environ.get("VTE_TOPK_LOGITS_READBACK", "0") == "1"):
+            try:
+                from vte.compiler.codegen import CodegenEngine
+                from vte.core.topk_logits_reducer import TopKLogitsReducer
+                self._topk_reducer = TopKLogitsReducer(self._hip, self._allocator, CodegenEngine())
+                topk_capture_info = {
+                    'kernel_fn': self._topk_reducer.kernel,
+                    'exclude_ids_ptr': self._topk_reducer.exclude_ids_ptr,
+                    'exclude_count_ptr': self._topk_reducer.exclude_count_ptr,
+                    'values_ptr': self._topk_reducer.values_ptr,
+                    'indices_ptr': self._topk_reducer.indices_ptr,
+                    'gathered_ptr': self._topk_reducer.gathered_ptr,
+                }
+                logger.info("TopKLogitsReducer ativado (VTE_TOPK_LOGITS_READBACK=1): redução de logits "
+                             "capturada dentro do HIP Graph de decode para o caminho greedy.")
+            except Exception as e:
+                logger.warning(f"Falha ao inicializar TopKLogitsReducer (VTE_TOPK_LOGITS_READBACK=1): {e}. "
+                                f"Caminho de leitura de logits completo será usado normalmente.")
+                self._topk_reducer = None
+                topk_capture_info = None
+
         if self._use_hip_graph:
             try:
                 self.executor = HIPGraphExecutor(self._hip, self._allocator, self._graph, self.tensor_mapping,
                                                   metadata=self.metadata, lm_head_info=lm_head_capture_info,
-                                                  context_length=self._context_length)
+                                                  context_length=self._context_length, topk_info=topk_capture_info)
                 self.executor.build_decode_graph()
                 logger.info(f"HIP Graph executor inicializado com sucesso (Nós: {len(self._graph.nodes)})")
             except Exception as e:
@@ -627,6 +662,10 @@ class VTEModel:
                 self.executor = FallbackExecutor(self._hip, self._allocator, self.arena, self._graph, self.tensor_mapping, metadata=self.metadata)
                 self._use_hip_graph = False
                 lm_head_capture_info = None
+                # O grafo não foi capturado (nem o LM Head nem o topk foram
+                # gravados nele) -- a instância existe mas não está ligada a
+                # nada real, usá-la seria incorreto.
+                self._topk_reducer = None
         else:
             logger.info("HIP Graphs desabilitado via flag. Usando FallbackExecutor.")
             self.executor = FallbackExecutor(self._hip, self._allocator, self.arena, self._graph, self.tensor_mapping, metadata=self.metadata)
@@ -917,6 +956,16 @@ class VTEModel:
         # capturado uma única vez e reaproveitado (replay puro), processar o
         # prompt assim continua rápido — sem overhead de lançar 392 kernels
         # em Python por token do prompt.
+        # use_topk decidido ANTES do prefill: quando ativo, o kernel de
+        # redução já roda dentro de TODO replay do grafo (inclusive
+        # prefill, capturado uma vez para toda a vida do modelo -- ver
+        # HIPGraphExecutor._capture_topk_reduce), então o buffer de
+        # exclusão precisa estar num estado válido (vazio, já que nenhum
+        # token foi gerado ainda) antes do PRIMEIRO replay.
+        use_topk = self._topk_reducer is not None and temperature <= 0.0
+        if use_topk:
+            self._topk_reducer.upload_exclude(np.empty(0, dtype=np.int64))
+
         if self._use_hip_graph:
             for pos, tok in enumerate(input_tokens):
                 self.executor.execute_decode(tok, kv_offset=pos)
@@ -933,21 +982,45 @@ class VTEModel:
             self._use_hip_graph and getattr(self.executor, 'lm_head_info', None) is not None
         )
 
+        def _get_logits_ptr():
+            if lm_head_captured_in_graph:
+                return self.lm_head.logits_buffer
+            hidden_ptr = self.tensor_mapping.get('output_norm.output')
+            hidden_val = hidden_ptr.ptr if hasattr(hidden_ptr, 'ptr') else hidden_ptr
+            return self.lm_head.compute_logits(hidden_val, seq_len=1)
+
         def _read_logits():
             logits_buffer = bytearray(self.lm_head.vocab_size * 2)
-            if lm_head_captured_in_graph:
-                logits_ptr = self.lm_head.logits_buffer
-            else:
-                hidden_ptr = self.tensor_mapping.get('output_norm.output')
-                hidden_val = hidden_ptr.ptr if hasattr(hidden_ptr, 'ptr') else hidden_ptr
-                logits_ptr = self.lm_head.compute_logits(hidden_val, seq_len=1)
+            logits_ptr = _get_logits_ptr()
             # O LM head grava logits em FP16 (mesmo tipo do matmul_kernel).
             self._hip.safe_memcpy_device_to_host(
                 logits_buffer, ctypes.c_void_p(logits_ptr), tag="logits_d2h"
             )
             return np.frombuffer(logits_buffer, dtype=np.float16).astype(np.float32)
 
-        logits = _read_logits()
+        # Caminho opcional (VTE_TOPK_LOGITS_READBACK=1, só greedy) que troca
+        # a leitura do vocabulário inteiro (151936 fp16, ~304KB, limitada por
+        # LATÊNCIA de PCIe/driver, não banda -- ver docs/PERFORMANCE.md,
+        # "Follow-up: GPU duty-cycle investigation") por uma redução feita
+        # na própria GPU (topk_reduce_greedy_kernel), lendo de volta só um
+        # punhado de candidatos. Corretude (não é uma aproximação -- ver
+        # Sampler.pick_greedy_from_gpu_candidates e o comentário do kernel):
+        # a penalidade de repetição só DIMINUI logits, nunca aumenta, então
+        # o vencedor pós-penalidade é sempre um token da janela recente
+        # (valor exato via gather) ou o melhor token NÃO-janela de cada
+        # grupo de thread (cujo valor não muda com a penalidade).
+        ignore_token_set = set(self.tokenizer.special_tokens.values())
+        vocab_size = self.lm_head.vocab_size
+        prompt_len = len(input_tokens)
+
+        if use_topk:
+            # O kernel já rodou como parte do ÚLTIMO replay do prefill (com
+            # exclusão vazia, uploadada acima antes do loop de prefill) --
+            # só falta ler de volta os candidatos, nenhum lançamento aqui.
+            unique_ids, counts = np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
+            group_values, group_indices, gathered_values = self._topk_reducer.read_candidates()
+        else:
+            logits = _read_logits()
         t_prefill_end = time.perf_counter()
 
         stop_ids = self.tokenizer.stop_token_ids
@@ -957,7 +1030,6 @@ class VTEModel:
         # vte/core/incremental_decoder.py). O decoder segura bytes
         # incompletos entre chamadas de feed() até a sequência completar.
         utf8_decoder = IncrementalUTF8Decoder()
-        prompt_len = len(input_tokens)
         # OpenAI's finish_reason: "length" is the default (covers both the
         # context-length break below and natural max_tokens exhaustion, neither
         # of which is a real stop condition), overwritten to "stop" only when
@@ -966,15 +1038,20 @@ class VTEModel:
 
         for i in range(max_tokens):
             t_tok_start = time.perf_counter() if _KERNEL_PROFILER.enabled else 0.0
-            next_token = self.sampler.sample(
-                logits=logits,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                repetition_penalty=repetition_penalty,
-                generated_tokens=input_tokens[prompt_len:],
-                ignore_tokens=set(self.tokenizer.special_tokens.values()),
-            )
+            if use_topk:
+                next_token = Sampler.pick_greedy_from_gpu_candidates(
+                    group_values, group_indices, gathered_values, unique_ids, counts, repetition_penalty
+                )
+            else:
+                next_token = self.sampler.sample(
+                    logits=logits,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    generated_tokens=input_tokens[prompt_len:],
+                    ignore_tokens=ignore_token_set,
+                )
 
             # Para no fim de turno (<|im_end|>) ou <|endoftext|>. Sem isto o
             # modelo continua gerando muito além da resposta, divergindo para
@@ -994,6 +1071,17 @@ class VTEModel:
             if current_seq_len >= self._context_length:
                 break
 
+            # Sobe o conteúdo do próximo conjunto de exclusão ANTES do
+            # replay que vai usá-lo -- o kernel topk roda DENTRO do mesmo
+            # replay que recalcula os logits (gravado no grafo logo após o
+            # LM Head), então precisa ver a janela de repetição já
+            # atualizada com o `next_token` recém-anexado a input_tokens.
+            if use_topk:
+                unique_ids, counts = Sampler.compute_repetition_ids(
+                    input_tokens[prompt_len:], vocab_size, ignore_token_set
+                )
+                self._topk_reducer.upload_exclude(unique_ids)
+
             # Processa o token recém-gerado na sua posição para prever o próximo.
             if self._use_hip_graph:
                 self.executor.execute_decode(next_token, kv_offset=current_seq_len - 1)
@@ -1010,7 +1098,13 @@ class VTEModel:
             # gaps reais de 3s entre turnos (ver README). Configurável via
             # VTE_KEEPALIVE_PULSE_MS para reverter sem deploy de código.
             self._keepalive.pulse(self._keepalive_pulse_s)
-            logits = _read_logits()
+            if use_topk:
+                # O replay acima já rodou o kernel topk (dentro do grafo)
+                # com o exclude_ids/count subidos logo acima -- só falta ler
+                # de volta os candidatos.
+                group_values, group_indices, gathered_values = self._topk_reducer.read_candidates()
+            else:
+                logits = _read_logits()
             if _KERNEL_PROFILER.enabled:
                 _KERNEL_PROFILER.mark_token((time.perf_counter() - t_tok_start) * 1000.0)
 

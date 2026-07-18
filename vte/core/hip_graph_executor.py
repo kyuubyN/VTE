@@ -42,7 +42,7 @@ class HIPGraphExecutor:
 
     MAX_CACHED_PREFILL_GRAPHS = 2
 
-    def __init__(self, hip: HIPRuntime, allocator: SlabAllocator, graph: IRGraph, tensor_mapping: dict, metadata: dict = None, lm_head_info: dict = None, context_length: int = None):
+    def __init__(self, hip: HIPRuntime, allocator: SlabAllocator, graph: IRGraph, tensor_mapping: dict, metadata: dict = None, lm_head_info: dict = None, context_length: int = None, topk_info: dict = None):
         self.hip = hip
         self.allocator = allocator
         self.ir_graph = graph
@@ -61,6 +61,16 @@ class HIPGraphExecutor:
         # cada token (eliminava ~3.19ms/tok de overhead de despacho). Só se
         # aplica ao grafo de decode (seq_len sempre 1) -- ver _capture_graph.
         self.lm_head_info = lm_head_info
+
+        # Opt-in (VTE_TOPK_LOGITS_READBACK=1): redução de logits pro caminho
+        # greedy, gravada DENTRO do grafo logo após o LM Head -- mesma
+        # motivação da linha acima (uma versão eager, fora do grafo, media
+        # perda líquida de tok/s: o despacho de um kernel novo custava mais
+        # que a leitura reduzida economizava). Ver TopKLogitsReducer e
+        # _capture_topk_reduce. Só o dict de ponteiros/kernel_fn (endereços
+        # fixos); model.py mantém a instância de TopKLogitsReducer para
+        # upload_exclude()/read_candidates() a cada passo de generate().
+        self.topk_info = topk_info
 
         self.num_layers = self.metadata.get('block_count', 28)
         self.max_seq_len = 4096
@@ -463,6 +473,34 @@ class HIPGraphExecutor:
             shared_mem=0,
         )
 
+    def _capture_topk_reduce(self):
+        """Grava topk_reduce_greedy_kernel DENTRO do grafo de decode, logo
+        após o LM Head -- lê o MESMO logits_buffer que o LM Head acabou de
+        escrever neste replay (endereço fixo, `self.lm_head_info[
+        'logits_buffer_ptr']`), usando os ponteiros de exclusão/saída fixos
+        de TopKLogitsReducer (`self.topk_info`, ver model.py e
+        topk_logits_reducer.py). O CONTEÚDO do array de exclusão é
+        atualizado pelo host (H2D pequeno) ANTES de cada hipGraphLaunch --
+        só o endereço é fixo, exatamente como o kv_cache_offset acima."""
+        info = self.topk_info
+        lm_info = self.lm_head_info
+        args = [
+            ctypes.c_void_p(lm_info['logits_buffer_ptr']),
+            info['exclude_ids_ptr'],
+            info['exclude_count_ptr'],
+            ctypes.c_int(lm_info['vocab_size']),
+            info['values_ptr'],
+            info['indices_ptr'],
+            info['gathered_ptr'],
+        ]
+        self.hip.launch_kernel_recorded(
+            function=info['kernel_fn'],
+            args=args,
+            grid=(1, 1, 1),
+            block=(1024, 1, 1),
+            shared_mem=0,
+        )
+
     def _capture_graph(self, mode: str, seq_len: int) -> ctypes.c_void_p:
         """
         Captura o fluxo de kernels no stream da AMD, sempre a partir do AOT
@@ -672,6 +710,10 @@ class HIPGraphExecutor:
             if mode == 'decode' and self.lm_head_info is not None:
                 self._capture_lm_head()
                 nodes_recorded += 1
+
+                if self.topk_info is not None:
+                    self._capture_topk_reduce()
+                    nodes_recorded += 1
 
             raw_graph = self.hip.stream_end_capture()
             graph_exec = self.hip.graph_instantiate(raw_graph)

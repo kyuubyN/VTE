@@ -67,6 +67,8 @@ Same GGUF files on disk for both engines, same prompt, `temperature=0`, decode-o
 
 The code doing the dispatching here is **Python**, not C++, driving every HIP launch through ctypes, and landing at 84%+ of a mature, years-tuned C++ engine's throughput (beating it on Granite) is the evidence for this project's core bet: dispatch overhead is a solvable engineering problem, not a language tax. The 7B is the largest model registered so far and shows the widest gap, likely more per-token cost shifting into shared GEMV/FFN kernels as the model grows, not yet profiled to confirm. See [Performance](docs/PERFORMANCE.md#benchmark-vte-vs-ollama-llamacpp) for the full write-up.
 
+The three Q4_K rows above predate a later kernel-level fix (Thesis V6, see [Performance](docs/PERFORMANCE.md#thesis-v6-achieved-bandwidth-driven-gemv_q4k-optimization-2026-07)) that measurably improved `gemv_q4k` throughput on all Q4_K models; this table is a matched, same-methodology comparison against Ollama and hasn't been re-run against a fresh Ollama baseline since, so it's kept here as-is rather than mixing in a one-sided update.
+
 ## Quick start
 
 The fastest way to talk to a model is the desktop UI (chat + live GPU telemetry).
@@ -77,7 +79,7 @@ The fastest way to talk to a model is the desktop UI (chat + live GPU telemetry)
 **Requirements**
 - Windows 10/11, 64-bit
 - AMD RDNA3 GPU (RX 7000 series) or RDNA2 GPU (RX 6000 series). RDNA2 support: architecture detection and CU-count kernel scaling are implemented and validated by simulation (see [Limitations](docs/LIMITATIONS.md)); precompiled kernels ship for it too (below), but none of it has been run on real RDNA2 hardware yet
-- [HIP SDK (ROCm 6.4–7.1 tested)](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html): **[MSVC Build Tools](https://visualstudio.microsoft.com/pt-br/downloads/?q=build+tools) only needed for an unrecognized GPU**: precompiled kernels ship with the project for gfx1102 (RX 7600, tested on real hardware), gfx1100/gfx1101 (RX 7900/7600 XT/7700/7800 series), and gfx1030/gfx1031/gfx1032/gfx1034 (RDNA2: RX 6400 through RX 6950 XT) — every architecture except gfx1102 is compiled offline and has never run on real hardware of that generation, see [Limitations](docs/LIMITATIONS.md). Anything VTE doesn't recognize falls back to compiling kernels locally, which does need MSVC Build Tools
+- [HIP SDK (ROCm 6.4–7.1 tested)](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html): **[MSVC Build Tools](https://visualstudio.microsoft.com/pt-br/downloads/?q=build+tools) only needed for an unrecognized GPU**: precompiled kernels ship with the project for gfx1102 (RX 7600, tested on real hardware), gfx1100/gfx1101 (RX 7900/7600 XT/7700/7800 series), and gfx1030/gfx1031/gfx1032/gfx1034 (RDNA2: RX 6400 through RX 6950 XT); every architecture except gfx1102 is compiled offline and has never run on real hardware of that generation, see [Limitations](docs/LIMITATIONS.md). Anything VTE doesn't recognize falls back to compiling kernels locally, which does need MSVC Build Tools
 - Python 3.10+, ~8GB VRAM
 - A `.gguf` model in `Model/`: any GGUF of a supported architecture (Qwen2.5, Granite, Qwen3.5) works, not just the three pre-tested ones below; see [Getting started](docs/USAGE.md#where-models-go)
 
