@@ -2,6 +2,7 @@ import ctypes
 import os
 import ctypes.util
 import subprocess
+import sys
 import time
 import collections
 from pathlib import Path
@@ -208,24 +209,31 @@ class HIPRuntime:
         self._duty_cycle_max_sleep = 0.25
         
         if library_path is None:
-            from .dll_discovery import find_hip_dll
-            library_path = find_hip_dll()
+            from .dll_discovery import find_hip_library
+            library_path = find_hip_library()
             if library_path is None:
+                if sys.platform == "win32":
+                    raise HIPRuntimeError(
+                        "amdhip64.dll não encontrada. Instale o AMD HIP SDK:\n"
+                        "https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html"
+                    )
                 raise HIPRuntimeError(
-                    "amdhip64.dll não encontrada. Instale o AMD HIP SDK:\n"
-                    "https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html"
+                    "libamdhip64.so não encontrada. Instale o ROCm e confirme "
+                    "que ROCM_PATH aponta pro diretório de instalação:\n"
+                    "https://rocm.docs.amd.com/en/latest/"
                 )
-        
+
         path_to_load = library_path
         try:
             self._lib = ctypes.CDLL(path_to_load)
-            logger.info(f"amdhip64.dll carregada de {path_to_load}")
-            # A DLL pode estar num SDK instalado fora do PATH global do Windows
-            # (ex.: local customizado do HIP SDK) -- injeta a pasta bin aqui pra
-            # que subprocessos deste processo (hipcc, via codegen.py) a encontrem
-            # mesmo sem configuração manual de ambiente. codegen.py::_setup_hip_env
-            # já faz sua própria busca (HIP_PATH/ROCM_PATH), mas isso não ajuda
-            # chamadas fora daquele caminho específico.
+            logger.info(f"Biblioteca do HIP runtime carregada de {path_to_load}")
+            # A biblioteca pode estar fora do PATH/LD_LIBRARY_PATH global (ex.:
+            # local customizado do HIP SDK/ROCm), então injeta a pasta aqui pra
+            # que subprocessos deste processo (hipcc, via codegen.py) a
+            # encontrem mesmo sem configuração manual de ambiente.
+            # codegen.py::_setup_hip_env já faz sua própria busca (HIP_PATH/
+            # ROCM_PATH), mas isso não ajuda chamadas fora daquele caminho
+            # específico.
             bin_dir = str(Path(path_to_load).parent)
             if bin_dir not in os.environ.get("PATH", ""):
                 os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")

@@ -51,7 +51,12 @@ def get_kernel_cache_path(cpp_code: str, arch: str) -> str:
 
 class CodegenEngine:
     def __init__(self):
-        self.templates_dir = Path(__file__).parent / "templates"
+        # templates/ é separado por família de arquitetura (rdna/, cdna/):
+        # todo template hoje é RDNA2/RDNA3 (wave32), então isto resolve pra
+        # rdna/ diretamente. cdna/ existe como destino pros kernels wave64
+        # de uma futura investigação em CDNA (MI300X e afins), ainda sem
+        # nenhum template lá.
+        self.templates_dir = Path(__file__).parent / "templates" / "rdna"
         self.logs_dir = Path("logs/Codegen")
         self.cache_dir = Path("cache/kernels")
         # Binários AOT congelados com o projeto (Fase 2, ver
