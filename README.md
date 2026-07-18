@@ -42,7 +42,7 @@ None of that is solvable from outside ROCm's own stack, and VTE doesn't attempt 
 
 The throughput numbers below are the headline result, but the more transferable finding for anyone else targeting consumer RDNA2/3 through HIP on Windows is arguably this: a project that had to build its own safety net under a stack that regularly hangs, crashes, or fails to enumerate hardware for other people on the exact same class of GPU.
 
-As of this writing, single-sequence decode holds a **stable ~100 tok/s on Qwen2.5-1.5B**, and batched decode peaks at **~200 tok/s aggregate** at batch size 4, both climbed from a ~41 tok/s baseline through profiling, not GEMV rewrites. IBM Granite 4.1 3B and Qwen3.5 2B run correctly in VRAM and reach similar throughput ratios vs. llama.cpp/Ollama. Full numbers below.
+As of this writing, single-sequence decode holds a **stable ~113 tok/s on Qwen2.5-1.5B**, and batched decode peaks at **~200 tok/s aggregate** at batch size 4. Both climbed from a ~41 tok/s baseline mostly through profiling and removing overhead, plus one real GEMV kernel rewrite (Thesis V6) that closed part of a measured memory-bandwidth gap. IBM Granite 4.1 3B and Qwen3.5 2B run correctly in VRAM and reach similar throughput ratios vs. llama.cpp/Ollama. Full numbers below.
 
 ## Screenshots
 
@@ -60,14 +60,14 @@ Same GGUF files on disk for both engines, same prompt, `temperature=0`, decode-o
 
 | Model | VTE | Ollama (llama.cpp) | VTE / Ollama |
 |---|---|---|---|
-| Qwen2.5 1.5B (Q4_K_M) | 107.85 tok/s | 110.76 tok/s | 97.4% (tied) |
-| Qwen2.5 7B (Q4_K_M) | 35.89 tok/s | 42.71 tok/s | 84.0% |
+| Qwen2.5 1.5B (Q4_K_M) | **112.98 tok/s** | 110.76 tok/s | **102.0% (VTE faster)** |
+| Qwen2.5 7B (Q4_K_M) | 39.60 tok/s | 42.71 tok/s | 92.7% |
 | Granite 4.1 3B (Q8_0) | **55.65 tok/s** | 50.84 tok/s | **109.5% (VTE faster)** |
 | Qwen3.5 2B (Q6_K) | 69.00 tok/s | 77.00 tok/s | 89.6% |
 
-The code doing the dispatching here is **Python**, not C++, driving every HIP launch through ctypes, and landing at 84%+ of a mature, years-tuned C++ engine's throughput (beating it on Granite) is the evidence for this project's core bet: dispatch overhead is a solvable engineering problem, not a language tax. The 7B is the largest model registered so far and shows the widest gap, likely more per-token cost shifting into shared GEMV/FFN kernels as the model grows, not yet profiled to confirm. See [Performance](docs/PERFORMANCE.md#benchmark-vte-vs-ollama-llamacpp) for the full write-up.
+The code doing the dispatching here is **Python**, not C++, driving every HIP launch through ctypes, and landing at 84%+ of a mature, years-tuned C++ engine's throughput (beating it on two of four models) is the evidence for this project's core bet: dispatch overhead is a solvable engineering problem, not a language tax. The 7B is the largest model registered so far and shows the widest gap, likely more per-token cost shifting into shared GEMV/FFN kernels as the model grows, not yet profiled to confirm. See [Performance](docs/PERFORMANCE.md#benchmark-vte-vs-ollama-llamacpp) for the full write-up.
 
-The three Q4_K rows above predate a later kernel-level fix (Thesis V6, see [Performance](docs/PERFORMANCE.md#thesis-v6-achieved-bandwidth-driven-gemv_q4k-optimization-2026-07)) that measurably improved `gemv_q4k` throughput on all Q4_K models; this table is a matched, same-methodology comparison against Ollama and hasn't been re-run against a fresh Ollama baseline since, so it's kept here as-is rather than mixing in a one-sided update.
+The Qwen2.5 rows reflect a later kernel-level fix (Thesis V6, see [Performance](docs/PERFORMANCE.md#thesis-v6-achieved-bandwidth-driven-gemv_q4k-optimization-2026-07)) that measurably improved `gemv_q4k` throughput: the VTE side was re-measured with the exact same prompt/token-count/`temperature=0` methodology as the rest of this table, but the Ollama numbers are from the earlier run and have not been re-verified since, so the VTE/Ollama ratio for these two rows is not a freshly matched comparison on both sides.
 
 ## Quick start
 
