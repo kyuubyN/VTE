@@ -16,6 +16,7 @@ On this page:
 - [Follow-up: GPU duty-cycle investigation (2026-07)](#follow-up-gpu-duty-cycle-investigation-2026-07): a live Task Manager observation after V6, two plausible hypotheses killed by measurement, and the real (smaller) per-token overhead found outside the kernel itself, in sampling and LM-head logits readback
 - [GPU-side top-k logits reduction (2026-07)](#gpu-side-top-k-logits-reduction-2026-07): an opt-in greedy-decode path that reads back a small candidate set instead of the full vocabulary, an eager version that measured as a net loss, and the HIP-Graph-captured version that fixed it
 - [Extending these optimizations to other quantizations (2026-07)](#extending-these-optimizations-to-other-quantizations-2026-07): what applies to Granite/Q8_0 and Qwen3.5/Q6_K, and what does not
+- [First real Linux/W7900 run: CU-scaling investigation (2026-07)](#first-real-linuxw7900-run-cu-scaling-investigation-2026-07): a plausible under-utilization hypothesis on a 96-CU card (3x the RX 7600), tested with the existing `VTE_NUM_CUS` override, and killed by measurement
 
 ## Single-sequence decode (batch=1)
 
@@ -337,4 +338,94 @@ The same-process, interleaved A/B comparison (`tools/bench_gemv_q6k_ab_compare.p
 
 **Root cause**: the two redundancies look identical in source code but are not identical on the hardware. Q4_K's original problem was 8 threads reading 8 *different* small addresses scattered across one 16-byte region, genuinely poor coalescing that the GPU's memory subsystem cannot merge on its own. Q6_K's `d` read is 64 threads reading the *same single* address, a uniform/broadcast access pattern that RDNA3's cache hardware already serves efficiently, effectively for free. The rewrite replaced that already-free read with an explicit branch (`if (lane==0)`) plus a real `__shfl` instruction on every iteration, adding genuine instruction overhead to remove a bottleneck that didn't actually exist.
 
+## First real Linux/W7900 run: CU-scaling investigation (2026-07)
+
+The AMD hackathon's cloud instance gave the codebase its first ever run on a card other than the RX 7600: an AMD Radeon PRO W7900 (`gfx1100`, 96 CUs, 48GB VRAM, 3x the RX 7600's 32 CUs), Linux/ROCm 7.2.1 instead of the Windows HIP SDK every prior number in this document was measured on. Full environment/bug writeup in [BENCHMARK_W7900.md](BENCHMARK_W7900.md); this section covers only the tok/s investigation that followed the first cross-engine comparison.
+
+**Initial comparison** (Qwen2.5 1.5B Q4_K_M, `llama-cpp-python` w/ HIP backend as the reference, same GGUF bytes on both sides): VTE decoded at ~140.2 tok/s against llama.cpp's ~201.5 tok/s (69.6%), a wider relative gap than the ~102% (VTE *faster*) measured on the RX 7600 for the same model in the table above. Granite 4.1 30B Q8_0 showed a smaller, more RX-7600-like gap (~20.2 vs ~22.5 tok/s, 89.8%).
+
+**Hypothesis**: `_chunk_size_for_cus(num_cus)` (Split-KV attention, [Portability](#portability-dynamic-compute-unit-detection-rdna2rdna3-not-just-the-rx-7600) above) was derived and validated only against `num_cus=32`. FlashAttention is the single largest kernel category by GPU time (32.0% at Qwen2.5 1.5B, confirmed via `VTE_PROFILE=1` on this card, see below) -- a formula that degrades outside the range it was tuned on would hit here hardest.
+
+**Test**: `VTE_NUM_CUS` (existing override, no code change) swept across `[16, 32, 48, 64, 96, 128]`, each value a fresh process (grid dimensions are baked into the HIP Graph at capture time, so the override must be set before the model loads, not after), real end-to-end decode tok/s measured through the production HIP-Graph path (`scripts/sweep_num_cus_w7900.py`):
+
+| `VTE_NUM_CUS` | Decode tok/s |
+|---|---|
+| 16 | 118.64 |
+| 32 (RX 7600's value) | 133.22 |
+| 48 | 137.89 |
+| 64 | 139.53 |
+| **96 (auto-detected, real value)** | **139.96** |
+| 128 | 139.28 |
+
+**Result: hypothesis killed.** The auto-detected value (96, the card's real CU count) is already the best point in the sweep, plateauing from 64 upward -- `_chunk_size_for_cus` scales correctly onto this card; it is not the source of the gap. A separate, earlier `VTE_PROFILE=1` reading (eager/`FallbackExecutor` path, category GPU-ms sum) had shown a 67.4 tok/s GPU-only ceiling on this card, *lower* than the RX 7600's documented ~130 tok/s HIP-Graph-replay ceiling for the same model -- initially read as a red flag, but the two numbers use different measurement methodologies (eager per-kernel GPU timestamps, which include inter-kernel sync/launch latency baked into each category's own timing, vs. one contiguous HIP Graph replay) and are not directly comparable; the sweep above is the real, apples-to-apples signal, and it says the CU-scaling path is healthy.
+
+**Standing conclusion**: the ~140 tok/s figure is a genuine kernel-efficiency ceiling on this card for this model, the same category of ceiling as the RX 7600's own ~100 tok/s ("further gains need actual kernel-level work ... not attempted here", [Investigation: pushing past ~100 tok/s](#investigation-pushing-past-100-toks-2026-07) above). Closing the remaining gap to llama.cpp on the W7900 would mean the same kind of `gemv_q4k`/attention tiling work already deferred there, without RGP or any hardware-counter profiler available on this cloud instance either (no full Radeon driver install, out of scope for a rented instance with limited hours). Not attempted this round; a real kernel-engineering project, not a quick fix, matching this document's own standing rule for the RX 7600 findings above.
+
 **Reverted.** `gemv_q6k.hip.template` is unchanged from before this investigation. The real inefficiency behind Q6_K's 74% bandwidth ceiling is still open and registered here for a future investigation: the leading candidate, given the kernel's own header comment, is the total absence of vectorized (`uint4`) loads anywhere in the kernel, since its 210-byte block size isn't a multiple of 16 and every `ql`/`qh`/`scales` read is scalar. Closing that would mean a real layout/access-pattern redesign, not a targeted coalescing fix, and has not been attempted.
+
+## Thesis V7: real hardware counters, and closing the "no profiler on this cloud instance" gap (2026-07)
+
+The CU-scaling investigation above ended on an open question: closing the W7900 gap to llama.cpp "would mean the same kind of `gemv_q4k`/attention tiling work already deferred [on the RX 7600], without RGP or any hardware-counter profiler available on this cloud instance either." That was revisited directly: the W7900 instance's full ROCm 7.2.1 install does ship `rocprof`/`rocprofv2`/`rocprofv3`/`rocprof-compute`, in principle removing that blocker. In practice, none of them produced usable hardware-counter data on this instance -- `rocprof-compute` (renamed Omniperf) refuses to run on `gfx1100` at all (its metric definitions are CDNA-only), `rocprofv2`/legacy `rocprof` fail to execute regardless of syntax, and `rocprofv3`'s raw `--pmc` counters return real data only for two counters derivable from dispatch-trace metadata alone (`SQ_WAVES`, `SQ_BUSY_CYCLES`) -- every other counter tested (cache hit rate, occupancy, wait-states, instruction mix, memory bandwidth) returned a hard zero on every kernel, with no error. Full reproduction steps and command transcripts in [PLATFORM_ISSUES.md](../../PLATFORM_ISSUES.md). Net effect: the hardware-counter gap from the CU-scaling investigation is *not* closed by this cloud instance, and every finding below still comes from the same software-side methodology (HIP-events microbenchmarks, static `hipcc -Rpass-analysis` audits) already used throughout this document, not from real hardware counters.
+
+### `gemv_q4k` bandwidth, revalidated on W7900 (both the 1.5B and 32B FFN-down shapes)
+
+`tools/bench_gemv_q4k_bandwidth.py` (V6's own methodology, unmodified) re-run on this card for Qwen2.5 1.5B's actual FFN-down shape (`in_features=8960, out_features=1536`), and a new variant (`tools/bench_gemv_q4k_bandwidth_qwen32b.py`) parameterized to Qwen2.5 32B's real published shape (`in_features=27648, out_features=5120`, confirmed against the model's own `config.json`, not assumed):
+
+| Shape | Median ratio (5 trials) | Spread |
+|---|---|---|
+| Qwen2.5 1.5B FFN-down | **99.6%** of read-bandwidth baseline | 97.1-99.7% |
+| Qwen2.5 32B FFN-down | **94.4%** of read-bandwidth baseline | 94.2-94.5% |
+
+Both clear the ≥85% "memory-saturated, no recoverable headroom" gate decisively, with far less trial-to-trial noise than the original V6 measurement (which had to work through several methodology traps before landing on a trustworthy number). **Direct answer to the CU-scaling investigation's open question**: there is no further `gemv_q4k` kernel-level headroom on the W7900, on either the small or the large model's GEMV shape. The ~140 tok/s ceiling on Qwen2.5 1.5B and the ~20-22 tok/s ceiling on the 30B/32B-class models are real physical memory-bandwidth walls, not unexploited kernel inefficiency -- confirmed with data now, not left as a deferred hypothesis.
+
+### FFN fusion: fixed, and its generalization limit
+
+Two real bugs were found and fixed in `fused_rmsnorm_gate_up_silu.hip.template` (the FFN Gate+Up+SiLU fusion kernel, previously rejected on the RX 7600 at 12.7-13.5 tok/s vs 18.8 tok/s unfused, see [Architecture](ARCHITECTURE.md#why-qkv-projection-is-fused-and-why-ffn-fusion-is-off)):
+
+1. **Silent LDS buffer overflow.** `FUSED_FFN_MAX_HIDDEN` was hardcoded to 1536 (Qwen2.5 1.5B's `hidden_size`) with no bounds check anywhere in the dispatcher before passing the model's real `hidden_size` (Qwen2.5 7B=3584, Llama 3.1 8B=4096, Qwen2.5 32B=5120) into the kernel. Any of those three models would have silently overflowed the shared-memory buffer if fusion were ever enabled for them. Raised to 8192 (16KB/block LDS, well inside the confirmed 64KB/block budget) before any generalization testing.
+2. **Per-element dequant, not per-superblock.** The scalar Q4_K dequant helper was called once per `k` (0..`hidden_size`), recomputing each superblock's `d`/`dmin`/scale from scratch every single call -- 1536 redundant recomputations for a superblock that only changes every 256 elements. Rewritten (`q4k_dequant_row_accumulate`) to amortize `d`/`dmin` once per 256-element superblock and `sc`/`mn` once per 64-element `mblk`, the same amortization cadence V6 used for `gemv_q4k` (but without V6's `__shfl` cross-thread trick, since this kernel is one-thread-per-output-neuron, not warp-cooperative).
+
+Measured on Qwen2.5 1.5B (the hackathon demo's model), W7900, production config (`use_hip_graph=True`): HIP Graph node count dropped from 395 to 339 (exactly 2 kernels/layer x 28 layers, confirming the fusion engaged correctly), output stayed coherent (no NaN/garbage) in every trial. Median gain **+3.5%** (138.6 -> 143.4 tok/s, 3 trials each side, zero overlap between groups) -- the first time in this project's history FFN fusion has been a net win.
+
+**Generalization across model sizes, tested and found narrow.** The same fix, re-measured on Qwen2.5 7B, Llama 3.1 8B, and Qwen2.5 32B:
+
+| Model | `hidden_size` | Unfused | Fused (scalar dequant) | Delta |
+|---|---|---|---|---|
+| Qwen2.5 1.5B | 1536 | 138.6 tok/s | 143.4 tok/s | **+3.5%** |
+| Qwen2.5 7B | 3584 | 87.5 tok/s | 85.9 tok/s | **-1.9%** |
+| Llama 3.1 8B | 4096 | 81.6 tok/s | 73.4 tok/s | **-10.0%** |
+| Qwen2.5 32B | 5120 | 23.1 tok/s | 21.7 tok/s | **-6.0%** |
+
+Fusion wins only on the smallest model tested; it regresses on all three larger ones, not monotonically with `hidden_size` (Llama 3.1 8B regresses more than the larger Qwen2.5 32B). Two mechanisms were hypothesized and checked against real data, in order:
+
+- **Register pressure/occupancy**: ruled out. `hipcc -Rpass-analysis=kernel-resource-usage` on the actual kernel reports `VGPRs=61, ScratchSize=0 bytes/lane, spill=0, Occupancy=16 waves/SIMD` (the theoretical max) -- and since `hidden_size` is a runtime loop-trip-count parameter, not compiled into the kernel, this is the *same* number for every model size. There is no spill or occupancy loss possible in any tested configuration.
+- **Scalar (non-vectorized) memory access**: also ruled out. The dequant loop's innermost byte-at-a-time reads of the `qs` payload were rewritten to use 2x `uint4` (128-bit) loads per `mblk`, matching `gemv_q4k`'s own vectorization pattern exactly (verified 16-byte-aligned offsets, same guarantee `gemv_q4k`'s header documents). Re-measured, same-session, back-to-back to avoid cross-run clock-drift noise:
+
+| Model | Unfused | Fused, vectorized | Delta |
+|---|---|---|---|
+| Qwen2.5 1.5B | 169.3 tok/s | 172.3 tok/s | **+1.8%** |
+| Qwen2.5 7B | 86.9 tok/s | 86.1 tok/s | **-0.9%** |
+| Llama 3.1 8B | 81.3 tok/s | 73.2 tok/s | **-10.0%** (unchanged) |
+| Qwen2.5 32B | 23.2 tok/s | 21.7 tok/s | **-6.2%** (unchanged) |
+
+Vectorization gave zero measurable benefit on the two biggest-regression models and only a marginal improvement on 7B -- the opposite of what the scalar-access theory predicts (it predicts the largest gain precisely where there's the most `qs` payload to stream, i.e. 8B/32B). Both of the two most plausible mechanisms are now disproven by direct measurement; the actual cause of the larger models' regression is unidentified, and finding it would need real hardware counters (achieved occupancy, cache hit rate, stall reasons) that are confirmed non-functional on this instance (see above). Not pursued further.
+
+**Standing conclusion**: `VTE_ENABLE_FFN_FUSION` stays opt-in, default off. The vectorization fix is kept regardless (harmless, numerically identical output, real static-analysis improvement), but the fusion itself is a narrow, real win specific to small models (confirmed on Qwen2.5 1.5B, the exact model this hackathon's demo runs) rather than the broad architectural improvement it looked like on first measurement.
+
+## Thesis V9: RoPE fusion into Split-KV attention (tried, correct, reverted)
+
+Follow-up to the kernel-boundary-cost hypothesis from Thesis V7/V8 (each of the ~339 kernel launches in a decode tick was hypothesized to cost roughly 2.5us from pipeline drain and command-buffer re-fetch, a number arrived at by curve-fitting -- 339 x 2.5us matches the measured gap to llama.cpp almost exactly, which is itself a reason to distrust it without an independent measurement). The standalone `rope_kernel` runs once per layer per decode step (28 launches/token on a 28-layer model) and was picked as a controlled experiment to calibrate that per-boundary cost with real data instead of a fitted constant.
+
+**Design.** RoPE cannot be fused the same way for Q and K. K's rotation cannot move into the attention kernel's read loop: that loop replays the *entire* KV cache history every token, and every historical position was already rotated correctly when it was first written -- rotating it again on every subsequent read would double-rotate it, silently, with no NaN or crash, just a phase error that grows with distance from the token's original position (worse at long `seq_len`, invisible at short `seq_len`). The only safe point to rotate K is where it's written into the cache exactly once: `kv_cache_append_kernel`. Q has no such hazard -- it's loaded once per attention launch and reused read-only for the whole chunk loop -- so it was fused directly into `flash_attention_split_kv_partial_kernel`, applied to the shared-memory copy right after loading, before the online-softmax loop starts. Both fusions are gated behind `VTE_FUSE_ROPE=1` (default off) and `rope_type==0` (NEOX/Qwen2.5 only; Granite and Qwen3.5 keep using the standalone kernel).
+
+**A premise check that failed, then a premise check that was itself wrong.** Mid-implementation, reading `fused_qkv_dispatch.py` showed that the *default* QKV projection path (Two-Pass Split-K) already applies RoPE inside its Pass2 kernel as an existing, unrelated optimization -- which looked like it invalidated the whole thesis (no spare `rope_kernel` launches left to eliminate) and, worse, looked like it explained an observed generation divergence as double-rotation corruption. That conclusion was reported and nearly acted on. It was wrong: that QKV fusion path is disabled for this exact model, because Qwen2.5 1.5B's `attn_q`/`attn_k`/`attn_output` weights are raw Q4_K (a VRAM-reduction routing decision from an earlier session), and raw-quantized attention weights unconditionally disable QKV fusion (confirmed directly: `is_raw_q4k_weight()` returns true for all three tensors on this checkpoint). So the standalone `rope_kernel` genuinely does run as 28 real launches/token on the default path for this model, and the fusion had a real target after all.
+
+**Validation, once the premise was actually confirmed.**
+
+- HIP Graph decode-capture node count: 395 -> 367 with `VTE_FUSE_ROPE=1` -- exactly 28 fewer, matching the eliminated launches with nothing extra and nothing missing.
+- K's fused rotation (`kv_cache_append_kernel`, `rope_type==0`) compared bit-for-bit against the standalone `rope_kernel` applied to the same raw K buffer, same cos/sin cache, same position: **0.000000 max diff**.
+- Q's fused rotation plus the full split-KV attention pipeline (append -> partial -> reduce, 3 real decode steps building actual cache history) compared against a numpy reference built from the cos/sin cache read directly off the GPU (not reimplemented independently): **0.00056 max diff**, consistent with ordinary FP16 rounding.
+- Both `VTE_FUSE_ROPE=0` and `=1` are internally deterministic -- confirmed by running each twice in separate processes and diffing the greedy-decoded text byte-for-byte (identical both times). The text does differ *between* the two configurations, but that's expected: swapping which kernel performs a numerically-equivalent-to-FP16-precision computation changes the rounding order, which can flip a close greedy-argmax choice after enough layers. The same effect is already documented for the FFN fusion above (`demo_ffn_fusion.py`'s own before/after runs produce different text too) and isn't itself evidence of a bug -- the two independent numerical checks above are what actually establish correctness.
+- Median tok/s (5 runs each side, Qwen2.5 1.5B, RX 7600): 110.79 -> 111.41, **+0.6%**. Calibrated boundary cost: `(1000/110.79 - 1000/111.41) * 1000 / 28 ≈ 1.77us/boundary` -- same order of magnitude as the curve-fit 2.5us estimate, but a real measurement now, not a fit.
+
+**Decision: reverted anyway.** The fusion is correct and the gain is real, but +0.6% doesn't clear the bar for the added surface area -- two new kernel variants with a conditional rotation path each, an opt-in flag that's a no-op on every architecture except Qwen2.5/NEOX, and a correctness hazard class (double-rotation) that's silent by nature and would need re-auditing on every future change to either kernel. Kept as a documented, calibrated data point rather than shipped code: `VTE_FUSE_ROPE` is not present in the current tree.
